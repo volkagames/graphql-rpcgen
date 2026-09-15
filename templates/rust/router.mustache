@@ -1,0 +1,6 @@
+
+/// Axum router for the `{{{service}}}` service.
+pub fn {{{module}}}_router<S: {{{trait_name}}}>(service: S) -> Router {
+    Router::new()
+{{{routes}}}        .with_state(service)
+}

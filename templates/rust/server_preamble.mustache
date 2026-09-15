@@ -1,0 +1,29 @@
+
+#![allow(clippy::all, dead_code, unused_imports)]
+
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::Router;
+use serde::{Deserialize, Serialize};
+use treat::extract_axum::ApiJson;
+use treat::prelude::*;
+
+/// The envelope and everything that builds one, re-exported so implementing a
+/// service trait takes a single import.
+pub use treat::{error, error_and_message, failure, success, ApiError, ApiResponse, ErrorMessage};
+{{{types_import}}}
+/// Reject a body that parsed but breaks a constraint the SDL declares.
+///
+/// The code is rewritten to `{{{invalid_body_code}}}` so every code on the wire
+/// stays a registry value instead of leaking `validator`'s own rule names; the
+/// rule that was broken survives in `message`, and the RFC 6901 pointer says
+/// which field it was.
+fn invalid_input(violations: &validator::ValidationErrors) -> Response {
+    let mut messages = treat::validation_error_messages(violations);
+    for message in &mut messages {
+        message.code = {{{invalid_body_code}}}.to_string();
+    }
+    let response: ApiResponse<treat::NoData> = failure(messages);
+    response.into_response()
+}

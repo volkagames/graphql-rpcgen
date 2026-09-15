@@ -1,0 +1,242 @@
+
+#![allow(clippy::all, dead_code, unused_imports)]
+
+use std::marker::PhantomData;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+{{{types_import}}}
+/// Locator for the offending input, mirroring the JSON:API `source` member.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorSource {
+    /// RFC 6901 JSON Pointer, e.g. `/device_info/sdk_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+}
+
+/// One entry of the wire `errors[]` array.
+///
+/// `code` stays a plain string: a server newer than this client must still be
+/// reportable rather than fail to parse. [`ApiErrors::code`] converts it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorMessage {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Free-form context, typed as a map so `meta["clan_id"]` needs no cast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ErrorSource>,
+    /// RFC 9457 `type`: a URI identifying the error kind.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub type_uri: Option<String>,
+    /// RFC 9457 `instance`: id or URI of this specific occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+}
+
+/// The response envelope, used for both success and failure.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiResponse<T> {
+    #[serde(default = "Option::default")]
+    pub data: Option<T>,
+    /// Envelope-level context, alongside `data` rather than about one error.
+    #[serde(default)]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub errors: Vec<ErrorMessage>,
+}
+
+/// Everything a call can fail with.
+///
+/// `Api` is the server answering with `errors[]`; the rest never reached the
+/// application layer. Only `Api` carries a code the caller can branch on.
+#[derive(Debug)]
+pub enum ClientError<C> {
+    /// The server reported one or more errors in the envelope.
+    Api(ApiErrors<C>),
+    /// The request never completed: connection, TLS or timeout.
+    Transport(String),
+    /// A 2xx body that did not match the expected shape, or a non-JSON body.
+    Decode(String),
+    /// A non-2xx status with no usable envelope, such as a proxy error page.
+    Status(u16),
+}
+
+impl<C> std::fmt::Display for ClientError<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::Api(e) => write!(f, "{e}"),
+            ClientError::Transport(m) => write!(f, "transport error: {m}"),
+            ClientError::Decode(m) => write!(f, "could not decode response: {m}"),
+            ClientError::Status(s) => write!(f, "request failed with status {s}"),
+        }
+    }
+}
+
+impl<C: std::fmt::Debug> std::error::Error for ClientError<C> {}
+
+/// The errors from one failed call, in the order the server listed them.
+///
+/// A list, not one entry: validating a whole input reports every problem.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiErrors<C> {
+    /// The entries as the server sent them, codes included verbatim.
+    pub messages: Vec<ErrorMessage>,
+    /// The operation's code set, carried in the type alone.
+    code: PhantomData<C>,
+}
+
+impl<C> ApiErrors<C> {
+    fn new(messages: Vec<ErrorMessage>) -> Self {
+        Self {
+            messages,
+            code: PhantomData,
+        }
+    }
+
+    /// The first entry, which is the one to show when only one can be shown.
+    pub fn first(&self) -> Option<&ErrorMessage> {
+        self.messages.first()
+    }
+
+    /// JSON Pointer to the field that caused the failure, when the server
+    /// located one — set for `invalid_body` rejections.
+    pub fn pointer(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .find_map(|e| e.source.as_ref()?.pointer.as_deref())
+    }
+
+    /// The first entry's code as a registry value, for logging or a `match`.
+    ///
+    /// `None` when the server sent a code this client does not know, which is
+    /// what a server newer than the client looks like.
+    pub fn code(&self) -> Option<{{{error_code_enum}}}> {
+        let code = self.first()?.code.clone();
+        serde_json::from_value(serde_json::Value::String(code)).ok()
+    }
+}
+
+/// Reading a failure against the set the calling operation declares.
+///
+/// A code the operation cannot return is not a variant of `C`, so asking about
+/// it does not compile rather than answering `false` forever.
+impl<C: std::fmt::Display> ApiErrors<C> {
+    /// Whether any entry carries `code`.
+    pub fn is(&self, code: C) -> bool {
+        let code = code.to_string();
+        self.messages.iter().any(|e| e.code == code)
+    }
+
+    /// First `meta` payload reported against `code`.
+    pub fn meta_for(&self, code: C) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        let code = code.to_string();
+        self.messages
+            .iter()
+            .find(|e| e.code == code)
+            .and_then(|e| e.meta.as_ref())
+    }
+}
+
+impl<C> std::fmt::Display for ApiErrors<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.first() {
+            Some(e) => match &e.message {
+                Some(message) => write!(f, "{}: {message}", e.code),
+                None => write!(f, "{}", e.code),
+            },
+            None => write!(f, "request failed without an error code"),
+        }
+    }
+}
+
+pub type ClientResult<T, C> = std::result::Result<T, ClientError<C>>;
+
+/// Typed client over the RPC API. Every operation is `POST` + JSON.
+///
+/// Cloning is cheap and shares the underlying connection pool, so a clone per
+/// task is the intended usage.
+#[derive(Debug, Clone)]
+pub struct {{{client_name}}} {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+impl {{{client_name}}} {
+    /// Client for the API served at `base_url`, which is an origin and
+    /// optionally a prefix: operation paths from the SDL are absolute.
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_http(base_url, reqwest::Client::new())
+    }
+
+    /// Client using a caller-configured `reqwest::Client`, for timeouts,
+    /// proxies, TLS roots and default headers.
+    pub fn with_http(base_url: impl Into<String>, http: reqwest::Client) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The underlying HTTP client, for callers that need to reuse the pool.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Issue one RPC call and unwrap the envelope.
+    ///
+    /// The status line is not the signal: this API answers `200 OK` even when
+    /// the call failed, so `errors[]` decides the outcome and is checked first.
+    pub async fn call<I: Serialize, O: DeserializeOwned, C>(
+        &self,
+        path: &str,
+        input: &I,
+    ) -> ClientResult<O, C> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .json(input)
+            .send()
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+        let envelope: ApiResponse<O> = match serde_json::from_slice(&body) {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Err(if status.is_success() {
+                    ClientError::Decode(e.to_string())
+                } else {
+                    ClientError::Status(status.as_u16())
+                })
+            }
+        };
+
+        if !envelope.errors.is_empty() {
+            return Err(ClientError::Api(ApiErrors::new(envelope.errors)));
+        }
+        match envelope.data {
+            Some(data) => Ok(data),
+            None => Err(if status.is_success() {
+                ClientError::Decode("response carried neither `data` nor `errors`".to_string())
+            } else {
+                ClientError::Status(status.as_u16())
+            }),
+        }
+    }
+}

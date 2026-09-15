@@ -1,0 +1,3 @@
+    pub async fn {{{method}}}(&self, input: &{{{input}}}) -> ClientResult<reqwest::Response, {{{error}}}> {
+        self.client.raw("{{{path}}}", input).await
+    }

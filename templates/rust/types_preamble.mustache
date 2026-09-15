@@ -1,0 +1,97 @@
+
+#![allow(clippy::all, dead_code, unused_imports)]
+
+use derive_more::{AsRef, Display, From, Into};
+use serde::{Deserialize, Serialize};
+use treat::prelude::*;
+use regex::Regex;
+use std::sync::LazyLock;
+use validator::Validate;
+
+pub use error_set::error_set;
+
+/// Whether a value satisfies a `@pattern`, given the regex compiled for it.
+///
+/// `None` is a pattern that did not compile, and rejects. `graphql-rpcgen`
+/// compiles every pattern before emitting it, so that is a generator bug rather
+/// than a runtime condition — and rejecting is the safe side of one, because
+/// the alternative accepts input no rule ever checked.
+fn matches_pattern<T>(pattern: &LazyLock<Option<Regex>>, value: &T) -> bool
+where
+    T: validator::ValidateRegex + ?Sized,
+{
+    pattern
+        .as_ref()
+        .is_some_and(|regex| validator::ValidateRegex::validate_regex(value, regex))
+}
+
+/// The error every function below a handler answers with: the flat registry.
+///
+/// One type, so a check shared between operations composes with a plain `?` and
+/// can be reused anywhere a value can go. The declared set is checked where it
+/// is declared, one [`Narrow::narrow`] away.
+pub type Failure = ApiError<{{{error_code_enum}}}>;
+
+/// What a set answers with for a code it does not declare: its `internal_error`.
+pub trait Undeclared: Sized {
+    const UNDECLARED: Self;
+}
+
+/// `meta` key carrying the code that was raised but never declared.
+pub const UNDECLARED_CODE_META: &str = "undeclared_code";
+
+/// Report a flat [`Failure`] through the set the operation declares.
+///
+/// A declared code becomes that set's variant and nothing else changes. An
+/// undeclared one is a gap in `@throws`: it is reported as `internal_error` with
+/// the raised code in `meta`, and a debug build asserts instead, so the gap
+/// surfaces in tests rather than in production traffic.
+pub trait Narrow<T> {
+    #[track_caller]
+    fn narrow<C>(self) -> Result<T, ApiError<C>>
+    where
+        C: ApiErrorCode + Undeclared + TryFrom<{{{error_code_enum}}}>;
+}
+
+impl<T> Narrow<T> for Result<T, Failure> {
+    #[track_caller]
+    fn narrow<C>(self) -> Result<T, ApiError<C>>
+    where
+        C: ApiErrorCode + Undeclared + TryFrom<{{{error_code_enum}}}>,
+    {
+        self.map_err(|failure| {
+            let raised = *failure.code();
+            match C::try_from(raised) {
+                Ok(declared) => failure.map_code(|_| declared),
+                Err(_) => {
+                    debug_assert!(
+                        false,
+                        "`{raised}` was raised by an operation that does not declare it; \
+                         add it to that operation's `@throws` in the SDL",
+                    );
+                    // The raised code is merged into whatever diagnostics the
+                    // check below already attached, because this branch is the
+                    // untested path and its `meta` is what says why. A `meta`
+                    // that is not an object cannot take a key, so it is nested
+                    // under `meta` instead of being dropped.
+                    let mut meta = match failure.meta() {
+                        Some(serde_json::Value::Object(existing)) => existing.clone(),
+                        Some(other) => {
+                            let mut map = serde_json::Map::new();
+                            map.insert("meta".to_string(), other.clone());
+                            map
+                        }
+                        None => serde_json::Map::new(),
+                    };
+                    meta.insert(
+                        UNDECLARED_CODE_META.to_string(),
+                        serde_json::Value::String(raised.to_string()),
+                    );
+                    failure
+                        .map_code(|_| C::UNDECLARED)
+                        .with_meta(serde_json::Value::Object(meta))
+                }
+            }
+        })
+    }
+}

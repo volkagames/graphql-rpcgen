@@ -1,0 +1,6 @@
+    pub async fn {{{method}}}(&self, input: &{{{input}}}, content_type: &str) -> ClientResult<reqwest::Response, {{{error}}}> {
+        let body = input.{{{body_field}}}.clone();
+        self.client
+            .raw_request("{{{path}}}", input, body, content_type)
+            .await
+    }

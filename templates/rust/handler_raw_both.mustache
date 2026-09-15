@@ -1,0 +1,22 @@
+
+async fn {{{handler}}}<S: {{{trait_name}}}>(
+    State(service): State<S>,
+    {{{context_extractor}}}RawQuery(query): RawQuery,
+    body: axum::body::Body,
+) -> Response {
+{{{role_guard}}}    let mut input: {{{input}}} = match input_from_query(query.as_deref(), &{{{query_fields}}}) {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    input.{{{body_field}}} = match raw_body(body, RAW_BODY_LIMIT).await {
+        Ok(bytes) => bytes.into(),
+        Err(response) => return response,
+    };
+    if let Err(violations) = validator::Validate::validate(&input) {
+        return invalid_input(&violations);
+    }
+    match service.{{{method}}}({{{context_arg}}}input).await {
+        Ok(body) => body.into_response(),
+        Err(error) => error.into_response(),
+    }
+}

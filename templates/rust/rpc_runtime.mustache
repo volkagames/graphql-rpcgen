@@ -1,0 +1,272 @@
+
+// --- streaming and raw bodies ------------------------------------------------
+//
+// Emitted only for an API that has a `@subscription` or a `@raw` operation, so
+// a plain JSON API compiles none of it.
+
+use axum::extract::RawQuery;
+use axum::http::{HeaderName, HeaderValue};
+use axum::routing::get;
+
+/// A stream of events, which is what a `@subscription` answers with.
+///
+/// Boxed rather than generic: a trait method cannot name an opaque return type,
+/// and the handler does nothing with the stream but poll it.
+pub type EventStream<T> = std::pin::Pin<Box<dyn futures_core::Stream<Item = T> + Send>>;
+
+/// Box any stream of events into the shape a subscription returns.
+pub fn event_stream<T, S>(stream: S) -> EventStream<T>
+where
+    S: futures_core::Stream<Item = T> + Send + 'static,
+{
+    Box::pin(stream)
+}
+
+/// A response body that is bytes rather than the JSON envelope.
+///
+/// What a `@raw(response:)` operation answers with. The headers describing the
+/// body — `Content-Disposition` above all — are part of the answer rather than
+/// metadata about it, so they are carried here instead of being derived from
+/// the bytes.
+#[derive(Debug, Clone)]
+pub struct RawBody {
+    pub content_type: String,
+    pub body: Vec<u8>,
+    /// Response headers beyond the content type.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl RawBody {
+    pub fn new(content_type: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            content_type: content_type.into(),
+            body: body.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// Typed rather than string-keyed, so a header this cannot represent is a
+    /// compile error at the call site instead of a surprise in the response.
+    pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
+    /// Offer the body as a download named `filename`.
+    ///
+    /// The name is sanitised rather than trusted: it often comes from a record
+    /// title, and a quote or a newline in one would otherwise end the header
+    /// value early and let the rest be read as another header.
+    pub fn attachment(self, filename: &str) -> Self {
+        let safe: String = filename
+            .chars()
+            .map(|c| match c {
+                '"' | '\\' | '\r' | '\n' => '_',
+                c if c.is_control() || !c.is_ascii() => '_',
+                c => c,
+            })
+            .collect();
+        match HeaderValue::from_str(&format!("attachment; filename=\"{safe}\"")) {
+            Ok(value) => self.header(axum::http::header::CONTENT_DISPOSITION, value),
+            // Every unrepresentable character was replaced above, so this is
+            // unreachable; dropping the header beats refusing the download.
+            Err(_) => self,
+        }
+    }
+}
+
+impl IntoResponse for RawBody {
+    fn into_response(self) -> Response {
+        let content_type = match HeaderValue::from_str(&self.content_type) {
+            Ok(value) => value,
+            // The content type is the service's own, not the caller's, so an
+            // unrepresentable one is a bug here rather than a bad request.
+            Err(_) => {
+                return internal_failure(&format!(
+                    "`{}` is not a usable content type",
+                    self.content_type
+                ))
+            }
+        };
+
+        let mut response = Response::new(axum::body::Body::from(self.body));
+        let headers = response.headers_mut();
+        headers.insert(axum::http::header::CONTENT_TYPE, content_type);
+        for (name, value) in self.headers {
+            headers.insert(name, value);
+        }
+        response
+    }
+}
+
+/// Render a stream of events as Server-Sent Events.
+///
+/// One JSON event per `data:` frame, which is the framing the generated
+/// TypeScript client reads with `EventSource`.
+///
+/// An idle stream would otherwise sit silent until its next event, and an idle
+/// proxy in between would cut it. The legacy TypeScript route pinged every 30
+/// seconds with a `:keep-alive` comment; an SSE comment is ignored by
+/// `EventSource`, so the `: keep-alive` frame axum emits is equivalent.
+/// `keep_alive` resets its timer after every event, so pings go out only
+/// while the stream is actually quiet.
+fn sse_response<T: serde::Serialize + Send + 'static>(stream: EventStream<T>) -> Response {
+    let frames = futures_util::StreamExt::map(stream, |event| {
+        axum::response::sse::Event::default().json_data(event)
+    });
+    axum::response::Sse::new(frames)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(30))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// How one query-string parameter is decoded before serde sees it.
+///
+/// A query string carries only text, so a value's JSON type comes from the
+/// schema rather than from the bytes: `column=2` is the number `2` for an
+/// `Int!` field and the string `"2"` for a `String!` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    Str,
+    Int,
+    Float,
+    Bool,
+    /// Anything with no query-string spelling of its own — an object, or the
+    /// unconstrained `JSON` scalar — sent as JSON text in the parameter.
+    Json,
+}
+
+/// One input field as the query string carries it.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryField {
+    pub name: &'static str,
+    pub kind: QueryKind,
+    /// A list repeats its key, which is what `URLSearchParams` writes and what
+    /// reading with `getAll` expects.
+    pub list: bool,
+}
+
+/// Rebuild an operation's input from the query string.
+///
+/// Used where there is no JSON body to read it from: a subscription is opened
+/// by `EventSource`, which can only GET, and a raw request has already spent
+/// its one body on the payload.
+///
+/// An absent parameter is left out of the object rather than sent as null, so
+/// an optional field takes its `#[serde(default)]` and a missing required one
+/// is reported by serde as the missing field it is.
+fn input_from_query<T: serde::de::DeserializeOwned>(
+    query: Option<&str>,
+    fields: &[QueryField],
+) -> Result<T, Response> {
+    let pairs: Vec<(String, String)> =
+        form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+
+    let mut object = serde_json::Map::new();
+    for field in fields {
+        let mut values = pairs
+            .iter()
+            .filter(|(key, _)| key == field.name)
+            .map(|(_, value)| value.as_str());
+
+        if field.list {
+            let items = values
+                .map(|value| query_value(field, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            // An empty list and an absent one are the same thing in a query
+            // string, so the field is left out and takes its default.
+            if !items.is_empty() {
+                object.insert(field.name.to_string(), serde_json::Value::Array(items));
+            }
+        } else if let Some(value) = values.next() {
+            object.insert(field.name.to_string(), query_value(field, value)?);
+        }
+    }
+
+    serde_json::from_value(serde_json::Value::Object(object))
+        .map_err(|e| invalid_query(&e.to_string(), None))
+}
+
+/// One parameter as the JSON value its declared type calls for.
+fn query_value(field: &QueryField, raw: &str) -> Result<serde_json::Value, Response> {
+    let parsed = match field.kind {
+        QueryKind::Str => Some(serde_json::Value::String(raw.to_string())),
+        QueryKind::Int => raw.parse::<i64>().ok().map(Into::into),
+        QueryKind::Float => raw.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(serde_json::Value::Number),
+        QueryKind::Bool => raw.parse::<bool>().ok().map(serde_json::Value::Bool),
+        QueryKind::Json => serde_json::from_str(raw).ok(),
+    };
+    parsed.ok_or_else(|| {
+        invalid_query(
+            &format!("`{raw}` is not a valid {}", describe_kind(field.kind)),
+            Some(field.name),
+        )
+    })
+}
+
+fn describe_kind(kind: QueryKind) -> &'static str {
+    match kind {
+        QueryKind::Str => "string",
+        QueryKind::Int => "integer",
+        QueryKind::Float => "number",
+        QueryKind::Bool => "boolean",
+        QueryKind::Json => "JSON value",
+    }
+}
+
+/// Reject a query string that does not describe the operation's input.
+///
+/// The same code as a malformed body — it is the same failure, reached through
+/// the URL because that is where these operations carry their input — with the
+/// offending parameter named in `source` the way a pointer names a field.
+fn invalid_query(message: &str, parameter: Option<&str>) -> Response {
+    let mut error = ErrorMessage {
+        code: {{{invalid_body_code}}}.to_string(),
+        message: Some(message.to_string()),
+        ..Default::default()
+    };
+    if let Some(parameter) = parameter {
+        error.source = Some(treat::ErrorSource::default().with_parameter(parameter));
+    }
+    let response: ApiResponse<treat::NoData> = failure(vec![error]);
+    response.into_response()
+}
+
+/// The envelope for a failure that is this server's own fault.
+fn internal_failure(message: &str) -> Response {
+    let response: ApiResponse<treat::NoData> = failure(vec![ErrorMessage {
+        code: {{{internal_error_code}}}.to_string(),
+        message: Some(message.to_string()),
+        ..Default::default()
+    }]);
+    response.into_response()
+}
+
+/// Read a raw request body, rejecting one larger than `limit` bytes.
+///
+/// A bound is applied here rather than left to the service because the body is
+/// buffered to reach it: without one, the size of an upload would be the
+/// caller's choice rather than the server's.
+async fn raw_body(body: axum::body::Body, limit: usize) -> Result<Vec<u8>, Response> {
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(_) => Err(invalid_query(
+            &format!("request body is unreadable or larger than {limit} bytes"),
+            None,
+        )),
+    }
+}
+
+/// Bound on a buffered `@raw(request:)` body, in bytes.
+///
+/// One number for every raw operation: the SDL says which fields carry a body
+/// but not how large one may be, so this is a floor under the server's memory
+/// rather than a statement about any particular upload. An operation needing a
+/// tighter bound states it as a `@length` on the field, which is checked after
+/// the body is read; one needing a larger body streams it instead of buffering.
+pub const RAW_BODY_LIMIT: usize = 8 * 1024 * 1024;

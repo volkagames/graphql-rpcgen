@@ -1,0 +1,10 @@
+
+async fn {{{handler}}}<S: {{{trait_name}}}>(
+    State(service): State<S>,
+    {{{context_extractor}}}
+) -> Response {
+{{{role_guard}}}    match service.{{{method}}}({{{context_arg}}}).await {
+        Ok(stream) => sse_response(stream),
+        Err(error) => error.into_response(),
+    }
+}

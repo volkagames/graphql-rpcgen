@@ -1,0 +1,62 @@
+
+// --- request context ---------------------------------------------------------
+//
+// Emitted only for an API with an `@auth(require: session)` operation, so one
+// that authenticates elsewhere compiles none of it.
+
+/// The caller, extracted before a session-guarded operation runs.
+///
+/// A newtype over the project's own context type so the extraction is one
+/// `FromRequestParts` impl the project writes once, rather than a bound this
+/// generator would have to name. `FromRequestParts` and not `FromRequest`
+/// because the body belongs to the operation's input: an extractor that
+/// consumed it would have to be last, and the input's already is.
+pub struct Ctx<T>(pub T);
+
+// Not `#[async_trait]`: axum 0.8 declares `FromRequestParts` with native async,
+// so a desugared impl would not match the trait's signature.
+impl<T, S> axum::extract::FromRequestParts<S> for Ctx<T>
+where
+    T: FromRequestContext,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        T::from_parts(parts).await.map(Ctx)
+    }
+}
+
+/// What a request context must do to be extracted and role-checked.
+///
+/// The generator names this contract; the project's own context type implements
+/// it. Named for what it does rather than for what it holds, so it does not
+/// collide with the type that satisfies it — which is very often called
+/// `RequestContext` itself. Resolving a session — the cookie, the exchange with
+/// whoever issues it, the user lookup — is not describable in a schema, so it
+/// stays on this side of the boundary.
+///
+/// Native async rather than `#[async_trait]`: `FromRequestParts` requires the
+/// future to be `Send`, and a boxed one does not carry that bound where the impl
+/// above needs it.
+pub trait FromRequestContext: Sized + Send + Sync + 'static {
+    /// Resolve the caller from the request, or reject it.
+    ///
+    /// A rejection is a whole `Response` rather than a code, because failing to
+    /// authenticate is not one of the operation's declared outcomes: it happens
+    /// before the operation is reached. Answering with the envelope and a code
+    /// the registry lists for it is the conventional shape.
+    fn from_parts(
+        parts: &mut axum::http::request::Parts,
+    ) -> impl std::future::Future<Output = Result<Self, Response>> + Send;
+
+    /// Whether this caller holds `role`, as `@auth(role:)` demands.
+    ///
+    /// Returns the response to send when they do not, so the policy — which
+    /// code, which message — stays with the project rather than being fixed
+    /// here. Only called for an operation that declares a role.
+    fn require_role(&self, role: &str) -> Result<(), Response>;
+}

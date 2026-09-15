@@ -1,0 +1,72 @@
+[package]
+categories = ["development-tools"]
+description = "GraphQL SDL -> Rust/TypeScript/OpenAPI RPC code generator"
+edition = "2021"
+exclude = [".cargo", ".vscode"]
+keywords = ["graphql", "codegen", "rpc", "openapi", "axum"]
+license = "MIT"
+name = "graphql-rpcgen"
+repository = "https://github.com/volkagames/graphql-rpcgen"
+version = "0.7.0"
+
+[dependencies]
+erris = "2"
+graphql-parser = "0.4"
+mustache = "0.9.0"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = { version = "1.1.6", default-features = false, features = [
+  "parse",
+  "display",
+  "serde",
+] }
+
+# What the *generated* Rust reaches for, not what the generator needs. The
+# `oneof_wire` and `raw_wire` tests compile generated code in scratch projects
+# and pin their versions to this lockfile, so the set has to resolve here even
+# though no line of `src/` mentions any of it.
+#
+# `raw_wire` is why the server and client halves are here: a `@raw` operation
+# emits handlers and client methods, not just types, and those reach for a web
+# framework and an HTTP stack. `form_urlencoded` and `reqwest`'s `stream`
+# feature are the two the generated streaming runtime needs and nothing else
+# does — see "What the generated Rust needs on the other side" in the README.
+[dev-dependencies]
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+derive_more = { version = "2", features = [
+  "from",
+  "into",
+  "display",
+  "as_ref",
+] }
+error_set = "0.9"
+form_urlencoded = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+  "stream",
+] }
+treat = { version = "0.22", features = [
+  "axum",
+  "rpc-status-header",
+  "serde-path",
+  "validator-extract",
+] }
+uuid = { version = "1", features = ["serde"] }
+validator = { version = "0.21", features = ["derive"] }
+
+# No deliberate panic reaches a generator run: a failure is a `CompileError`
+# that names the file and the position. Tests included — a test that `?`s says
+# what broke. The same block the generated projects carry.
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unreachable = "deny"
+unwrap_used = "deny"

@@ -1,0 +1,13 @@
+
+async fn {{{handler}}}<S: {{{trait_name}}}>(
+    State(service): State<S>,
+    {{{context_extractor}}}ApiJson(input): ApiJson<{{{input}}}>,
+) -> Response {
+{{{role_guard}}}    if let Err(violations) = validator::Validate::validate(&input) {
+        return invalid_input(&violations);
+    }
+    match service.{{{method}}}({{{context_arg}}}input).await {
+        Ok(body) => body.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
