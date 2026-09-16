@@ -27,7 +27,8 @@ pub fn is_unescapable_keyword(wire_name: &str) -> bool {
 ///
 /// GraphQL names already satisfy this, so the only string that needs asking is
 /// one the SDL supplies as a directive argument rather than as a name —
-/// `@discriminator(field:)`, which becomes a key in a TypeScript object type.
+/// `@discriminator(field:)` or `(sibling:)`, which becomes a key in a TypeScript
+/// object type.
 pub fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars

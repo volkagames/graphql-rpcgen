@@ -397,6 +397,36 @@ A tag on a type no union names is rejected, as are two members of one union
 claiming the same tag: the first would do nothing and the second would make the
 wire ambiguous in both directions.
 
+Some unions are selected by a field their holder declares anyway — a template
+field whose `type` decides the shape of its `settings`. A tag inside the member
+would repeat that field and could contradict it, so `@discriminator(sibling:)`
+puts the tag beside the member instead, as a key of the holding object:
+
+```graphql
+enum SettingKind { flag number }
+type FlagSetting @variant(tag: "flag") { tribool: Boolean }
+type NumberSetting @variant(tag: "number") { min: Int }
+union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
+
+type Param { label: String! kind: SettingKind! settings: Setting! }
+```
+```json
+{ "label": "cap", "kind": "number", "settings": { "min": 1 } }
+```
+
+Rust gets `#[serde(tag = "kind", content = "settings")] enum Setting` flattened
+into `Param`, which has no separate `kind` field — a `kind` that disagrees with
+`settings` cannot be built. TypeScript gets the holder as
+`{ label: string } & ({ kind: 'flag'; settings: FlagSetting } | …)`, which
+narrows `settings` on `kind`. OpenAPI gets the holder's other fields plus a
+`oneOf` of `{kind, settings}` pairs.
+
+The holder must declare the tag as a non-null enum whose values are exactly the
+member tags, and hold the union in one non-null, non-list field. Every holder
+names that field the same, one holder holds at most one such union, and the
+union cannot be an operation's output: all of these leave the tag without one
+key to sit in.
+
 An `@oneOf` input becomes a Rust enum and an *exclusive* TypeScript union, so
 supplying two variants is a compile error:
 
@@ -424,7 +454,8 @@ type PaymentInput =
 | `@range(min:, max:)` | FIELD/INPUT | `minimum` / `maximum` |
 | `@pattern(value:)` | FIELD/INPUT | `pattern` |
 | `@oneOf` | INPUT_OBJECT | exactly one field must be present |
-| `@discriminator(field:)` | UNION | wire tag field, default `kind` |
+| `@discriminator(field:)` | UNION | wire tag field inside the member, default `kind` |
+| `@discriminator(sibling:)` | UNION | wire tag field beside the member, in the holding object |
 | `@variant(tag:)` | OBJECT | the tag value selecting this union member |
 | `@scalar(rust:, typescript:, …)` | SCALAR | the scalar's representation in each target |
 
@@ -448,7 +479,7 @@ in that form, so a field or operation named after one is refused rather than
 renamed behind the author's back.
 
 Two strings arrive as SDL arguments rather than as GraphQL names, and each is
-checked for what it becomes. `@discriminator(field:)` is emitted as a bare key
+checked for what it becomes. `@discriminator(field:)` and `(sibling:)` are emitted as a bare key
 in the TypeScript union, so it must be an identifier. `@rpc(path:)` is spelled
 into Rust and TypeScript string literals by templates that do not escape it, so
 it must start with `/` and carry only unreserved URL characters.

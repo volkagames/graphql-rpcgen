@@ -138,6 +138,7 @@ impl<'a> Analyzer<'a> {
         }
 
         self.resolve_variant_tags(&mut types);
+        self.resolve_sibling_contents(&mut types);
 
         // Sorting here is what makes generation deterministic; every generator
         // walks these vectors in order.
@@ -398,39 +399,7 @@ impl<'a> Analyzer<'a> {
                         t.position,
                     ));
                 }
-                let discriminator = match find_directive(&t.directives, "discriminator") {
-                    Some(d) => match string_arg(d, "field") {
-                        Some(v) => v,
-                        None if d.arguments.is_empty() => DEFAULT_DISCRIMINATOR.to_string(),
-                        None => {
-                            self.errors.push(CompileError::at(
-                                format!(
-                                    "union `{}`: @discriminator(field:) must be a string",
-                                    t.name
-                                ),
-                                file,
-                                t.position,
-                            ));
-                            DEFAULT_DISCRIMINATOR.to_string()
-                        }
-                    },
-                    None => DEFAULT_DISCRIMINATOR.to_string(),
-                };
-                // Every other wire name reaches the targets through a GraphQL
-                // name, which is an identifier already. This one is a directive
-                // argument, and the TypeScript union spells it as a bare key:
-                // `{ kind-of: 'card' }` does not parse.
-                if !crate::naming::is_identifier(&discriminator) {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "union `{}`: @discriminator(field: \"{discriminator}\") must be an \
-                             identifier — it is emitted as an object key, not as a string",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
+                let tagging = self.union_tagging(file, t);
                 types.push(ApiType::Union(UnionType {
                     name: t.name.clone(),
                     description: t.description.clone(),
@@ -444,7 +413,7 @@ impl<'a> Analyzer<'a> {
                             tag: m.clone(),
                         })
                         .collect(),
-                    discriminator,
+                    tagging,
                 }));
             }
             TypeDefinition::Interface(t) => {
@@ -1302,6 +1271,142 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Where a union's tag sits, from `@discriminator(field:)` or
+    /// `@discriminator(sibling:)`.
+    ///
+    /// A sibling tag's `content` is left empty: it is the name of the field
+    /// holding the union, known only once every object is read, and
+    /// [`Self::resolve_sibling_contents`] fills it in.
+    fn union_tagging(
+        &mut self,
+        file: &Path,
+        t: &graphql_parser::schema::UnionType<'static, String>,
+    ) -> Tagging {
+        let default = || Tagging::Internal {
+            tag: DEFAULT_DISCRIMINATOR.to_string(),
+        };
+        let Some(d) = find_directive(&t.directives, "discriminator") else {
+            return default();
+        };
+        let field = d.arguments.iter().find(|(name, _)| name == "field");
+        let sibling = d.arguments.iter().find(|(name, _)| name == "sibling");
+        let unknown = d
+            .arguments
+            .iter()
+            .find(|(name, _)| name != "field" && name != "sibling");
+        if let Some((name, _)) = unknown {
+            self.errors.push(CompileError::at(
+                format!(
+                    "union `{}`: @discriminator has no argument `{name}`; it takes `field` or `sibling`",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+            return default();
+        }
+
+        let (argument, value) = match (field, sibling) {
+            (None, None) => return default(),
+            (Some(_), Some(_)) => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "union `{}`: @discriminator takes `field` or `sibling`, not both — the tag \
+                         sits either inside the member or beside it",
+                        t.name
+                    ),
+                    file,
+                    t.position,
+                ));
+                return default();
+            }
+            (Some((_, v)), None) => ("field", v),
+            (None, Some((_, v))) => ("sibling", v),
+        };
+        let Value::String(tag) = value else {
+            self.errors.push(CompileError::at(
+                format!(
+                    "union `{}`: @discriminator({argument}:) must be a string",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+            return default();
+        };
+        // Every other wire name reaches the targets through a GraphQL name,
+        // which is an identifier already. This one is a directive argument,
+        // and TypeScript spells it as a bare key: `{ kind-of: 'card' }` does
+        // not parse.
+        if !crate::naming::is_identifier(tag) {
+            self.errors.push(CompileError::at(
+                format!(
+                    "union `{}`: @discriminator({argument}: \"{tag}\") must be an identifier — it \
+                     is emitted as an object key, not as a string",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+        match argument {
+            "field" => Tagging::Internal { tag: tag.clone() },
+            // The tag names a holder field, and fields are snake_cased on the
+            // way into the IR; unconverted, `settingKind` would match nothing.
+            _ => Tagging::Sibling {
+                tag: crate::naming::snake_case_raw(tag),
+                content: String::new(),
+            },
+        }
+    }
+
+    /// Name each sibling-tagged union's `content` key after the field holding it.
+    ///
+    /// One name across every holder, because the Rust enum states the key once:
+    /// two holders spelling it differently would need two enums for one union.
+    /// A union no object holds has no key to sit under at all.
+    fn resolve_sibling_contents(&mut self, types: &mut [ApiType]) {
+        let mut holders: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for ty in types.iter() {
+            let ApiType::Object(o) = ty else { continue };
+            for f in &o.fields {
+                holders
+                    .entry(f.ty.base_name().to_string())
+                    .or_default()
+                    .push((o.name.clone(), f.name.clone()));
+            }
+        }
+
+        for ty in types.iter_mut() {
+            let ApiType::Union(u) = ty else { continue };
+            let Tagging::Sibling { content, .. } = &mut u.tagging else {
+                continue;
+            };
+            let held_by = holders.get(&u.name).map(Vec::as_slice).unwrap_or_default();
+            let Some((_, first)) = held_by.first() else {
+                self.errors.push(CompileError::new(format!(
+                    "union `{}`: @discriminator(sibling:) puts the tag beside the field holding the \
+                     union, but no object field holds it",
+                    u.name
+                )));
+                continue;
+            };
+            if held_by.iter().any(|(_, name)| name != first) {
+                let sites = held_by
+                    .iter()
+                    .map(|(owner, name)| format!("`{owner}.{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.errors.push(CompileError::new(format!(
+                    "union `{}`: every field holding a sibling-tagged union must share one name, \
+                     but it is held by {sites}",
+                    u.name
+                )));
+            }
+            *content = first.clone();
+        }
+    }
+
     /// Put each `@variant(tag:)` on the union member it belongs to, and reject
     /// the two ways it can be meaningless: a tag on a type no union names, and
     /// two members of one union answering to the same tag.
@@ -1817,35 +1922,133 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// A union member must not carry a field named after its discriminator.
+    /// A union's tag must have somewhere to sit that nothing else claims.
     ///
-    /// The serializer injects the tag under that name on top of the member's
-    /// fields; one already present would collide with it and serde would fail
-    /// at every request, so the collision is an SDL error instead.
+    /// Inside the member, a field of the same name would collide with the tag
+    /// the serializer injects, and serde would fail at every request. Beside
+    /// it, the holder must declare the tag as an enum naming exactly the
+    /// union's tags, and hold the union in the one shape a single tag key can
+    /// select: a non-null field that is not a list.
     fn check_union_discriminators(&mut self, api: &Api) {
         for ty in &api.types {
             let ApiType::Union(u) = ty else { continue };
-            for member in &u.members {
-                let Some(ApiType::Object(o)) = api.find_type(member.name.as_str()) else {
-                    continue;
-                };
-                if o.fields.iter().any(|f| f.name == u.discriminator) {
-                    // The IR keeps no field positions, but the union's own
-                    // declaration site is where the discriminator was chosen.
-                    let (site, pos) = self
-                        .declared
-                        .get(&u.name)
-                        .cloned()
-                        .unwrap_or_else(|| ("<builtin>".into(), Pos { line: 0, column: 0 }));
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "union `{}`: member `{}` declares a field `{}`; that name is the \
-                             union's discriminator and is reserved for the variant tag",
-                            u.name, member.name, u.discriminator
-                        ),
-                        Path::new(&site),
-                        pos,
-                    ));
+            match &u.tagging {
+                Tagging::Internal { tag } => self.check_internal_tag(api, u, tag),
+                Tagging::Sibling { tag, .. } => self.check_sibling_tag(api, u, tag),
+            }
+        }
+    }
+
+    fn check_internal_tag(&mut self, api: &Api, u: &UnionType, tag: &str) {
+        for member in &u.members {
+            let Some(ApiType::Object(o)) = api.find_type(member.name.as_str()) else {
+                continue;
+            };
+            if o.fields.iter().any(|f| f.name == tag) {
+                // The IR keeps no field positions, but the union's own
+                // declaration site is where the discriminator was chosen.
+                let (site, pos) = self
+                    .declared
+                    .get(&u.name)
+                    .cloned()
+                    .unwrap_or_else(|| ("<builtin>".into(), Pos { line: 0, column: 0 }));
+                self.errors.push(CompileError::at(
+                    format!(
+                        "union `{}`: member `{}` declares a field `{}`; that name is the \
+                         union's discriminator and is reserved for the variant tag",
+                        u.name, member.name, tag
+                    ),
+                    Path::new(&site),
+                    pos,
+                ));
+            }
+        }
+    }
+
+    fn check_sibling_tag(&mut self, api: &Api, u: &UnionType, tag: &str) {
+        let member_tags: BTreeSet<&str> = u.members.iter().map(|m| m.tag.as_str()).collect();
+
+        for holder in &api.types {
+            let ApiType::Object(o) = holder else { continue };
+            let held: Vec<&Field> = o
+                .fields
+                .iter()
+                .filter(|f| f.ty.base_name() == u.name)
+                .collect();
+            let Some(field) = held.first() else { continue };
+
+            if held.len() > 1
+                || api
+                    .sibling_tagged(o)
+                    .is_some_and(|(_, other, _)| other.name != u.name)
+            {
+                self.errors.push(CompileError::new(format!(
+                    "`{}` holds more than one sibling-tagged union; each needs a tag key of its own \
+                     and the object has one set of keys",
+                    o.name
+                )));
+                continue;
+            }
+            if !matches!(
+                field.ty,
+                TypeRef::Named {
+                    nullable: false,
+                    ..
+                }
+            ) {
+                self.errors.push(CompileError::new(format!(
+                    "`{}.{}` holds union `{}`, whose tag sits beside it; the field must be \
+                     non-null and not a list, since one tag key selects one member",
+                    o.name, field.name, u.name
+                )));
+            }
+
+            let tag_enum = o
+                .fields
+                .iter()
+                .find(|f| f.name == tag)
+                .and_then(|f| match &f.ty {
+                    TypeRef::Named {
+                        name,
+                        nullable: false,
+                    } => match api.find_type(name) {
+                        Some(ApiType::Enum(e)) => Some(e),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+            let Some(tag_enum) = tag_enum else {
+                self.errors.push(CompileError::new(format!(
+                    "`{}.{}` holds union `{}`, tagged by the sibling `{tag}`; `{}` must declare \
+                     `{tag}` as a non-null enum",
+                    o.name, field.name, u.name, o.name
+                )));
+                continue;
+            };
+
+            // Exactly, not a subset: a value with no member leaves the holder a
+            // tag it cannot deserialize, and a member with no value is a shape
+            // the holder could never carry.
+            let values: BTreeSet<&str> = tag_enum.values.iter().map(EnumValue::wire_name).collect();
+            if values != member_tags {
+                let missing: Vec<&str> = member_tags.difference(&values).copied().collect();
+                let extra: Vec<&str> = values.difference(&member_tags).copied().collect();
+                self.errors.push(CompileError::new(format!(
+                    "`{}.{tag}` is `{}`, whose values must be exactly the tags of union `{}`; \
+                     members with no value: {missing:?}, values with no member: {extra:?}",
+                    o.name, tag_enum.name, u.name
+                )));
+            }
+        }
+
+        for s in &api.services {
+            for op in &s.operations {
+                if op.output.base_name() == u.name {
+                    self.errors.push(CompileError::new(format!(
+                        "`{}.{}` outputs union `{}`, whose tag sits beside it in a holding \
+                         object; an operation's output has no holder",
+                        s.name, op.name, u.name
+                    )));
                 }
             }
         }

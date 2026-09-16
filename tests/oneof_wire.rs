@@ -7,6 +7,10 @@
 //! pinned at runtime rather than left to a reader's imagination of the
 //! emitted text.
 //!
+//! A union tagged beside its holder rides along for the same reason: serde's
+//! flattened adjacent tagging is behaviour, and only running it shows that the
+//! tag and the member land as two keys of the holder.
+//!
 //! The SDL also declares one service, so the emitted error vocabulary is
 //! compiled rather than assumed: an `error_set!` with members, and the
 //! `TryFrom` / `Undeclared` impls a `narrow` goes through. A set is macro
@@ -63,6 +67,12 @@ input CryptoInput { coin: String! }
 type CardPayment @variant(tag: "card") { last4: String! }
 type CryptoPayment { network: String! }
 union PaymentMethod = CardPayment | CryptoPayment
+
+enum SettingKind { flag number }
+type FlagSetting @variant(tag: "flag") { tribool: Boolean }
+type NumberSetting @variant(tag: "number") { min: Int }
+union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
+type Param { label: String! kind: SettingKind! settings: Setting! }
 
 input PaymentInput @oneOf {
   card: CardInput
@@ -209,6 +219,40 @@ fn a_float_newtype_arm_is_checked_against_its_bound() -> TestResult {
         return Err("@range(min: 0) applies to the arm".into());
     };
     assert!(err.0.contains_key("amount"), "the error must point at the arm: {err:?}");
+    Ok(())
+}
+
+#[test]
+fn a_sibling_tag_is_a_key_of_the_holder_not_of_the_member() -> TestResult {
+    let param = Param {
+        label: "cap".into(),
+        settings: Setting::NumberSetting(NumberSetting { min: Some(1) }),
+    };
+    let json = serde_json::to_string(&param)?;
+    assert_eq!(json, r#"{"label":"cap","kind":"number","settings":{"min":1}}"#);
+    assert_eq!(serde_json::from_str::<Param>(&json)?, param);
+    Ok(())
+}
+
+#[test]
+fn the_holder_tag_selects_the_member() -> TestResult {
+    // Both members would accept an empty object, so only the tag can decide.
+    let flag: Param = serde_json::from_str(r#"{"label":"l","kind":"flag","settings":{}}"#)?;
+    assert!(matches!(flag.settings, Setting::FlagSetting(_)));
+    let number: Param = serde_json::from_str(r#"{"label":"l","kind":"number","settings":{}}"#)?;
+    assert!(matches!(number.settings, Setting::NumberSetting(_)));
+    Ok(())
+}
+
+#[test]
+fn a_holder_with_an_unknown_or_missing_tag_is_rejected() -> TestResult {
+    for body in [
+        r#"{"label":"l","kind":"bogus","settings":{}}"#,
+        r#"{"label":"l","settings":{}}"#,
+        r#"{"label":"l","kind":"flag"}"#,
+    ] {
+        assert!(serde_json::from_str::<Param>(body).is_err(), "{body}");
+    }
     Ok(())
 }
 

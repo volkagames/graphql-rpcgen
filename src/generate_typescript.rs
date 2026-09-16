@@ -70,6 +70,9 @@ fn emit_types(out: &mut String, api: &Api) {
                     .join(" | ");
                 let _ = writeln!(out, "export type {} = {variants}", e.name);
             }
+            ApiType::Object(o) if api.sibling_tagged(o).is_some() => {
+                emit_sibling_holder(out, api, o);
+            }
             ApiType::Object(o) => {
                 out.push('\n');
                 emit_doc(out, "", &o.description);
@@ -95,19 +98,67 @@ fn emit_types(out: &mut String, api: &Api) {
                 let arms = u
                     .members
                     .iter()
-                    .map(|m| {
-                        format!(
-                            "  | ({{ {}: {} }} & {})",
-                            u.discriminator,
-                            quoted(&m.tag),
-                            m.name
-                        )
+                    .map(|m| match &u.tagging {
+                        Tagging::Internal { tag } => {
+                            format!("  | ({{ {tag}: {} }} & {})", quoted(&m.tag), m.name)
+                        }
+                        // The tag lives on the holder, which pairs it with the
+                        // member there; the union alone is just the shapes.
+                        Tagging::Sibling { .. } => format!("  | {}", m.name),
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
                 let _ = writeln!(out, "export type {} =\n{arms}", u.name);
             }
         }
+    }
+}
+
+/// An object holding a sibling-tagged union: its other fields, intersected with
+/// one arm per member pairing the tag literal with that member's shape.
+///
+/// An interface cannot say that `type: 'bool'` goes with `settings:
+/// BoolSetting`; the intersection can, and narrowing on the tag narrows the
+/// member with it. The two fields' descriptions sit above the arms, which have
+/// no member of their own to carry them.
+fn emit_sibling_holder(out: &mut String, api: &Api, o: &ObjectType) {
+    let Some((held, union, tag)) = api.sibling_tagged(o) else {
+        return;
+    };
+    let rest: Vec<&Field> = o
+        .fields
+        .iter()
+        .filter(|f| f.name != tag && f.name != held.name)
+        .collect();
+
+    out.push('\n');
+    emit_doc(out, "", &o.description);
+    // A holder with nothing but the pair is the arms alone; an empty `{}`
+    // intersected with them would say nothing.
+    if rest.is_empty() {
+        let _ = writeln!(out, "export type {} =", o.name);
+    } else {
+        let _ = writeln!(out, "export type {} = {{", o.name);
+        for f in &rest {
+            emit_interface_field(out, api, f);
+        }
+        out.push_str("} & (\n");
+    }
+    if let Some(f) = o.fields.iter().find(|f| f.name == tag) {
+        emit_doc(out, "  ", &f.description);
+    }
+    emit_doc(out, "  ", &held.description);
+    for m in &union.members {
+        let _ = writeln!(
+            out,
+            "  | {{ {tag}: {}; {}: {} }}",
+            quoted(&m.tag),
+            held.name,
+            m.name
+        );
+    }
+    if !rest.is_empty() {
+        out.push_str(")\n");
     }
 }
 

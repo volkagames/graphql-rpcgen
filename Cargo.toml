@@ -7,7 +7,7 @@ keywords = ["graphql", "codegen", "rpc", "openapi", "axum"]
 license = "MIT"
 name = "graphql-rpcgen"
 repository = "https://github.com/volkagames/graphql-rpcgen"
-version = "0.7.0"
+version = "0.8.0"
 
 [dependencies]
 erris = "2"

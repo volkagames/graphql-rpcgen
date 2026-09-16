@@ -70,6 +70,20 @@ type CardPayment @variant(tag: "card") { last4: String! }
 type CryptoPayment { network: String! }
 union PaymentMethod @discriminator(field: "kind") = CardPayment | CryptoPayment
 
+enum SettingKind { flag number }
+type FlagSetting @variant(tag: "flag") { tribool: Boolean }
+type NumberSetting @variant(tag: "number") { min: Int }
+"Selected by the holder's own `kind`, so the member carries no copy of the tag."
+union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
+type Param {
+  label: String!
+  "Which shape `settings` takes."
+  kind: SettingKind!
+  settings: Setting!
+}
+"Nothing but the pair."
+type BareParam { kind: SettingKind! settings: Setting! }
+
 input CardInput { token: String! }
 
 "A tree holding itself through a list, which is what makes its schema recursive."
@@ -279,6 +293,73 @@ fn rust_snapshot() -> TestResult {
     // `ApiError`.
     assert!(out.contains("match service.get(input).await"));
     assert!(out.contains("Err(error) => error.into_response(),"));
+    Ok(())
+}
+
+/// A union tagged beside the field holding it: the tag and the member are two
+/// keys of the holder, `{"kind": "flag", "settings": {…}}`, and every target
+/// has to pair them rather than emit two independent fields.
+#[test]
+fn sibling_tagged_union_snapshot() -> TestResult {
+    let api = api()?;
+
+    let rust = generate_rust::generate(&api, &config())?;
+    assert!(rust.contains("#[serde(tag = \"kind\", content = \"settings\")]\npub enum Setting {"));
+    let param = rust
+        .split("pub struct Param {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .ok_or("the holder is emitted as a struct")?;
+    assert!(
+        param.contains("    #[serde(flatten)]\n    pub settings: Setting,"),
+        "{param}"
+    );
+    // The enum writes the tag, so a field of its own would claim the key twice.
+    assert!(!param.contains("pub kind:"), "{param}");
+
+    let ts = generate_typescript::generate(&api);
+    assert!(ts.contains("export type Setting =\n  | FlagSetting\n  | NumberSetting\n"));
+    assert!(ts.contains("export type Param = {\n  label: string\n} & (\n"));
+    assert!(ts.contains("  | { kind: 'flag'; settings: FlagSetting }\n"));
+    assert!(ts.contains("  | { kind: 'number'; settings: NumberSetting }\n"));
+    assert!(ts.contains("  /** Which shape `settings` takes. */\n"));
+    assert!(!ts.contains("export interface Param "));
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&generate_openapi::generate(&api, &config())?)?;
+    let schemas = &doc["components"]["schemas"];
+    assert!(schemas["Setting"]["discriminator"].is_null());
+    assert_eq!(
+        schemas["Setting"]["oneOf"][0]["$ref"],
+        "#/components/schemas/FlagSetting"
+    );
+    assert!(schemas["FlagSetting_Tagged"].is_null());
+
+    let base = &schemas["Param"]["allOf"][0];
+    assert!(base["properties"]["label"].is_object());
+    assert!(base["properties"]["kind"].is_null());
+    assert!(base["properties"]["settings"].is_null());
+
+    let flag = &schemas["Param"]["allOf"][1]["oneOf"][0];
+    assert_eq!(flag["properties"]["kind"]["const"], "flag");
+    assert_eq!(
+        flag["properties"]["kind"]["description"],
+        "Which shape `settings` takes."
+    );
+    assert_eq!(
+        flag["properties"]["settings"]["$ref"],
+        "#/components/schemas/FlagSetting"
+    );
+    assert_eq!(flag["required"], serde_json::json!(["kind", "settings"]));
+
+    // A holder with nothing but the pair is the arms alone, not an empty
+    // object intersected with them.
+    assert!(ts.contains("export type BareParam =\n  | { kind: 'flag'; settings: FlagSetting }\n"));
+    assert!(schemas["BareParam"]["allOf"].is_null());
+    assert_eq!(
+        schemas["BareParam"]["oneOf"][1]["properties"]["kind"]["const"],
+        "number"
+    );
     Ok(())
 }
 

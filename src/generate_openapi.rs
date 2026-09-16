@@ -327,10 +327,11 @@ fn schemas(api: &Api) -> Map<String, Value> {
                 schemas.insert(e.name.clone(), Value::Object(schema));
             }
             ApiType::Object(o) => {
-                schemas.insert(
-                    o.name.clone(),
-                    object_schema(api, &o.description, &o.fields),
-                );
+                let schema = match api.sibling_tagged(o) {
+                    Some(sibling) => sibling_holder_schema(api, o, sibling),
+                    None => object_schema(api, &o.description, &o.fields),
+                };
+                schemas.insert(o.name.clone(), schema);
             }
             ApiType::InputObject(i) if i.one_of => {
                 // Within its own variant the chosen member is present and
@@ -365,6 +366,22 @@ fn schemas(api: &Api) -> Map<String, Value> {
                 );
             }
             ApiType::Union(u) => {
+                let Tagging::Internal { tag } = &u.tagging else {
+                    // The holder carries the tag and pairs it with the member,
+                    // so the union alone is only the shapes it may take.
+                    let mut schema = Map::new();
+                    if let Some(d) = &u.description {
+                        schema.insert("description".into(), json!(d));
+                    }
+                    let members: Vec<Value> = u
+                        .members
+                        .iter()
+                        .map(|m| json!({ "$ref": format!("#/components/schemas/{}", m.name) }))
+                        .collect();
+                    schema.insert("oneOf".into(), Value::Array(members));
+                    schemas.insert(u.name.clone(), Value::Object(schema));
+                    continue;
+                };
                 let variants: Vec<Value> = u
                     .members
                     .iter()
@@ -386,7 +403,7 @@ fn schemas(api: &Api) -> Map<String, Value> {
                 schema.insert("oneOf".into(), Value::Array(variants));
                 schema.insert(
                     "discriminator".into(),
-                    json!({ "propertyName": u.discriminator, "mapping": Value::Object(mapping) }),
+                    json!({ "propertyName": tag, "mapping": Value::Object(mapping) }),
                 );
                 schemas.insert(u.name.clone(), Value::Object(schema));
 
@@ -401,9 +418,9 @@ fn schemas(api: &Api) -> Map<String, Value> {
                                 {
                                     "type": "object",
                                     "properties": {
-                                        u.discriminator.clone(): { "type": "string", "const": m.tag }
+                                        tag.clone(): { "type": "string", "const": m.tag }
                                     },
-                                    "required": [u.discriminator.clone()],
+                                    "required": [tag.clone()],
                                 }
                             ]
                         }),
@@ -493,6 +510,73 @@ fn object_schema(api: &Api, description: &Option<String>, fields: &[Field]) -> V
     if !required.is_empty() {
         schema.insert("required".into(), json!(required));
     }
+    Value::Object(schema)
+}
+
+/// An object holding a sibling-tagged union: its other fields, plus one branch
+/// per member pinning the tag to that member's value and the held field to its
+/// shape.
+///
+/// A `discriminator` cannot express this: OpenAPI reads the tag from inside the
+/// variant, and here the variant is two keys of the holder.
+fn sibling_holder_schema(
+    api: &Api,
+    o: &ObjectType,
+    (held, union, tag): (&Field, &UnionType, &str),
+) -> Value {
+    let rest: Vec<Field> = o
+        .fields
+        .iter()
+        .filter(|f| f.name != tag && f.name != held.name)
+        .cloned()
+        .collect();
+    let tag_description = o
+        .fields
+        .iter()
+        .find(|f| f.name == tag)
+        .and_then(|f| f.description.clone());
+
+    let branches: Vec<Value> = union
+        .members
+        .iter()
+        .map(|m| {
+            let mut tag_schema = Map::new();
+            if let Some(d) = &tag_description {
+                tag_schema.insert("description".into(), json!(d));
+            }
+            tag_schema.insert("type".into(), json!("string"));
+            tag_schema.insert("const".into(), json!(m.tag));
+            let member = Field {
+                ty: TypeRef::Named {
+                    name: m.name.clone(),
+                    nullable: false,
+                },
+                ..held.clone()
+            };
+            json!({
+                "type": "object",
+                "properties": {
+                    tag: Value::Object(tag_schema),
+                    held.name.clone(): field_schema(api, &member),
+                },
+                "required": [tag, held.name.clone()],
+            })
+        })
+        .collect();
+
+    let mut schema = Map::new();
+    if let Some(d) = &o.description {
+        schema.insert("description".into(), json!(d));
+    }
+    // A holder with nothing but the pair is the branches alone; an empty object
+    // schema beside them would constrain nothing.
+    match rest.is_empty() {
+        true => schema.insert("oneOf".into(), Value::Array(branches)),
+        false => schema.insert(
+            "allOf".into(),
+            json!([object_schema(api, &None, &rest), { "oneOf": branches }]),
+        ),
+    };
     Value::Object(schema)
 }
 

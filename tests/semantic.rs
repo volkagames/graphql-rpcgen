@@ -4,7 +4,7 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-use graphql_rpcgen::ir::{ApiType, OperationKind, TypeRef};
+use graphql_rpcgen::ir::{ApiType, OperationKind, Tagging, TypeRef};
 
 /// Minimal preamble so each case only states what it is testing.
 const PRELUDE: &str = r#"
@@ -504,7 +504,155 @@ union U = A | B
     let ApiType::Union(u) = api.find_type("U").ok_or("union exists")? else {
         return Err("the type is a union".into());
     };
-    assert_eq!(u.discriminator, "kind");
+    assert_eq!(u.tagging, Tagging::Internal { tag: "kind".into() });
+    Ok(())
+}
+
+/// The pieces a sibling-tagged union needs, with the holder left to each case.
+const SIBLING: &str = r#"
+enum Kind { flag number }
+type Flag @variant(tag: "flag") { tribool: Boolean }
+type Num @variant(tag: "number") { min: Int }
+union Setting @discriminator(sibling: "kind") = Flag | Num
+"#;
+
+/// The content key is the name of the field holding the union, which only the
+/// holder knows.
+#[test]
+fn a_sibling_tag_takes_its_content_key_from_the_holder() -> TestResult {
+    let api = compile(&format!(
+        "{SIBLING}type Param {{ kind: Kind! settings: Setting! }}"
+    ))?;
+    let ApiType::Union(u) = api.find_type("Setting").ok_or("union exists")? else {
+        return Err("the type is a union".into());
+    };
+    assert_eq!(
+        u.tagging,
+        Tagging::Sibling {
+            tag: "kind".into(),
+            content: "settings".into()
+        }
+    );
+    Ok(())
+}
+
+/// The tag names a holder field, so it is spelled as the SDL spells that field
+/// and reaches the wire snake_cased like every other field.
+#[test]
+fn a_camel_case_sibling_tag_names_the_holder_field() -> TestResult {
+    let api = compile(
+        r#"
+enum Kind { a }
+type A @variant(tag: "a") { x: Int }
+union U @discriminator(sibling: "settingKind") = A
+type H { settingKind: Kind! u: U! }
+"#,
+    )?;
+    let ApiType::Union(u) = api.find_type("U").ok_or("union exists")? else {
+        return Err("the type is a union".into());
+    };
+    assert_eq!(
+        u.tagging,
+        Tagging::Sibling {
+            tag: "setting_kind".into(),
+            content: "u".into()
+        }
+    );
+    Ok(())
+}
+
+/// Beside the member, a member field named like the tag collides with nothing.
+#[test]
+fn a_sibling_tagged_member_may_declare_a_field_named_like_the_tag() -> TestResult {
+    compile(
+        r#"
+enum Kind { a }
+type A @variant(tag: "a") { kind: String! }
+union U @discriminator(sibling: "kind") = A
+type H { kind: Kind! u: U! }
+"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn field_and_sibling_together_are_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+type A { a: String! }
+union U @discriminator(field: "kind", sibling: "kind") = A
+"#,
+    )?;
+    assert!(e.contains("not both"), "{e}");
+    Ok(())
+}
+
+#[test]
+fn a_sibling_tagged_union_nobody_holds_is_rejected() -> TestResult {
+    let e = expect_error(SIBLING)?;
+    assert!(e.contains("no object field holds it"), "{e}");
+    Ok(())
+}
+
+/// One Rust enum spells the content key once, so every holder must agree on it.
+#[test]
+fn holders_naming_the_field_differently_are_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        "{SIBLING}type A {{ kind: Kind! settings: Setting! }}\ntype B {{ kind: Kind! config: Setting! }}"
+    ))?;
+    assert!(e.contains("must share one name"), "{e}");
+    Ok(())
+}
+
+#[test]
+fn a_nullable_or_list_holder_field_is_rejected() -> TestResult {
+    for field in ["settings: Setting", "settings: [Setting!]!"] {
+        let e = expect_error(&format!("{SIBLING}type Param {{ kind: Kind! {field} }}"))?;
+        assert!(e.contains("non-null and not a list"), "{field}: {e}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_holder_without_the_tag_enum_is_rejected() -> TestResult {
+    for tag in ["", "kind: String!", "kind: Kind"] {
+        let e = expect_error(&format!(
+            "{SIBLING}type Param {{ {tag} settings: Setting! }}"
+        ))?;
+        assert!(
+            e.contains("must declare `kind` as a non-null enum"),
+            "{tag:?}: {e}"
+        );
+    }
+    Ok(())
+}
+
+/// A subset in either direction is a tag the holder cannot read or a member it
+/// can never carry.
+#[test]
+fn a_tag_enum_that_differs_from_the_member_tags_is_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        "{SIBLING}enum Narrow {{ flag }}\ntype Param {{ kind: Narrow! settings: Setting! }}"
+    ))?;
+    assert!(e.contains(r#"members with no value: ["number"]"#), "{e}");
+    Ok(())
+}
+
+#[test]
+fn two_sibling_tagged_unions_in_one_holder_are_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        "{SIBLING}type Param {{ kind: Kind! settings: Setting! other: Setting! }}"
+    ))?;
+    assert!(e.contains("more than one sibling-tagged union"), "{e}");
+    Ok(())
+}
+
+#[test]
+fn a_sibling_tagged_union_as_an_operation_output_is_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        "{SIBLING}type Param {{ kind: Kind! settings: Setting! }}\ntype S @service {{ get: Setting! @query }}"
+    ))?;
+    assert!(e.contains("an operation's output has no holder"), "{e}");
     Ok(())
 }
 

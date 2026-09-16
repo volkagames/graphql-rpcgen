@@ -618,8 +618,19 @@ fn emit_object(out: &mut String, api: &Api, o: &ObjectType) {
     emit_doc(out, "", &o.description);
     out.push_str("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
     let _ = writeln!(out, "pub struct {} {{", o.name);
+    let sibling = api.sibling_tagged(o);
     for f in &o.fields {
-        emit_struct_field(out, api, &o.name, f);
+        match sibling {
+            // The enum writes and reads the tag itself, so a field of its own
+            // would claim the same key twice.
+            Some((_, _, tag)) if f.name == tag => {}
+            Some((held, _, _)) if held.name == f.name => {
+                emit_doc(out, "    ", &f.description);
+                out.push_str("    #[serde(flatten)]\n");
+                emit_field_body(out, api, &o.name, f);
+            }
+            _ => emit_struct_field(out, api, &o.name, f),
+        }
     }
     out.push_str("}\n");
 }
@@ -991,11 +1002,21 @@ fn emit_union(out: &mut String, u: &UnionType) {
     out.push('\n');
     emit_doc(out, "", &u.description);
     out.push_str("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
-    let _ = writeln!(out, "#[serde(tag = {:?})]", u.discriminator);
+    match &u.tagging {
+        Tagging::Internal { tag } => {
+            let _ = writeln!(out, "#[serde(tag = {tag:?})]");
+        }
+        // Adjacently tagged, and flattened into the holder by `emit_object`:
+        // the tag and the member become two keys of the holding object.
+        Tagging::Sibling { tag, content } => {
+            let _ = writeln!(out, "#[serde(tag = {tag:?}, content = {content:?})]");
+        }
+    }
     let _ = writeln!(out, "pub enum {} {{", u.name);
     for member in &u.members {
         // Internally tagged newtype variants flatten the member's fields
-        // alongside the tag, giving {"kind":"CardPayment","last4":"4242"}.
+        // alongside the tag, giving {"kind":"CardPayment","last4":"4242"};
+        // adjacently tagged ones nest them under the content key.
         if member.tag != member.name {
             let _ = writeln!(out, "    #[serde(rename = {:?})]", member.tag);
         }

@@ -116,8 +116,39 @@ pub struct UnionType {
     pub name: String,
     pub description: Option<String>,
     pub members: Vec<UnionMember>,
-    /// Wire field holding the variant tag; defaults to `kind`.
-    pub discriminator: String,
+    /// Where the variant tag sits on the wire; inside the member under `kind`
+    /// unless `@discriminator` says otherwise.
+    pub tagging: Tagging,
+}
+
+/// Where a union's variant tag sits on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tagging {
+    /// A key of the member object itself, from `@discriminator(field:)`:
+    /// `{"kind": "card", "last4": "4242"}`.
+    Internal { tag: String },
+    /// A key of the object holding the union, beside the key the member sits
+    /// under, from `@discriminator(sibling:)`:
+    /// `{"type": "bool", "settings": {"tribool": true}}`.
+    ///
+    /// For a union selected by a field its holder declares anyway — a template
+    /// field whose `type` decides the shape of its `settings`. The member then
+    /// carries no copy of the tag, so the two cannot disagree.
+    Sibling {
+        tag: String,
+        /// Name of the field holding the union. Every holder names it the same,
+        /// which is what lets one Rust enum spell it as its `content` key.
+        content: String,
+    },
+}
+
+impl Tagging {
+    /// The wire key holding the tag, wherever that key sits.
+    pub fn tag(&self) -> &str {
+        match self {
+            Tagging::Internal { tag } | Tagging::Sibling { tag, .. } => tag,
+        }
+    }
 }
 
 /// One member of a union, and the tag value that selects it on the wire.
@@ -342,6 +373,27 @@ impl Api {
             Some(ApiType::Scalar(s)) => Some(s),
             _ => None,
         }
+    }
+
+    /// The sibling-tagged union an object holds: the field holding it, the
+    /// union, and the name of the field carrying its tag.
+    ///
+    /// At most one per object, which the compiler enforces. Every target emits
+    /// that pair of fields as one construct rather than as two fields, since
+    /// neither says anything on its own.
+    pub fn sibling_tagged<'a>(
+        &'a self,
+        o: &'a ObjectType,
+    ) -> Option<(&'a Field, &'a UnionType, &'a str)> {
+        o.fields
+            .iter()
+            .find_map(|f| match self.find_type(f.ty.base_name()) {
+                Some(ApiType::Union(u)) => match &u.tagging {
+                    Tagging::Sibling { tag, .. } => Some((f, u, tag.as_str())),
+                    Tagging::Internal { .. } => None,
+                },
+                _ => None,
+            })
     }
 
     /// Whether the named type is a binary scalar. See [`ScalarType::is_binary`].
