@@ -166,13 +166,38 @@ do not pull in each other, so a client-only consumer needs no web framework:
 | --- | --- |
 | `rust_types` | `serde`, `serde_json`, `derive_more`, `treat`, `regex`, `validator`, `error_set`, plus whatever each `@scalar(rust:)` names — typically `uuid` and `chrono` |
 | `rust_server` | `axum`, `async-trait`, and `treat` with its `axum` and `validator-extract` features |
-| `rust_client` | `reqwest` with its `json` feature |
+| `rust_client` | `reqwest` with its `json` feature; `treat` for the envelope and its error entries, no features needed |
 
 Those are the features the generated code needs to *compile*. The OpenAPI
 document additionally describes an `x-rpc-status` header on every response,
 which no generated handler writes: it comes from `treat`'s middleware, so a
 server meant to honour that document also needs `treat`'s `rpc-status-header`
 feature.
+
+Span traces are the other feature nothing here needs to compile, and the one
+easiest to forget. Without them an internal error logs as `connection lost`
+with no trace of which request or which record it came from. A server should
+enable `treat`'s `spantrace` feature **and** install `tracing_error::ErrorLayer`
+in its subscriber; with the feature alone the trace is printed empty, and
+nothing warns about it:
+
+```toml
+treat = { version = "0.23", features = ["axum", "validator-extract", "rpc-status-header", "spantrace"] }
+tracing-error = "0.2"
+```
+
+```rust
+use tracing_subscriber::prelude::*;
+
+tracing_subscriber::registry()
+    .with(tracing_subscriber::fmt::layer())
+    .with(tracing_error::ErrorLayer::default())
+    .init();
+```
+
+The details, including why a trace can go missing, are in `treat`'s
+[span traces](https://github.com/volkagames/treat/blob/main/docs/errors.md#span-traces)
+section.
 
 An API declaring a `@subscription` or a `@raw` body emits a streaming runtime on
 top of that, which a plain JSON API never compiles:

@@ -243,6 +243,31 @@ fn the_client_imports_types_from_the_shared_path() -> TestResult {
     Ok(())
 }
 
+/// The envelope is `treat`'s, so the client decodes the type the server encodes
+/// rather than a copy that can drift from it.
+#[test]
+fn the_client_reuses_the_treat_envelope() -> TestResult {
+    let api = graphql_rpcgen::compile_str(&sdl(PLAIN_SDL))?;
+    let client = graphql_rpcgen::generate_rust_client::generate(&api, &Config::default())?;
+
+    assert!(
+        client.contains("pub use treat::{ErrorMessage, ErrorSource};"),
+        "{client}"
+    );
+    assert!(client.contains("= treat::ApiResponse<T,"), "{client}");
+    for copy in [
+        "pub struct ErrorMessage",
+        "pub struct ErrorSource",
+        "pub struct ApiResponse",
+    ] {
+        assert!(
+            !client.contains(copy),
+            "`{copy}` must come from treat, not a copy"
+        );
+    }
+    Ok(())
+}
+
 /// SDL for an operation reading everything from the session.
 const NO_INPUT_SDL: &str = r#"
 type MeOutput { id: ID! }

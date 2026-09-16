@@ -4,53 +4,16 @@
 use std::marker::PhantomData;
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 {{{types_import}}}
-/// Locator for the offending input, mirroring the JSON:API `source` member.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ErrorSource {
-    /// RFC 6901 JSON Pointer, e.g. `/device_info/sdk_version`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pointer: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parameter: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub header: Option<String>,
-}
-
-/// One entry of the wire `errors[]` array.
-///
-/// `code` stays a plain string: a server newer than this client must still be
-/// reportable rather than fail to parse. [`ApiErrors::code`] converts it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ErrorMessage {
-    pub code: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// Free-form context, typed as a map so `meta["clan_id"]` needs no cast.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<ErrorSource>,
-    /// RFC 9457 `type`: a URI identifying the error kind.
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub type_uri: Option<String>,
-    /// RFC 9457 `instance`: id or URI of this specific occurrence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<String>,
-}
+/// The error entries are `treat`'s own, so the client decodes exactly the type
+/// the server encodes and the two cannot drift apart.
+pub use treat::{ErrorMessage, ErrorSource};
 
 /// The response envelope, used for both success and failure.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiResponse<T> {
-    #[serde(default = "Option::default")]
-    pub data: Option<T>,
-    /// Envelope-level context, alongside `data` rather than about one error.
-    #[serde(default)]
-    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default)]
-    pub errors: Vec<ErrorMessage>,
-}
+///
+/// Envelope-level `meta` is typed as a map, so `meta["page"]` needs no cast.
+pub type ApiResponse<T> = treat::ApiResponse<T, serde_json::Map<String, serde_json::Value>>;
 
 /// Everything a call can fail with.
 ///
@@ -197,7 +160,10 @@ impl {{{client_name}}} {
     ///
     /// The status line is not the signal: this API answers `200 OK` even when
     /// the call failed, so `errors[]` decides the outcome and is checked first.
-    pub async fn call<I: Serialize, O: DeserializeOwned, C>(
+    ///
+    /// `O: Serialize` comes with `treat`'s envelope, and is kept on purpose: a
+    /// decoded answer can be logged or attached to a diagnostic as it arrived.
+    pub async fn call<I: Serialize, O: DeserializeOwned + Serialize, C>(
         &self,
         path: &str,
         input: &I,

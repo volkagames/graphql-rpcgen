@@ -308,7 +308,7 @@ impl {{{client_name}}} {
 
     /// A raw request whose answer is an ordinary envelope — an upload
     /// reporting what it wrote.
-    pub async fn raw_request_json<I: Serialize, O: DeserializeOwned, C>(
+    pub async fn raw_request_json<I: Serialize, O: DeserializeOwned + Serialize, C>(
         &self,
         path: &str,
         input: &I,

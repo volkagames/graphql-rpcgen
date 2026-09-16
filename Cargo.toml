@@ -52,7 +52,7 @@ reqwest = { version = "0.13", default-features = false, features = [
   "rustls",
   "stream",
 ] }
-treat = { version = "0.22", features = [
+treat = { version = "0.23", features = [
   "axum",
   "rpc-status-header",
   "serde-path",

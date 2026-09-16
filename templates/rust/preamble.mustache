@@ -65,18 +65,8 @@ impl<T> Narrow<T> for Result<T, Failure> {
                     );
                     // The raised code is merged into whatever diagnostics the
                     // check below already attached, because this branch is the
-                    // untested path and its `meta` is what says why. A `meta`
-                    // that is not an object cannot take a key, so it is nested
-                    // under `meta` instead of being dropped.
-                    let mut meta = match failure.meta() {
-                        Some(serde_json::Value::Object(existing)) => existing.clone(),
-                        Some(other) => {
-                            let mut map = serde_json::Map::new();
-                            map.insert("meta".to_string(), other.clone());
-                            map
-                        }
-                        None => serde_json::Map::new(),
-                    };
+                    // untested path and its `meta` is what says why.
+                    let mut meta = failure.meta().cloned().unwrap_or_default();
                     meta.insert(
                         UNDECLARED_CODE_META.to_string(),
                         serde_json::Value::String(raised.to_string()),

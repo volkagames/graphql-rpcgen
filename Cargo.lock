@@ -1840,9 +1840,9 @@ dependencies = [
 
 [[package]]
 name = "treat"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc599a87fd947b2eb8070f6f04707204f5d532630e045940f8ad31bbe785234d"
+checksum = "1cf8b8fce08c28b965f39f2d9eeaf6f2d76abe087eb00218e965d8eeac1487a5"
 dependencies = [
  "treat-core",
  "treat-derive",
@@ -1850,9 +1850,9 @@ dependencies = [
 
 [[package]]
 name = "treat-core"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a182e2c96328d91719c80d958ca868c0f454cc004100b7583f57b178c8623391"
+checksum = "87bfcb0c2fb44633921858b5225cbfc834a3eb5554147ee6574640db66074892"
 dependencies = [
  "axum",
  "cfg_block",
@@ -1865,9 +1865,9 @@ dependencies = [
 
 [[package]]
 name = "treat-derive"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05c3c8600b305b5aa2d517e98ec6717aeb568f380903cfb5495966c1ad5e5a10"
+checksum = "ff902ca193e40f0e96714cc7efcb037e510d4f9f6bcd458f890c88c290821d83"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
