@@ -14,6 +14,10 @@
 //! a scratch cargo project, offline, with versions pinned to this crate's
 //! lockfile — the arrangement `oneof_wire` already uses and for the same
 //! reasons.
+//!
+//! A streamed request is the one form whose point is behaviour rather than
+//! shape — a body larger than `RAW_BODY_LIMIT` getting through — so the scratch
+//! project also serves the router on a local port and sends it one.
 
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
@@ -70,7 +74,22 @@ input ConvertInput {
   body: Binary!
 }
 
+input UploadInput {
+  id: UUID!
+  "Left empty by the server: the payload reaches the service unread."
+  body: Binary!
+}
+
 type IngestResult { written: Int! }
+
+type UploadResult {
+  "Bytes the service read from the body."
+  received: Int!
+  "The `Content-Length` the request declared."
+  declared: Int
+  "Whether every byte read was the byte the test sent."
+  intact: Boolean!
+}
 
 type Files @service {
   "A stream of events, sharing the runtime the raw forms emit."
@@ -100,24 +119,65 @@ type Files @service {
     @mutation
     @rpc(path: "/convert")
     @raw(request: ["text/csv"], response: ["application/json"])
+
+  "Bytes in unread, JSON out."
+  upload(input: UploadInput!): UploadResult!
+    @mutation
+    @rpc(path: "/upload")
+    @raw(request: ["application/octet-stream"], stream: true)
+
+  "Bytes in unread, bytes out, for a caller with a session: the one form with every extractor."
+  echo(input: ConvertInput!): Binary!
+    @mutation
+    @rpc(path: "/echo")
+    @raw(request: ["application/octet-stream"], response: ["application/octet-stream"], stream: true)
+    @auth(require: session)
 }
 "#;
 
-/// An implementation of the generated trait, and one use of each client method.
+/// An implementation of the generated trait, one use of each client method, and
+/// the streamed request on the wire.
 ///
 /// Emitting a handler is not the same as being able to mount one: `post(h::<S>)`
 /// only proves out when axum's `Handler` bound is discharged, which is what
-/// building the router forces. The bodies answer with the smallest value of the
-/// right shape — nothing here asserts behaviour, only that the shapes check.
+/// building the router forces. The buffered bodies answer with the smallest
+/// value of the right shape — only their shapes are checked. The streamed ones
+/// read what they were sent, since that is what `wire` below asserts.
 const DRIVER: &str = r##"
 
 // --- driver ------------------------------------------------------------------
 
+use futures_util::io::AsyncReadExt;
+
 #[derive(Clone)]
 pub struct Files;
 
+/// A caller every request resolves to, so `echo` reaches its extractor and its
+/// call with a context without the test having a session to present.
+pub struct Caller;
+
+impl server::FromRequestContext for Caller {
+    async fn from_parts(
+        _parts: &mut axum::http::request::Parts,
+    ) -> Result<Self, axum::response::Response> {
+        Ok(Caller)
+    }
+
+    fn require_role(&self, _role: &str) -> Result<(), axum::response::Response> {
+        Ok(())
+    }
+}
+
+/// The byte at offset `i` of what `wire` sends, so the service can tell a body
+/// that arrived whole from one merely of the right length.
+pub fn pattern(i: usize) -> u8 {
+    (i % 251) as u8
+}
+
 #[async_trait::async_trait]
 impl server::FilesService for Files {
+    type Ctx = Caller;
+
     async fn watch(
         &self,
         _input: server::WatchInput,
@@ -159,6 +219,50 @@ impl server::FilesService for Files {
         // than a `(String, Vec<u8>)`.
         Ok(server::RawBody::new("text/csv", Vec::new()).attachment("report.csv"))
     }
+
+    async fn upload(
+        &self,
+        input: server::UploadInput,
+        body: server::RawRequest,
+    ) -> Result<
+        server::ApiResponse<server::UploadResult>,
+        server::ApiError<server::FilesUploadCodes>,
+    > {
+        assert!(input.body.is_empty(), "a streamed body is never put in the field");
+        let declared = body.content_length().map(|n| n as i32);
+        let mut reader = body.into_reader();
+        let mut received = 0usize;
+        let mut intact = true;
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let n = match reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return Err(server::error(server::FilesUploadCodes::InternalError)),
+            };
+            intact &= chunk[..n].iter().enumerate().all(|(i, b)| *b == pattern(received + i));
+            received += n;
+        }
+        Ok(server::success(server::UploadResult {
+            received: received as i32,
+            declared,
+            intact,
+        }))
+    }
+
+    async fn echo(
+        &self,
+        _ctx: &Caller,
+        _input: server::ConvertInput,
+        body: server::RawRequest,
+    ) -> Result<server::RawBody, server::ApiError<server::FilesEchoCodes>> {
+        let content_type = body.content_type().unwrap_or_default().to_string();
+        let mut bytes = Vec::new();
+        if body.into_reader().read_to_end(&mut bytes).await.is_err() {
+            return Err(server::error(server::FilesEchoCodes::InternalError));
+        }
+        Ok(server::RawBody::new(content_type, bytes))
+    }
 }
 
 /// Mounting every raw handler, which is what discharges axum's `Handler` bound.
@@ -178,14 +282,96 @@ async fn client_forms(api: &client::ApiClient) {
     let convert = types::ConvertInput { id: uuid::Uuid::nil(), body: Vec::new() };
     let ingest = types::IngestInput { id: uuid::Uuid::nil(), tags: None, body: Vec::new() };
     let report = types::ReportInput { id: uuid::Uuid::nil(), rows: None };
+    let upload = types::UploadInput { id: uuid::Uuid::nil(), body: Vec::new() };
     let watch = types::WatchInput { id: uuid::Uuid::nil() };
 
     let files = api.files();
     let _ = files.convert(&convert, "text/csv").await;
+    // A streamed operation is a raw request to the client: the server alone
+    // decides not to buffer it.
+    let _ = files.echo(&convert, "application/octet-stream").await;
     let _ = files.ingest(&ingest, "text/csv").await;
     let _ = files.manifest().await;
     let _ = files.report(&report).await;
+    let _ = files.upload(&upload, "application/octet-stream").await;
     let _ = files.watch(&watch).await;
+}
+
+#[cfg(test)]
+mod wire {
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Past the buffered bound by a margin, so a handler that still buffered
+    /// would answer `invalid_body` rather than the service's result.
+    const LARGE: usize = crate::server::RAW_BODY_LIMIT + 1024 * 1024 + 7;
+
+    const ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    /// The router on an ephemeral local port, and the base URL reaching it.
+    async fn serve() -> TestResult<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, super::router()).await });
+        Ok(format!("http://{addr}"))
+    }
+
+    fn body(len: usize) -> Vec<u8> {
+        (0..len).map(super::pattern).collect()
+    }
+
+    /// A body with a `Content-Length` larger than any buffered body may be,
+    /// read whole by the service.
+    #[tokio::test]
+    async fn a_large_body_reaches_the_service_whole() -> TestResult {
+        let base = serve().await?;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/upload?id={ID}"))
+            .header("content-type", "application/octet-stream")
+            .body(body(LARGE))
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let json: serde_json::Value = response.json().await?;
+        assert_eq!(json["data"]["received"], LARGE, "{json}");
+        assert_eq!(json["data"]["declared"], LARGE, "{json}");
+        assert_eq!(json["data"]["intact"], true, "{json}");
+        Ok(())
+    }
+
+    /// The query string is still the input, and still rejected as one.
+    #[tokio::test]
+    async fn a_bad_query_is_invalid_body() -> TestResult {
+        let base = serve().await?;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/upload?id=nope"))
+            .body(body(10))
+            .send()
+            .await?;
+        let json: serde_json::Value = response.json().await?;
+        assert_eq!(json["errors"][0]["code"], "invalid_body", "{json}");
+        Ok(())
+    }
+
+    /// A streamed request answering with raw bytes, through the context
+    /// extractor.
+    #[tokio::test]
+    async fn a_streamed_raw_response_echoes_the_body() -> TestResult {
+        let base = serve().await?;
+        let sent = body(LARGE);
+        let response = reqwest::Client::new()
+            .post(format!("{base}/echo?id={ID}"))
+            .header("content-type", "application/octet-stream")
+            .body(sent.clone())
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers().get("content-type").map(|v| v.as_bytes()),
+            Some(&b"application/octet-stream"[..])
+        );
+        assert!(response.bytes().await? == sent, "the echo must be the body sent");
+        Ok(())
+    }
 }
 "##;
 
@@ -211,8 +397,10 @@ fn generated() -> TestResult<(String, String, String)> {
 /// source of truth for versions.
 ///
 /// `form_urlencoded` and `reqwest`'s `stream` feature are in this list for the
-/// raw and streaming runtime alone: drop either and the emitted code stops
-/// compiling, which is the failure this test exists to make visible.
+/// raw and streaming runtime alone, and `futures-util`'s `io` feature for a
+/// streamed request: drop any of them and the emitted code stops compiling,
+/// which is the failure this test exists to make visible. `tokio` is the
+/// driver's alone, for the `wire` tests.
 const DEPENDENCIES: &[&str] = &[
     "async-trait",
     "axum",
@@ -227,6 +415,7 @@ const DEPENDENCIES: &[&str] = &[
     "reqwest",
     "serde",
     "serde_json",
+    "tokio",
     "treat",
     "uuid",
     "validator",
@@ -237,10 +426,12 @@ fn features_of(dep: &str) -> &'static str {
     match dep {
         "chrono" => r#"{ version = "{v}", features = ["serde"] }"#,
         "derive_more" => r#"{ version = "{v}", features = ["from", "into", "display", "as_ref"] }"#,
+        "futures-util" => r#"{ version = "{v}", features = ["io"] }"#,
         "reqwest" => {
             r#"{ version = "{v}", default-features = false, features = ["json", "rustls", "stream"] }"#
         }
         "serde" => r#"{ version = "{v}", features = ["derive"] }"#,
+        "tokio" => r#"{ version = "{v}", features = ["macros", "net", "rt"] }"#,
         // `validator-extract` already implies `serde-path`, which is what
         // `treat::extract_axum` needs; `rpc-status-header` compiles nothing
         // here but is what emits the `x-rpc-status` the OpenAPI document
@@ -306,7 +497,7 @@ fn manifest_for(root: &std::path::Path) -> TestResult<String> {
 }
 
 #[test]
-fn the_generated_raw_server_and_client_compile() -> TestResult {
+fn the_generated_raw_server_and_client_compile_and_serve() -> TestResult {
     let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))?;
 
     // Stable locations: the project's lockfile and target directory survive
@@ -327,10 +518,9 @@ fn the_generated_raw_server_and_client_compile() -> TestResult {
     )?;
     std::fs::write(project.join("Cargo.toml"), manifest_for(&root)?)?;
 
-    // `build`, not `test`: what is being asserted is that rustc accepts the
-    // emitted code. The wire behaviour it would run is `oneof_wire`'s job.
+    // `--lib`: the emitted doc comments are documentation, not doctests.
     let output = Command::new("cargo")
-        .args(["build", "--quiet", "--offline"])
+        .args(["test", "--lib", "--quiet", "--offline"])
         .current_dir(&project)
         .env("CARGO_TARGET_DIR", &project_target)
         .output()?;
@@ -338,7 +528,7 @@ fn the_generated_raw_server_and_client_compile() -> TestResult {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "the generated raw server and client must compile:\n{stdout}\n{stderr}"
+        "the generated raw server and client must compile and pass the wire tests:\n{stdout}\n{stderr}"
     );
     Ok(())
 }

@@ -685,7 +685,7 @@ impl<'a> Analyzer<'a> {
             }
         };
 
-        let (raw_request, raw_response) = self
+        let (raw_request, raw_response, raw_request_stream) = self
             .raw_bodies(file, service, field, kind)
             .unwrap_or_default();
 
@@ -843,6 +843,7 @@ impl<'a> Analyzer<'a> {
             output,
             errors,
             raw_request,
+            raw_request_stream,
             raw_response,
             auth,
             role,
@@ -945,7 +946,8 @@ impl<'a> Analyzer<'a> {
         Some((require, role))
     }
 
-    /// The media types `@raw` declares for each direction.
+    /// The media types `@raw` declares for each direction, and whether the
+    /// request body is streamed rather than buffered.
     ///
     /// Returns `None` on a malformed declaration, having recorded why; the
     /// caller carries on with no raw bodies so the rest of the operation is
@@ -957,7 +959,7 @@ impl<'a> Analyzer<'a> {
         service: &str,
         field: &GqlField<'static, String>,
         kind: OperationKind,
-    ) -> Option<(Option<Vec<String>>, Option<Vec<String>>)> {
+    ) -> Option<(Option<Vec<String>>, Option<Vec<String>>, bool)> {
         let d = find_directive(&field.directives, "raw")?;
         let op = format!("`{service}.{}`", field.name);
 
@@ -1000,7 +1002,30 @@ impl<'a> Analyzer<'a> {
             }
         }
 
-        Some((request, response))
+        let stream = match bool_arg(d, "stream") {
+            Some(stream) => stream,
+            None if d.arguments.iter().all(|(n, _)| n != "stream") => false,
+            None => {
+                self.errors.push(CompileError::at(
+                    format!("{op}: @raw(stream:) must be a boolean"),
+                    file,
+                    field.position,
+                ));
+                return None;
+            }
+        };
+        // Only the request body is ever streamed, and without `request:` the
+        // request has no body of its own to stream.
+        if stream && request.is_none() {
+            self.errors.push(CompileError::at(
+                format!("{op}: @raw(stream: true) needs `request:` — it streams the request body"),
+                file,
+                field.position,
+            ));
+            return None;
+        }
+
+        Some((request, response, stream))
     }
 
     /// Keep a binary scalar and `@raw` in step with each other.
@@ -1088,6 +1113,24 @@ impl<'a> Analyzer<'a> {
                          declare @raw(request:)",
                         many[0]
                     ))),
+                }
+
+                // A streamed body is never read into the field, so a bound on it
+                // would measure the empty value the server leaves there and pass
+                // or fail regardless of what was sent. Resolved, because a
+                // `@length` on the binary scalar reaches the field the same way.
+                if op.raw_request_stream {
+                    if let Some(f) = api.body_field(op) {
+                        let c = api.resolved_constraints(f);
+                        if c.min_length.is_some() || c.max_length.is_some() {
+                            self.errors.push(CompileError::new(format!(
+                                "{name}: @length on `{}` cannot apply to a streamed body, \
+                                 which is never read into the field; bound it in the service, \
+                                 from `RawRequest::content_length` and what it reads",
+                                f.name
+                            )));
+                        }
+                    }
                 }
 
                 if op.kind == OperationKind::Subscription && !bodies.is_empty() {

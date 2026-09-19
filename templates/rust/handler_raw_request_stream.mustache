@@ -1,0 +1,18 @@
+
+async fn {{{handler}}}<S: {{{trait_name}}}>(
+    State(service): State<S>,
+    {{{context_extractor}}}request: axum::extract::Request,
+) -> Response {
+{{{role_guard}}}    let (parts, body) = request.into_parts();
+    let input: {{{input}}} = match input_from_query(parts.uri.query(), &{{{query_fields}}}) {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    if let Err(violations) = validator::Validate::validate(&input) {
+        return invalid_input(&violations);
+    }
+    match service.{{{method}}}({{{context_arg}}}input, RawRequest { parts, body }).await {
+        Ok(response) => response.into_response(),
+        Err(error) => error.into_response(),
+    }
+}

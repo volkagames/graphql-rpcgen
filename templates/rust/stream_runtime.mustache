@@ -1,0 +1,65 @@
+
+// --- streamed request bodies -------------------------------------------------
+//
+// Emitted only for an API that has a `@raw(request:, stream: true)` operation,
+// so no other API needs `futures-util`'s `io` feature.
+
+/// A `@raw(request:, stream: true)` body, handed to the service unread.
+///
+/// **No size limit is applied; the service method receiving this owns it.**
+/// Nothing in the generated router bounds a streamed body — `RAW_BODY_LIMIT`
+/// covers buffered ones only. Skipping the buffer saves memory, but an
+/// unbounded body still fills a disk and holds a connection, so the method must
+/// set the bound: refuse on [`Self::content_length`] before reading, and count
+/// what it reads, since a chunked request declares no length at all.
+///
+/// The request's headers and extensions come along — `ConnectInfo` included,
+/// when the router is served with it — because the service may need them to
+/// decide whether to read the body at all.
+#[derive(Debug)]
+pub struct RawRequest {
+    parts: axum::http::request::Parts,
+    body: axum::body::Body,
+}
+
+impl RawRequest {
+    pub fn headers(&self) -> &axum::http::HeaderMap {
+        &self.parts.headers
+    }
+
+    pub fn extensions(&self) -> &axum::http::Extensions {
+        &self.parts.extensions
+    }
+
+    /// The declared `Content-Length`, or `None` when the request declares none
+    /// or one that is not a number.
+    pub fn content_length(&self) -> Option<u64> {
+        self.parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        self.parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)?
+            .to_str()
+            .ok()
+    }
+
+    pub fn into_body(self) -> axum::body::Body {
+        self.body
+    }
+
+    /// The body as a byte reader, for a service that copies it somewhere.
+    pub fn into_reader(self) -> impl futures_util::io::AsyncRead + Unpin + Send + 'static {
+        futures_util::TryStreamExt::into_async_read(futures_util::TryStreamExt::map_err(
+            self.body.into_data_stream(),
+            std::io::Error::other,
+        ))
+    }
+}

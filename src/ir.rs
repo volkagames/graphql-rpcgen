@@ -299,6 +299,14 @@ pub struct Operation {
     /// field, sent as the body verbatim, and the input's remaining fields move
     /// to the query string — there is only one body and the payload has it.
     pub raw_request: Option<Vec<String>>,
+    /// Whether the raw request body reaches the service unread, from
+    /// `@raw(request:, stream: true)`.
+    ///
+    /// Only the Rust server reads this. Every other target describes the same
+    /// operation as a buffered raw request: on the wire the two are one thing,
+    /// and only the server decides whether the body is held in memory. The
+    /// input's binary field stays declared and is left empty by the server.
+    pub raw_request_stream: bool,
     /// Media types the response body carries, when it is not the JSON envelope.
     ///
     /// Set by `@raw(response:)`. A failure still answers with the envelope, so

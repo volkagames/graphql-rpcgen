@@ -213,6 +213,10 @@ reads a raw request's parameters out of the query string, its one body having
 been spent on the payload, and the client reads a raw response back as a byte
 stream.
 
+A `@raw(request:, stream: true)` operation adds one more to `rust_server`: the
+**`io` feature** on `futures-util`, which `RawRequest::into_reader` needs. An API
+without a streamed request does not emit `RawRequest` and needs no such feature.
+
 The generated client groups operations by service, matching the TypeScript one:
 
 ```rust
@@ -446,7 +450,7 @@ type PaymentInput =
 | `@rpc(path:)` | FIELD | override the derived path |
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
 | `@subscription` | FIELD | a stream of events over SSE; the field's type is one event |
-| `@raw(request:, response:)` | FIELD | a body that is bytes rather than the JSON envelope |
+| `@raw(request:, response:, stream:)` | FIELD | a body that is bytes rather than the JSON envelope; `stream: true` hands the request body to the service unread |
 | `@auth(require:, role:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context |
 | `@mcp(expose:)` | OBJECT/FIELD | the operation is an MCP tool; surfaces as `x-mcp` in OpenAPI |
 | `@throws(codes:)` | FIELD | error codes the operation may return |
@@ -597,6 +601,49 @@ the one place deciding what an agent may call.
 A `@subscription` or `@raw` operation cannot be a tool — a tool call is one
 JSON request and one JSON response — and declaring one is a compile error
 rather than a tool that cannot honour its shape.
+
+### `@raw(stream:)`
+
+A `@raw(request:)` body is buffered before the service sees it, and bounded by
+`RAW_BODY_LIMIT` (8 MiB) because buffering is what spends the memory.
+`stream: true` hands it over unread instead, for an upload the server should
+copy somewhere rather than hold:
+
+```graphql
+input UploadInput { id: UUID!, body: Binary! }
+
+type Files @service {
+  upload(input: UploadInput!): UploadResult!
+    @mutation
+    @raw(request: ["application/octet-stream"], stream: true)
+}
+```
+
+```rust
+/// The request body arrives unread as `body`; `input.body` is always empty.
+/// No size limit is applied to it: this method must bound it — see [`RawRequest`].
+async fn upload(&self, input: UploadInput, body: RawRequest)
+    -> Result<ApiResponse<UploadResult>, ApiError<FilesUploadCodes>>;
+```
+
+The input is read from the query string and validated exactly as for a
+buffered request, and the service then gets the rest of the request as a
+`RawRequest`: `headers()`, `extensions()` (`ConnectInfo`, when the router is
+served with it), `content_length()`, `content_type()`, and the body through
+`into_body()` or `into_reader()`, a `futures_util::io::AsyncRead`.
+
+**No size limit is applied — the service method owns it.** Nothing in the
+generated router bounds a streamed body: `RAW_BODY_LIMIT` covers buffered ones
+only. Skipping the buffer saves memory, but an unbounded body still fills a disk
+and holds a connection, so the implementation must set the bound: refuse on
+`content_length()` before reading, and count what it reads, since a chunked
+request declares no length at all. `@length` on the binary field would measure
+the empty value the server leaves there, so it is a compile error on a streamed
+operation, inherited from the scalar or not.
+
+Only the Rust server changes. The input type keeps its binary field, and the
+TypeScript and Rust clients, zod and OpenAPI describe the operation exactly as
+a buffered raw request — on the wire the two are the same thing.
 
 ## Constraints
 
@@ -794,7 +841,8 @@ just ci                    # fmt-check, lints as errors, tests
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
   `@raw` form and a `@subscription` beside them, which is the only thing that
   checks the emitted handlers, client methods and streaming runtime against
-  rustc rather than against a `contains`
+  rustc rather than against a `contains`; the router is then served on a local
+  port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it
 
 `oneof_wire` and `raw_wire` build generated code against the versions in this
 repo's `Cargo.lock`, offline. Those crates (`treat`, `axum`, `reqwest`,

@@ -1147,6 +1147,100 @@ type Files @service {{
     Ok(())
 }
 
+/// A streamed request is a raw request in every respect but one, so it keeps
+/// the body field and the query parameters.
+#[test]
+fn a_streamed_request_compiles() -> TestResult {
+    let api = compile(&format!(
+        r#"{BINARY}
+input I {{ workspace_id: UUID!, body: Body! }}
+type R {{ ok: Boolean! }}
+type Files @service {{
+  put(input: I!): R!
+    @mutation
+    @raw(request: ["application/octet-stream"], stream: true)
+  plain(input: I!): R! @mutation @raw(request: ["text/csv"], stream: false)
+}}
+"#
+    ))?;
+
+    let ops = &api.services[0].operations;
+    let put = ops.iter().find(|o| o.name == "put").ok_or("put")?;
+    assert!(put.raw_request_stream);
+    assert_eq!(api.body_field(put).map(|f| f.name.as_str()), Some("body"));
+
+    let plain = ops.iter().find(|o| o.name == "plain").ok_or("plain")?;
+    assert!(!plain.raw_request_stream);
+    Ok(())
+}
+
+#[test]
+fn stream_without_a_request_is_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        r#"{BINARY}
+input I {{ id: UUID! }}
+type Files @service {{
+  get(input: I!): Body! @query @raw(response: ["text/csv"], stream: true)
+}}
+"#
+    ))?;
+    assert!(e.contains("@raw(stream: true) needs `request:`"), "{e}");
+    Ok(())
+}
+
+#[test]
+fn a_non_boolean_stream_is_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        r#"{BINARY}
+input I {{ id: UUID!, body: Body! }}
+type R {{ ok: Boolean! }}
+type Files @service {{
+  put(input: I!): R! @mutation @raw(request: ["text/csv"], stream: "yes")
+}}
+"#
+    ))?;
+    assert!(e.contains("@raw(stream:) must be a boolean"), "{e}");
+    Ok(())
+}
+
+/// A streamed body never lands in the field, so a bound on the field would
+/// measure the empty value left there — whether written on the field or
+/// inherited from the scalar.
+#[test]
+fn length_on_a_streamed_body_is_rejected() -> TestResult {
+    let on_field = expect_error(&format!(
+        r#"{BINARY}
+input I {{ id: UUID!, body: Body! @length(max: 10) }}
+type R {{ ok: Boolean! }}
+type Files @service {{
+  put(input: I!): R! @mutation @raw(request: ["text/csv"], stream: true)
+}}
+"#
+    ))?;
+    assert!(
+        on_field.contains("@length on `body` cannot apply to a streamed body"),
+        "{on_field}"
+    );
+
+    let on_scalar = expect_error(
+        r#"
+scalar Body
+  @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+  @length(max: 10)
+input I { id: UUID!, body: Body! }
+type R { ok: Boolean! }
+type Files @service {
+  put(input: I!): R! @mutation @raw(request: ["text/csv"], stream: true)
+}
+"#,
+    )?;
+    assert!(
+        on_scalar.contains("@length on `body` cannot apply to a streamed body"),
+        "{on_scalar}"
+    );
+    Ok(())
+}
+
 /// GraphQL enum values must be identifiers and several wire vocabularies are
 /// not, so the tag is what a value actually serialises to.
 #[test]

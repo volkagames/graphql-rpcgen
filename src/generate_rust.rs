@@ -72,6 +72,14 @@ const DEFAULT_HANDLER_RAW_RESPONSE_NO_INPUT: &str =
 const DEFAULT_HANDLER_RAW_REQUEST: &str =
     include_str!("../templates/rust/handler_raw_request.mustache");
 const DEFAULT_HANDLER_RAW_BOTH: &str = include_str!("../templates/rust/handler_raw_both.mustache");
+/// A raw request handed to the service unread, whichever kind of answer it
+/// gives: both `ApiResponse` and `RawBody` are `IntoResponse`, so one form
+/// serves both where the buffered request needs two.
+const DEFAULT_HANDLER_RAW_REQUEST_STREAM: &str =
+    include_str!("../templates/rust/handler_raw_request_stream.mustache");
+/// `RawRequest`, emitted only for an API with a streamed request: it is the one
+/// piece of the runtime that needs `futures-util`'s `io` feature.
+const DEFAULT_STREAM_RUNTIME: &str = include_str!("../templates/rust/stream_runtime.mustache");
 
 /// Variables the preamble template may reference, besides `template_vars`.
 ///
@@ -107,6 +115,8 @@ const RUNTIME_VARS: [&str; 2] = ["invalid_body_code", "internal_error_code"];
 /// The context runtime interpolates nothing: it names the project's trait and
 /// the extractor, both spelled the same in every project.
 const CONTEXT_RUNTIME_VARS: [&str; 0] = [];
+/// Nor does the stream runtime.
+const STREAM_RUNTIME_VARS: [&str; 0] = [];
 /// Variables the router template may reference, besides `template_vars`.
 const ROUTER_VARS: [&str; 4] = ["service", "module", "trait_name", "routes"];
 
@@ -118,6 +128,8 @@ struct Templates {
     /// The context extractor and its trait, rendered only for an API with a
     /// session-guarded operation.
     context_runtime: Template,
+    /// `RawRequest`, rendered only for an API with a streamed request body.
+    stream_runtime: Template,
     handler: Template,
     /// Handler form for an operation declaring no `input` argument.
     handler_no_input: Template,
@@ -128,6 +140,7 @@ struct Templates {
     handler_raw_request: Template,
     /// Bytes in and bytes out: an operation declaring both `@raw` directions.
     handler_raw_both: Template,
+    handler_raw_request_stream: Template,
     router: Template,
     /// Project-supplied values merged into every render.
     extra: Vars,
@@ -187,6 +200,12 @@ impl Templates {
                 &None,
                 &CONTEXT_RUNTIME_VARS,
             )?,
+            stream_runtime: compile(
+                DEFAULT_STREAM_RUNTIME,
+                "<builtin stream runtime>",
+                &None,
+                &STREAM_RUNTIME_VARS,
+            )?,
             handler_subscription: compile(
                 DEFAULT_HANDLER_SUBSCRIPTION,
                 "<builtin subscription handler>",
@@ -220,6 +239,12 @@ impl Templates {
             handler_raw_both: compile(
                 DEFAULT_HANDLER_RAW_BOTH,
                 "<builtin raw handler>",
+                &None,
+                &HANDLER_VARS,
+            )?,
+            handler_raw_request_stream: compile(
+                DEFAULT_HANDLER_RAW_REQUEST_STREAM,
+                "<builtin streamed raw-request handler>",
                 &None,
                 &HANDLER_VARS,
             )?,
@@ -279,6 +304,17 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
             ("invalid_body_code", &invalid_body_code()),
             ("internal_error_code", &internal_error_code()),
         ]))?);
+    }
+
+    // A streamed request is a raw one, so this lands after the runtime it
+    // builds on, and only where an operation hands its body over unread.
+    if api
+        .services
+        .iter()
+        .flat_map(|service| &service.operations)
+        .any(|op| op.raw_request_stream)
+    {
+        out.push_str(&templates.stream_runtime.render(&templates.vars(&[]))?);
     }
 
     // The extractor and the trait it needs, for an API that guards anything on a
@@ -1054,6 +1090,9 @@ fn emit_service(
     }
     for op in &service.operations {
         emit_doc(out, "    ", &op.description);
+        if op.raw_request_stream {
+            emit_stream_doc(out, api, op);
+        }
         let error = codes_type_name(&service.name, &op.name);
         // An operation with no `input` argument takes no parameter: there is
         // no placeholder value for an implementation to receive and ignore.
@@ -1065,13 +1104,19 @@ fn emit_service(
         // reads as the subject of the call, and it is the parameter every
         // session-guarded operation shares.
         let ctx = context_param(op);
+        // Last, because it is what is left of the request once the input has
+        // been read out of its URL.
+        let body = match op.raw_request_stream {
+            true => ", body: RawRequest",
+            false => "",
+        };
         // The failure half is `ApiError<Codes>`, which names the codes the
         // operation may use and is what `?` and treat's `wrap_api_error` family
         // produce. The success half is whatever this operation actually
         // answers with — see [`success_type`].
         let _ = writeln!(
             out,
-            "    async fn {}(&self{ctx}{arg}) -> Result<{}, ApiError<{error}>>;",
+            "    async fn {}(&self{ctx}{arg}{body}) -> Result<{}, ApiError<{error}>>;",
             snake_case(&op.name),
             success_type(api, op)
         );
@@ -1143,6 +1188,23 @@ fn emit_service(
     Ok(())
 }
 
+/// What a streamed operation's implementation has to know that its signature
+/// does not say: where the payload went, and that nothing bounds it.
+fn emit_stream_doc(out: &mut String, api: &Api, op: &Operation) {
+    if op.description.is_some() {
+        out.push_str("    ///\n");
+    }
+    let field = api
+        .body_field(op)
+        .map(|f| snake_case(&f.name))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "    /// The request body arrives unread as `body`; `input.{field}` is always empty.\n    \
+         /// No size limit is applied to it: this method must bound it — see [`RawRequest`]."
+    );
+}
+
 /// What a service method hands back when it succeeds.
 ///
 /// Three shapes, because three things can be answered with: a stream of events,
@@ -1203,6 +1265,9 @@ fn role_guard(op: &Operation) -> String {
 /// The handler form for one operation: where its input comes from, and what
 /// its answer is.
 fn handler_template<'a>(templates: &'a Templates, op: &Operation) -> &'a Template {
+    if op.raw_request_stream {
+        return &templates.handler_raw_request_stream;
+    }
     let has_input = op.input.is_some();
     match (
         op.kind,

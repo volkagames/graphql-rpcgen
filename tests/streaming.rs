@@ -72,6 +72,12 @@ type Files @service {
     @mutation
     @rpc(path: "/upload")
     @raw(request: ["text/csv", "application/json"])
+
+  "Bytes in, handed over unread."
+  store(input: UploadInput!): UploadResult!
+    @mutation
+    @rpc(path: "/store")
+    @raw(request: ["application/octet-stream"], stream: true)
 }
 "#;
 
@@ -267,5 +273,98 @@ type Rows @service {
     let client = generate_rust_client::generate(&plain, &Config::default())?;
     assert!(!client.contains("sse_stream"), "{client}");
     assert!(!client.contains("fn to_query"), "{client}");
+    Ok(())
+}
+
+/// A streamed request keeps the input it would have had and takes the unread
+/// body beside it, last, since that is what is left of the request.
+#[test]
+fn a_streamed_request_hands_the_body_over_unread() -> TestResult {
+    let out = server()?;
+
+    assert!(
+        out.contains(
+            "async fn store(&self, input: UploadInput, body: RawRequest) -> \
+             Result<ApiResponse<UploadResult>, ApiError<FilesStoreCodes>>;"
+        ),
+        "{out}"
+    );
+    // The signature cannot say where the payload went or that nothing bounds
+    // it, so the method's doc does.
+    assert!(
+        out.contains(
+            "    /// Bytes in, handed over unread.\n    ///\n    \
+             /// The request body arrives unread as `body`; `input.body` is always empty.\n    \
+             /// No size limit is applied to it: this method must bound it — see [`RawRequest`].\n    async fn store("
+        ),
+        "{out}"
+    );
+    assert!(out.contains("pub struct RawRequest {"), "{out}");
+    assert!(
+        out.contains("pub fn into_reader(self) -> impl futures_util::io::AsyncRead"),
+        "{out}"
+    );
+
+    let handler = out
+        .split("async fn files_store<")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .ok_or("the streamed handler is emitted")?;
+    // The whole request is the last extractor, split here rather than by axum
+    // so the query string and the body come from one value.
+    assert!(
+        handler.contains("request: axum::extract::Request,"),
+        "{handler}"
+    );
+    assert!(
+        handler.contains("input_from_query(parts.uri.query(), &["),
+        "{handler}"
+    );
+    assert!(
+        handler.contains("service.store(input, RawRequest { parts, body }).await"),
+        "{handler}"
+    );
+    assert!(
+        !handler.contains("raw_body("),
+        "nothing is buffered:\n{handler}"
+    );
+    Ok(())
+}
+
+/// The client cannot tell a streamed operation from a buffered one: both send
+/// the payload as the body, and only the server decides not to hold it.
+#[test]
+fn the_client_sends_a_streamed_body_like_any_raw_one() -> TestResult {
+    let out = client()?;
+    assert!(
+        out.contains(
+            "pub async fn store(&self, input: &UploadInput, content_type: &str) -> \
+             ClientResult<UploadResult, FilesStoreCodes>"
+        ),
+        "{out}"
+    );
+    Ok(())
+}
+
+/// `RawRequest` is the one piece of the runtime needing `futures-util`'s `io`
+/// feature, so an API whose raw requests are all buffered does not get it.
+#[test]
+fn a_buffered_api_gets_no_raw_request() -> TestResult {
+    let buffered = graphql_rpcgen::compile_str(
+        r#"
+scalar UUID
+scalar Binary @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+enum ErrorCode { invalid_body internal_error }
+input StoreInput { id: UUID! body: Binary! }
+type Done { ok: Boolean! }
+type Files @service {
+  store(input: StoreInput!): Done! @mutation @raw(request: ["text/csv"])
+}
+"#,
+    )?;
+    let server = generate_rust::generate(&buffered, &Config::default())?;
+    assert!(server.contains("RAW_BODY_LIMIT"), "{server}");
+    assert!(!server.contains("RawRequest"), "{server}");
+    assert!(!server.contains("futures_util::io"), "{server}");
     Ok(())
 }
