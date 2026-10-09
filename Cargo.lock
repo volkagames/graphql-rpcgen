@@ -332,9 +332,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "erris"
-version = "3.3.0"
+version = "3.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0abaf1f0e3e0ee315bf73e06297476ecaea55877d9497c7bf9ba841a0ab35ac5"
+checksum = "152c5f34bebbc80d2be9cc1e14a59057ac4c0984dde9a5c6ce8462d90186b8f3"
 dependencies = [
  "axum-core",
  "erris-meta",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "graphql-rpcgen"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1671,9 +1671,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.7+spec-1.1.0"
+version = "1.1.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7874cd34dd99040fc24e30923aa64a60a81ff3ddfe2b8129ccc84ba24949deed"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
 dependencies = [
  "serde_core",
  "serde_spanned",
@@ -1694,9 +1694,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.16+spec-1.1.0"
+version = "0.25.17+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88f38f3af8bf71841c67a990f4e2b52143b2d0a1a994c72513ff4c14977fc722"
+checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
 dependencies = [
  "indexmap",
  "toml_datetime",
@@ -1706,9 +1706,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bed810ee007d8e7f9cf20b4774e7198142fa27186e0f805871da7f3c39eaf333"
+checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow",
 ]
@@ -1835,9 +1835,9 @@ dependencies = [
 
 [[package]]
 name = "treat"
-version = "0.25.0"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf406774ae0d3e8fa6df4f190e68f13ffc0537dc4607f946d18a148802da4993"
+checksum = "3a18178a1825391b46be6937ced1ec78ef22747f29ba75f7beec8272f4392549"
 dependencies = [
  "treat-core",
  "treat-derive",
@@ -1845,9 +1845,9 @@ dependencies = [
 
 [[package]]
 name = "treat-core"
-version = "0.25.0"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38348968537b731a21f61e2f207721103d47b8cd154bf90aa2566d0dc742e984"
+checksum = "456574ea7b1b622e1b1fd35d48b7f74127f43f05bec3a0843bbed106e87927dc"
 dependencies = [
  "axum",
  "cfg_block",
@@ -1860,9 +1860,9 @@ dependencies = [
 
 [[package]]
 name = "treat-derive"
-version = "0.25.0"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3fdf58610ce57ffa012ef153cde8b479fe494904c132ac2c840fdd3f5b9afcc"
+checksum = "4feedc732ad039ffd1531bc73dc544da93376c338bab6947fc0c3f779e739ec0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
