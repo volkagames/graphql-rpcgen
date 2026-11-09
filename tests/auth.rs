@@ -375,32 +375,45 @@ fn a_service_role_is_checked_on_each_operation_that_inherits_it() -> TestResult 
     Ok(())
 }
 
+/// One operation's entry in `createApi`, from its key to its closing brace.
+fn api_entry<'a>(out: &'a str, service: &str, op: &str) -> TestResult<&'a str> {
+    out.split("export function createApi(")
+        .nth(1)
+        .and_then(|s| s.split(&format!("\n    {service}: {{\n")).nth(1))
+        .and_then(|s| s.split("\n    },\n").next())
+        .and_then(|s| s.split(&format!("      {op}: {{\n")).nth(1))
+        .and_then(|s| s.split("\n      },").next())
+        .ok_or_else(|| format!("createApi must carry {service}.{op}").into())
+}
+
 /// The browser mirrors the server's role checks, so it reads the role from the
 /// same declaration the generated handler enforces: a role the service sets is
-/// inherited, an operation's own rule wins whole, and one without a role is not
-/// listed. Keys follow the IR's order — by service, then by operation — not the
-/// order the SDL declares them in.
+/// inherited, an operation's own rule wins whole, and one without a role
+/// carries no `role` field.
 #[test]
-fn the_typescript_client_lists_each_operations_role() -> TestResult {
+fn the_typescript_api_carries_each_operations_role() -> TestResult {
     let out = graphql_rpcgen::generate_typescript::generate(&releases_api()?);
 
-    assert!(
-        out.contains(
-            "export const operationRoles = {\n  \
-             'Guarded.start': 'content_manager',\n  \
-             'Releases.approve': 'content_release',\n  \
-             'Releases.start': 'content_release',\n\
-             } as const\n"
-        ),
-        "{out}"
-    );
+    for (service, op, role) in [
+        ("guarded", "start", "content_manager"),
+        ("releases", "start", "content_release"),
+        ("releases", "approve", "content_release"),
+    ] {
+        let entry = api_entry(&out, service, op)?;
+        let field = format!("        role: '{role}' as const,\n");
+        assert!(entry.contains(&field), "{service}.{op}: {entry}");
+    }
+    for op in ["list", "feed"] {
+        let entry = api_entry(&out, "releases", op)?;
+        assert!(!entry.contains("role:"), "releases.{op}: {entry}");
+    }
     Ok(())
 }
 
-/// An API that names no role gains no export, so its generated client stays as
-/// it was.
+/// An API that names no role gives no operation a `role` field, so its
+/// generated client stays as it was.
 #[test]
-fn an_api_without_roles_emits_no_role_map() -> TestResult {
+fn an_api_without_roles_emits_no_role_field() -> TestResult {
     let api = graphql_rpcgen::compile_str(&format!(
         r#"{PRELUDE}
 type Open @service @auth(require: session) {{
@@ -410,6 +423,6 @@ type Open @service @auth(require: session) {{
     ))?;
     let out = graphql_rpcgen::generate_typescript::generate(&api);
 
-    assert!(!out.contains("operationRoles"), "{out}");
+    assert!(!out.contains("role:"), "{out}");
     Ok(())
 }
