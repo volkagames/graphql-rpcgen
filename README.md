@@ -552,29 +552,22 @@ code, and an operation may only answer with what it declares — undeclared, it
 would narrow to `internal_error` and a denial would read as a server fault.
 
 The TypeScript client carries the same declaration, so a UI that says who may
-do what reads it rather than restating it by hand:
+do what reads it rather than restating it by hand. Each operation in
+`createApi(client)` holds its role beside its call:
 
 ```ts
-export const operationRoles = {
-  'Documents.revert': 'content_admin',
-} as const
+documents: {
+  revert: {
+    role: 'content_admin' as const,
+    call: (input: RevertInput, options?: RpcCallOptions): Promise<RevertResponse> =>
+      client.call<RevertResponse>('/revert', input, options),
+    // queryKey, mutationOptions
+  },
+},
 ```
 
-Keys are `Service.operation`, sorted by service and then by operation; only
-operations with a role are listed, a service's role included, and an API with
-none emits no map. Under `noImplicitAny` (part of `strict`), a key that no
-longer exists fails the consumer's type check. The map says what the server
-asks for; the server still decides.
-
-Without `noImplicitAny`, an index the map lacks reads as `any`. A parameter
-typed with the map's keys rejects it under any settings:
-
-```ts
-type OperationWithRole = keyof typeof operationRoles
-type Role = (typeof operationRoles)[OperationWithRole]
-
-const roleOf = (op: OperationWithRole): Role => operationRoles[op]
-```
+Only operations with a role carry the field, a service's role included. The
+field says what the server asks for; the server still decides.
 
 **Absence of `@auth` means `public`.** Silence is not a claim about who may
 call, so protection is opt-in and an SDL predating the directive generates
@@ -845,8 +838,8 @@ just ci                    # fmt-check, lints as errors, tests
   requirement and every way it can fail, template variable validation,
   identifier casing
 - **auth** (15) — `@auth` on the trait signature, the handler's extractors, the
-  role guard ahead of the body, the client's role map, and the rejections that
-  keep a declaration from being decorative
+  role guard ahead of the body, the client's per-operation `role` field, and
+  the rejections that keep a declaration from being decorative
 - **mcp** (6) — `@mcp` inheritance, the `x-mcp` flag in the OpenAPI document,
   and the rejections of shapes a tool call cannot honour
 - **streaming** (10) — `@subscription` and `@raw` on both sides: the signature,

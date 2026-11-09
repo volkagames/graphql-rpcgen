@@ -574,7 +574,8 @@ fn emit_services(out: &mut String, api: &Api) {
     }
 }
 
-/// The `api` factory: TanStack helpers layered over the call methods.
+/// The `api` factory: per operation, its call, the TanStack helpers layered
+/// over it, and the role `@auth(role:)` asks for.
 fn emit_api_object(out: &mut String, api: &Api) {
     out.push_str(
         r#"
@@ -615,8 +616,6 @@ export interface MutationOptionsResult<Input, Output> {
                 "undefined"
             };
             let _ = writeln!(out, "      {}: {{", op.name);
-            // The role `@auth(role:)` asks, beside the call it guards: a control
-            // that calls this operation reads its role from here.
             if let Some(role) = op.role.as_deref() {
                 let _ = writeln!(out, "        role: {} as const,", quoted(role));
             }
