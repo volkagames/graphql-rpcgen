@@ -17,7 +17,6 @@ pub fn generate(api: &Api) -> String {
     emit_error_types(&mut out, api);
     emit_client(&mut out);
     emit_services(&mut out, api);
-    emit_operation_roles(&mut out, api);
     emit_api_object(&mut out, api);
 
     out
@@ -575,36 +574,6 @@ fn emit_services(out: &mut String, api: &Api) {
     }
 }
 
-/// `operationRoles`: the role `@auth(role:)` asks of each operation, keyed
-/// `Service.operation`, sorted by service and then by operation.
-///
-/// The server checks the role in the generated handler; this is the same
-/// declaration for a client that has to say who may do what — a permissions
-/// screen, a disabled button's reason — without restating it by hand.
-fn emit_operation_roles(out: &mut String, api: &Api) {
-    let entries: Vec<(String, &str)> = api
-        .services
-        .iter()
-        .flat_map(|service| {
-            service.operations.iter().filter_map(|op| {
-                let role = op.role.as_deref()?;
-                Some((format!("{}.{}", service.name, op.name), role))
-            })
-        })
-        .collect();
-    if entries.is_empty() {
-        return;
-    }
-    out.push_str(
-        "\n/** The role `@auth(role:)` asks of each operation that has one, keyed `Service.operation`. */\n",
-    );
-    out.push_str("export const operationRoles = {\n");
-    for (operation, role) in entries {
-        let _ = writeln!(out, "  {}: {},", quoted(&operation), quoted(role));
-    }
-    out.push_str("} as const\n");
-}
-
 /// The `api` factory: TanStack helpers layered over the call methods.
 fn emit_api_object(out: &mut String, api: &Api) {
     out.push_str(
@@ -646,6 +615,11 @@ export interface MutationOptionsResult<Input, Output> {
                 "undefined"
             };
             let _ = writeln!(out, "      {}: {{", op.name);
+            // The role `@auth(role:)` asks, beside the call it guards: a control
+            // that calls this operation reads its role from here.
+            if let Some(role) = op.role.as_deref() {
+                let _ = writeln!(out, "        role: {} as const,", quoted(role));
+            }
             let verb = if op.kind == OperationKind::Subscription {
                 "subscribe"
             } else {
