@@ -149,6 +149,14 @@ type Files @service {
 const PERMISSIONS_SDL: &str = r#"
 scalar UUID
 
+scalar Binary
+  @scalar(
+    rust: "Vec<u8>"
+    typescript: "Blob"
+    openapiType: "string"
+    openapiFormat: "binary"
+  )
+
 enum ErrorCode {
   invalid_body
   internal_error
@@ -163,7 +171,11 @@ enum Permission @permissions(codes: ["permission_required"]) {
   files_wipe @variant(tag: "files.wipe")
 }
 
+type Event { line: String! }
+
 input WatchInput { id: UUID! }
+
+input IngestInput { id: UUID! body: Binary! }
 
 type IngestResult { written: Int! }
 
@@ -180,6 +192,32 @@ type Admin @service @auth(require: session, permission: files_purge) {
     @rpc(path: "/wipe")
     @auth(require: session, permission: files_wipe)
     @throws(codes: ["permission_required"])
+
+  "The same refusal in every other handler form, each of which reads its request its own way."
+  wipe_all: IngestResult!
+    @mutation @rpc(path: "/admin/no_input")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  watch(input: WatchInput!): Event!
+    @subscription @rpc(path: "/admin/watch")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  watch_all: Event!
+    @subscription @rpc(path: "/admin/watch_all")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  report(input: WatchInput!): Binary!
+    @query @rpc(path: "/admin/report") @raw(response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  manifest: Binary!
+    @query @rpc(path: "/admin/manifest") @raw(response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  ingest(input: IngestInput!): IngestResult!
+    @mutation @rpc(path: "/admin/ingest") @raw(request: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  convert(input: IngestInput!): Binary!
+    @mutation @rpc(path: "/admin/convert") @raw(request: ["text/csv"], response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  upload(input: IngestInput!): IngestResult!
+    @mutation @rpc(path: "/admin/upload") @raw(request: ["application/octet-stream"], stream: true)
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
 }
 "#;
 
@@ -375,6 +413,83 @@ impl permissions::AdminService for Admin {
     > {
         panic!("a permission the caller lacks must stop the call before the method")
     }
+
+    async fn wipe_all(
+        &self,
+        _ctx: &Caller,
+    ) -> Result<
+        permissions::ApiResponse<permissions::IngestResult>,
+        permissions::ApiError<permissions::AdminWipeAllCodes>,
+    > {
+        panic!("refused before the method")
+    }
+
+    async fn watch(
+        &self,
+        _ctx: &Caller,
+        _input: permissions::WatchInput,
+    ) -> Result<
+        permissions::EventStream<permissions::Event>,
+        permissions::ApiError<permissions::AdminWatchCodes>,
+    > {
+        panic!("refused before the method")
+    }
+
+    async fn watch_all(
+        &self,
+        _ctx: &Caller,
+    ) -> Result<
+        permissions::EventStream<permissions::Event>,
+        permissions::ApiError<permissions::AdminWatchAllCodes>,
+    > {
+        panic!("refused before the method")
+    }
+
+    async fn report(
+        &self,
+        _ctx: &Caller,
+        _input: permissions::WatchInput,
+    ) -> Result<permissions::RawBody, permissions::ApiError<permissions::AdminReportCodes>> {
+        panic!("refused before the method")
+    }
+
+    async fn manifest(
+        &self,
+        _ctx: &Caller,
+    ) -> Result<permissions::RawBody, permissions::ApiError<permissions::AdminManifestCodes>> {
+        panic!("refused before the method")
+    }
+
+    async fn ingest(
+        &self,
+        _ctx: &Caller,
+        _input: permissions::IngestInput,
+    ) -> Result<
+        permissions::ApiResponse<permissions::IngestResult>,
+        permissions::ApiError<permissions::AdminIngestCodes>,
+    > {
+        panic!("refused before the method")
+    }
+
+    async fn convert(
+        &self,
+        _ctx: &Caller,
+        _input: permissions::IngestInput,
+    ) -> Result<permissions::RawBody, permissions::ApiError<permissions::AdminConvertCodes>> {
+        panic!("refused before the method")
+    }
+
+    async fn upload(
+        &self,
+        _ctx: &Caller,
+        _input: permissions::IngestInput,
+        _body: permissions::RawRequest,
+    ) -> Result<
+        permissions::ApiResponse<permissions::IngestResult>,
+        permissions::ApiError<permissions::AdminUploadCodes>,
+    > {
+        panic!("refused before the method")
+    }
 }
 
 /// Mounting every handler, which is what discharges axum's `Handler` bound.
@@ -481,9 +596,6 @@ mod wire {
         assert_eq!(json["errors"][0]["code"], "permission_required", "{json}");
         assert_eq!(json["errors"][0]["message"], "files.wipe", "{json}");
 
-        // The body is read after the check: a caller without the permission
-        // hears that, never what its body got wrong; with it, the same body is
-        // the `invalid_body` it is.
         // What a caller other than the router reads instead of the guard: each
         // operation's check by its id, and no row for an id the API lacks.
         let check = |id: &str| {
@@ -502,6 +614,9 @@ mod wire {
         assert_eq!(role, Some(Some(crate::server::Role::FilesRead)));
         assert!(crate::server::Role::OPERATIONS.contains(&("files_upload", None)));
 
+        // The body is read after the check: a caller without the permission
+        // hears that, never what its body got wrong; with it, the same body is
+        // the `invalid_body` it is.
         for (path, code) in [("wipe", "permission_required"), ("purge", "invalid_body")] {
             let response = client
                 .post(format!("{base}/{path}"))
@@ -511,6 +626,32 @@ mod wire {
                 .await?;
             let json: serde_json::Value = response.json().await?;
             assert_eq!(json["errors"][0]["code"], code, "{path}: {json}");
+        }
+
+        // Every other handler form refuses the same way, before its query
+        // string or body is read: none of these sends a valid one, and every
+        // method panics if reached.
+        for (method, path) in [
+            ("POST", "/admin/no_input"),
+            ("GET", "/admin/watch"),
+            ("GET", "/admin/watch_all"),
+            ("POST", "/admin/report"),
+            ("POST", "/admin/manifest"),
+            ("POST", "/admin/ingest"),
+            ("POST", "/admin/convert"),
+            ("POST", "/admin/upload"),
+        ] {
+            let method = reqwest::Method::from_bytes(method.as_bytes())?;
+            let response = client
+                .request(method, format!("{base}{path}"))
+                .header("content-type", "application/json")
+                .body("{ not json")
+                .send()
+                .await?;
+            assert_eq!(response.status(), 403, "{path}");
+            let json: serde_json::Value = response.json().await?;
+            assert_eq!(json["errors"][0]["code"], "permission_required", "{path}: {json}");
+            assert_eq!(json["errors"][0]["message"], "files.wipe", "{path}: {json}");
         }
         Ok(())
     }
