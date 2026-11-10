@@ -18,6 +18,11 @@
 //! A streamed request is the one form whose point is behaviour rather than
 //! shape — a body larger than `RAW_BODY_LIMIT` getting through — so the scratch
 //! project also serves the router on a local port and sends it one.
+//!
+//! The same project carries the one error-code form whose wire string differs
+//! from its Rust name, a `@variant(tag:)` code, because what reaches the
+//! envelope is decided by `treat`'s and `error_set`'s derives, which only a
+//! build exercises.
 
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
@@ -50,6 +55,8 @@ enum ErrorCode {
   role_required
   "Declared by no operation, so every generated set keeps a reachable fallback."
   database_error
+  "Tagged: the envelope must carry `files::gone`, not the identifier."
+  files__gone @variant(tag: "files::gone")
 }
 
 "A junior role and one inheriting it, so the guard below passes by inheritance."
@@ -107,7 +114,7 @@ type Files @service {
     @query
     @rpc(path: "/report")
     @raw(response: ["text/csv"])
-    @throws(codes: ["not_found"])
+    @throws(codes: ["not_found", "files__gone"])
 
   "Bytes out, nothing in."
   manifest: Binary!
@@ -350,6 +357,24 @@ mod wire {
         assert_eq!(json["data"]["received"], LARGE, "{json}");
         assert_eq!(json["data"]["declared"], LARGE, "{json}");
         assert_eq!(json["data"]["intact"], true, "{json}");
+        Ok(())
+    }
+
+    /// A tagged code reaches the envelope by its tag, and a client reads the
+    /// tag back as the registry value.
+    #[tokio::test]
+    async fn a_tagged_code_travels_by_its_tag() -> TestResult {
+        use axum::response::IntoResponse;
+
+        let error: crate::server::ApiError<crate::server::FilesReportCodes> =
+            crate::server::error(crate::server::FilesReportCodes::FilesGone);
+        let body = axum::body::to_bytes(error.into_response().into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["errors"][0]["code"], "files::gone", "{json}");
+
+        let code: crate::types::ErrorCode = serde_json::from_value(json["errors"][0]["code"].clone())?;
+        assert_eq!(code, crate::types::ErrorCode::files__gone);
+        assert_eq!(crate::types::ErrorCode::files__gone.to_string(), "files::gone");
         Ok(())
     }
 

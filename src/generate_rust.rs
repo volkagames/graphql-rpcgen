@@ -605,6 +605,12 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
 /// same string, which is how the portal's own `PortalErrorCode` is written.
 /// `#[derive(ApiErrorCode)]` supplies `Display`, `From<ErrorCode> for
 /// ApiError<ErrorCode>` and the declared `#[message(...)]`.
+///
+/// A value with `@variant(tag:)` cannot keep that symmetry: the SDL spelling
+/// is an identifier and the tag (`portal_db::clan_not_found`) need not be.
+/// The tag is pinned twice, as `#[code]` for `Display`, which is what `treat`
+/// writes into the envelope, and as `#[serde(rename)]`, which is what a client
+/// reads a code back through.
 fn emit_error_code_enum(out: &mut String, e: &EnumType) {
     out.push('\n');
     emit_doc(out, "", &e.description);
@@ -618,6 +624,10 @@ fn emit_error_code_enum(out: &mut String, e: &EnumType) {
         // The default message travels with the code, so a handler that has
         // nothing to add does not restate it at the call site.
         let _ = writeln!(out, "    #[message({:?})]", default_message(&v.name));
+        if let Some(tag) = &v.variant_tag {
+            let _ = writeln!(out, "    #[code({tag:?})]");
+            let _ = writeln!(out, "    #[serde(rename = {tag:?})]");
+        }
         let _ = writeln!(out, "    {},", v.name);
     }
     out.push_str("}\n");
@@ -634,9 +644,9 @@ fn default_message(code: &str) -> String {
 /// operation can, so without a per-operation set a handler could answer with any
 /// code in it and `@throws` would be documentation nobody checks.
 ///
-/// A variant is named after the registry code and carries that code as its
-/// `#[display]`, so the Rust name and the string on the wire stay the same
-/// vocabulary `errors.graphql` declares.
+/// A variant is named after the registry code and carries that code's wire
+/// name as its `#[display]` — the SDL spelling, or its `@variant(tag:)` — so a
+/// set writes into the envelope exactly what the registry value would.
 ///
 /// Each set also gets the two impls `Narrow` needs to report a flat `Failure`
 /// through it: `TryFrom` for the codes it declares, and `Undeclared` for what to
@@ -649,7 +659,7 @@ fn emit_error_sets(out: &mut String, api: &Api) {
     out.push_str("error_set! {\n");
     for service in &api.services {
         for op in &service.operations {
-            emit_operation_error_set(out, service, op);
+            emit_operation_error_set(out, api, service, op);
         }
     }
     out.push_str("}\n");
@@ -691,7 +701,7 @@ fn emit_error_set_narrowing(out: &mut String, service: &Service, op: &Operation)
 }
 
 /// One operation's set, as an `error_set!` member.
-fn emit_operation_error_set(out: &mut String, service: &Service, op: &Operation) {
+fn emit_operation_error_set(out: &mut String, api: &Api, service: &Service, op: &Operation) {
     let _ = writeln!(
         out,
         "    /// Error codes `{}.{}` may answer with.",
@@ -708,7 +718,8 @@ fn emit_operation_error_set(out: &mut String, service: &Service, op: &Operation)
     for code in op.error_codes() {
         let _ = writeln!(
             out,
-            "        #[display(\"{code}\")] {},",
+            "        #[display({:?})] {},",
+            api.error_code_wire_name(code),
             code_type_name(code)
         );
     }

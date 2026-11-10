@@ -111,11 +111,13 @@ enum ErrorCode {
   invalid_body
   internal_error
   not_found
+  "A code whose wire name is not an identifier, as `ns::name` codes are."
+  things__gone @variant(tag: "things::gone")
 }
 
 type Things @service {
   "Fetch one thing."
-  get(input: CreateInput!): Example! @query @throws(codes: ["not_found"])
+  get(input: CreateInput!): Example! @query @throws(codes: ["not_found", "things__gone"])
   make(input: PaymentInput!): PaymentMethod! @mutation
 }
 "#;
@@ -275,6 +277,15 @@ fn rust_snapshot() -> TestResult {
     assert!(out.contains("error_set! {"));
     assert!(out.contains(r#"        #[display("not_found")] NotFound,"#));
 
+    // A tagged code keeps its identifier as the Rust name and carries the tag
+    // everywhere a string is produced: `Display` (what `treat` writes into the
+    // envelope), serde (what a client reads back) and the operation's set.
+    assert!(out.contains(
+        "    #[message(\"things  gone\")]\n    #[code(\"things::gone\")]\n    #[serde(rename = \"things::gone\")]\n    things__gone,"
+    ));
+    assert!(out.contains(r#"        #[display("things::gone")] ThingsGone,"#));
+    assert!(!out.contains(r#"#[display("things__gone")]"#));
+
     // A set names what the operation declared, then what the runtime can emit
     // on its own. Anything else fails to compile at the handler, which is what
     // makes `@throws` binding.
@@ -409,6 +420,7 @@ fn typescript_snapshot() -> TestResult {
     // The client reads treat's envelope: payload under `meta`, locator under
     // `source`, and the outcome decided by `errors[]` rather than the status.
     assert!(out.contains("export type RpcErrorCode = ErrorCode"));
+    assert!(out.contains("'things::gone'"));
     assert!(out.contains("export interface RpcErrorItem {"));
     // `meta` is an object, not an arbitrary value: indexing it must not need
     // a cast at the call site.
@@ -463,6 +475,9 @@ fn openapi_snapshot() -> TestResult {
         .ok_or("code enum")?;
     assert!(codes.iter().any(|c| c == "not_found"));
     assert!(codes.iter().any(|c| c == "invalid_body"));
+    // Codes appear by their wire name, as the registry enum lists them.
+    assert!(codes.iter().any(|c| c == "things::gone"));
+    assert!(!codes.iter().any(|c| c == "things__gone"));
 
     // `meta` is an object on both halves of the envelope. A schema carrying
     // only a description has no type at all, and Swagger UI renders such a

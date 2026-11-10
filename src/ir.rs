@@ -415,6 +415,23 @@ impl Api {
         self.types.iter().find(|t| t.name() == name)
     }
 
+    /// What the registry code `code` is called on the wire: its
+    /// `@variant(tag:)`, or the code itself.
+    ///
+    /// Operations name their codes by SDL spelling (`@throws`), while the
+    /// envelope carries the wire name, so every target that writes a code
+    /// resolves it through here.
+    pub fn error_code_wire_name<'a>(&'a self, code: &'a str) -> &'a str {
+        match self.find_type(crate::semantic::ERROR_CODE_ENUM) {
+            Some(ApiType::Enum(e)) => e
+                .values
+                .iter()
+                .find(|v| v.name == code)
+                .map_or(code, EnumValue::wire_name),
+            _ => code,
+        }
+    }
+
     /// The scalar named `name`, if it is one.
     ///
     /// Scalars come from the project's config, so the generators resolve a

@@ -269,7 +269,11 @@ fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
 
     // A failure is the shared envelope with `code` narrowed to what this
     // operation declares, plus the codes the runtime can always emit.
-    let codes = op.error_codes();
+    let codes: Vec<&str> = op
+        .error_codes()
+        .into_iter()
+        .map(|code| api.error_code_wire_name(code))
+        .collect();
     alternatives.push(json!({
         "title": "Failure",
         "type": "object",
