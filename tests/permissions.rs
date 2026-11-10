@@ -227,15 +227,19 @@ type Audit @service @auth(require: session, role: auditor) {
   read(input: GetInput!): Thing! @query @rpc(path: "/audit/read") @throws(codes: ["role_required"])
 }
 "#;
-    let api = graphql_rpcgen::compile_str(&format!("{BASE}{PERMISSION_SET}{SDL}{roles}"))?;
-    let doc: serde_json::Value =
-        serde_json::from_str(&generate_openapi::generate(&api, &Config::default())?)?;
-    let op = |path: &str| &doc["paths"][path]["post"];
+    let document = |sdl: String| -> TestResult<serde_json::Value> {
+        let api = graphql_rpcgen::compile_str(&sdl)?;
+        Ok(serde_json::from_str(&generate_openapi::generate(
+            &api,
+            &Config::default(),
+        )?)?)
+    };
 
+    let doc = document(format!("{BASE}{PERMISSION_SET}{SDL}"))?;
+    let op = |path: &str| doc["paths"][path]["post"].clone();
     assert_eq!(op("/users/list")["x-permission"], "admin.users.read");
     assert_eq!(op("/users/delete")["x-permission"], "admin.users.write");
-    assert_eq!(op("/audit/read")["x-role"], "audit-reader");
-    for path in ["/users/me", "/users/ping", "/audit/read"] {
+    for path in ["/users/me", "/users/ping"] {
         assert!(
             op(path).get("x-permission").is_none(),
             "{path}: {}",
@@ -243,6 +247,11 @@ type Audit @service @auth(require: session, role: auditor) {
         );
     }
     assert!(op("/users/list").get("x-role").is_none());
+
+    let doc = document(format!("{BASE}{roles}"))?;
+    let audit = &doc["paths"]["/audit/read"]["post"];
+    assert_eq!(audit["x-role"], "audit-reader");
+    assert!(audit.get("x-permission").is_none(), "{audit}");
     Ok(())
 }
 
@@ -390,9 +399,13 @@ fn a_restatement_drops_a_check_only_by_saying_so() -> TestResult {
             "`S.g`: @auth restates the rule without its service's `role: admin`",
         ),
     ] {
+        let set = if rule.starts_with("role:") {
+            "enum Role @roles { admin }\n"
+        } else {
+            PERMISSION_SET
+        };
         let e = expect_error(&format!(
-            r#"{PERMISSION_SET}
-enum Role @roles {{ admin }}
+            r#"{set}
 type S @service @auth(require: session, {rule}) {{
   g(input: GetInput!): Thing! @query @rpc(path: "/g") @auth(require: session)
     @throws(codes: ["role_required", "role_forbidden", "scope_required"])
@@ -457,6 +470,23 @@ type S @service {service_rule} {{
         let e = expect_error(&sdl)?;
         assert!(e.contains(expected), "{sdl}: {e}");
     }
+    Ok(())
+}
+
+/// An API assigns permissions to roles in the SDL or leaves that to the
+/// implementation, not both: under `@permissions` the roles are data, so a
+/// `@roles` enum beside it would be a second set of roles.
+#[test]
+fn a_role_set_and_a_permission_set_are_not_declared_together() -> TestResult {
+    let e = expect_error(&format!("{PERMISSION_SET}enum Role @roles {{ admin }}\n"))?;
+    assert!(
+        e.contains(
+            "enum `Role` is @roles and enum `Permission` is @permissions: an API assigns \
+             permissions to roles in the SDL or leaves the assignment to the implementation; \
+             declare one set"
+        ),
+        "{e}"
+    );
     Ok(())
 }
 

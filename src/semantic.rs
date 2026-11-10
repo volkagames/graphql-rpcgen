@@ -195,6 +195,21 @@ impl<'a> Analyzer<'a> {
         self.resolve_sibling_contents(&mut types);
         let roles = self.resolve_roles();
         let permissions = self.resolve_permissions();
+        // Under `@permissions` the roles are the implementation's data, so a
+        // `@roles` enum beside it would describe a second, static set of roles
+        // living next to the dynamic one. One enum marked both is reported
+        // where it is declared.
+        match (&roles, &permissions) {
+            (Some(roles), Some(permissions)) if roles.enum_name != permissions.enum_name => {
+                self.errors.push(CompileError::new(format!(
+                    "enum `{}` is @roles and enum `{}` is @permissions: an API assigns \
+                     permissions to roles in the SDL or leaves the assignment to the \
+                     implementation; declare one set",
+                    roles.enum_name, permissions.enum_name
+                )));
+            }
+            _ => {}
+        }
 
         // Sorting here is what makes generation deterministic; every generator
         // walks these vectors in order.

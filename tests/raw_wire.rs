@@ -10,10 +10,10 @@
 //! response through `reqwest`'s `stream` feature, neither of which any other
 //! test or document mentioned.
 //!
-//! This builds all three Rust targets from one SDL reaching every raw form, in
-//! a scratch cargo project, offline, with versions pinned to this crate's
-//! lockfile — the arrangement `oneof_wire` already uses and for the same
-//! reasons.
+//! This builds all three Rust targets from one SDL reaching every raw form, and
+//! the server of a second one checking permissions, in a scratch cargo
+//! project, offline, with versions pinned to this crate's lockfile — the
+//! arrangement `oneof_wire` already uses and for the same reasons.
 //!
 //! A streamed request is the one form whose point is behaviour rather than
 //! shape — a body larger than `RAW_BODY_LIMIT` getting through — so the scratch
@@ -48,7 +48,6 @@ enum ErrorCode {
   internal_error
   not_found
   role_required
-  permission_required
   "Declared by no operation, so every generated set keeps a reachable fallback."
   database_error
 }
@@ -57,12 +56,6 @@ enum ErrorCode {
 enum Role @roles {
   files_read
   files_write @inherits(roles: [files_read])
-}
-
-"Permission ids are not GraphQL identifiers, so each travels by its tag."
-enum Permission @permissions(codes: ["permission_required"]) {
-  files_purge @variant(tag: "files.purge")
-  files_wipe @variant(tag: "files.wipe")
 }
 
 type Event { line: String! }
@@ -147,12 +140,38 @@ type Files @service {
     @raw(request: ["application/octet-stream"], response: ["application/octet-stream"], stream: true)
     @auth(require: session, role: files_read)
     @throws(codes: ["role_required"])
+}
+"#;
 
-  "A permission the caller holds, so the call reaches the service."
+/// The permission check, in an API of its own: an API declares a role set or a
+/// permission set, not both. Emitted as one self-contained server module beside
+/// the first, and mounted on the same router.
+const PERMISSIONS_SDL: &str = r#"
+scalar UUID
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  permission_required
+  "Declared by no operation, so every generated set keeps a reachable fallback."
+  database_error
+}
+
+"Permission ids are not GraphQL identifiers, so each travels by its tag."
+enum Permission @permissions(codes: ["permission_required"]) {
+  files_purge @variant(tag: "files.purge")
+  files_wipe @variant(tag: "files.wipe")
+}
+
+input WatchInput { id: UUID! }
+
+type IngestResult { written: Int! }
+
+type Admin @service @auth(require: session, permission: files_purge) {
+  "Inherits a permission the caller holds, so the call reaches the service."
   purge(input: WatchInput!): IngestResult!
     @mutation
     @rpc(path: "/purge")
-    @auth(require: session, permission: files_purge)
     @throws(codes: ["permission_required"])
 
   "A permission the caller lacks, so the call is refused before the service."
@@ -202,14 +221,24 @@ impl server::FromRequestContext for Caller {
             axum::http::StatusCode::FORBIDDEN,
         ))
     }
+}
+
+/// The same caller, to the permission API: that module names its own context
+/// trait, with the permission check and no role check.
+impl permissions::FromRequestContext for Caller {
+    async fn from_parts(
+        _parts: &mut axum::http::request::Parts,
+    ) -> Result<Self, axum::response::Response> {
+        Ok(Caller)
+    }
 
     /// Holds `files.purge` only, read by its id as an implementation keeping the
     /// assignment in data would: `wipe` is refused before its method runs.
     async fn require_permission(
         &self,
-        permission: server::Permission,
+        permission: permissions::Permission,
     ) -> Result<(), axum::response::Response> {
-        if server::Permission::from_name("files.purge") == Some(permission) {
+        if permissions::Permission::from_name("files.purge") == Some(permission) {
             return Ok(());
         }
         Err(axum::response::IntoResponse::into_response((
@@ -316,33 +345,41 @@ impl server::FilesService for Files {
         }
         Ok(server::RawBody::new(content_type, bytes))
     }
+}
+
+#[derive(Clone)]
+pub struct Admin;
+
+#[async_trait::async_trait]
+impl permissions::AdminService for Admin {
+    type Ctx = Caller;
 
     async fn purge(
         &self,
         _ctx: &Caller,
-        _input: server::WatchInput,
+        _input: permissions::WatchInput,
     ) -> Result<
-        server::ApiResponse<server::IngestResult>,
-        server::ApiError<server::FilesPurgeCodes>,
+        permissions::ApiResponse<permissions::IngestResult>,
+        permissions::ApiError<permissions::AdminPurgeCodes>,
     > {
-        Ok(server::success(server::IngestResult { written: 1 }))
+        Ok(permissions::success(permissions::IngestResult { written: 1 }))
     }
 
     async fn wipe(
         &self,
         _ctx: &Caller,
-        _input: server::WatchInput,
+        _input: permissions::WatchInput,
     ) -> Result<
-        server::ApiResponse<server::IngestResult>,
-        server::ApiError<server::FilesWipeCodes>,
+        permissions::ApiResponse<permissions::IngestResult>,
+        permissions::ApiError<permissions::AdminWipeCodes>,
     > {
         panic!("a permission the caller lacks must stop the call before the method")
     }
 }
 
-/// Mounting every raw handler, which is what discharges axum's `Handler` bound.
+/// Mounting every handler, which is what discharges axum's `Handler` bound.
 pub fn router() -> axum::Router {
-    server::files_router(Files)
+    server::files_router(Files).merge(permissions::admin_router(Admin))
 }
 
 /// Never called: compiling the body is the assertion.
@@ -370,8 +407,6 @@ async fn client_forms(api: &client::ApiClient) {
     let _ = files.report(&report).await;
     let _ = files.upload(&upload, "application/octet-stream").await;
     let _ = files.watch(&watch).await;
-    let _ = files.purge(&watch).await;
-    let _ = files.wipe(&watch).await;
 }
 
 #[cfg(test)]
@@ -490,16 +525,23 @@ mod wire {
 /// `types_path` points at a module of the same crate rather than a sibling one,
 /// which is the single-crate layout a scratch project wants; the split layout is
 /// what every other test already covers.
-fn generated() -> TestResult<(String, String, String)> {
+fn generated() -> TestResult<(String, String, String, String)> {
     let api = graphql_rpcgen::compile_str(SDL)?;
     let mut config = graphql_rpcgen::config::Config::default();
     config.rust.types_path = Some("crate::types".to_string());
     config.rust_client.types_path = Some("crate::types".to_string());
 
+    // Self-contained, its types inline: nothing else in the crate shares them.
+    let permissions = graphql_rpcgen::compile_str(PERMISSIONS_SDL)?;
+
     Ok((
         graphql_rpcgen::generate_rust::generate_types(&api, &config)?,
         graphql_rpcgen::generate_rust::generate(&api, &config)?,
         graphql_rpcgen::generate_rust_client::generate(&api, &config)?,
+        graphql_rpcgen::generate_rust::generate(
+            &permissions,
+            &graphql_rpcgen::config::Config::default(),
+        )?,
     ))
 }
 
@@ -618,13 +660,14 @@ fn the_generated_raw_server_and_client_compile_and_serve() -> TestResult {
     let src = project.join("src");
     std::fs::create_dir_all(&src)?;
 
-    let (types, server, client) = generated()?;
+    let (types, server, client, permissions) = generated()?;
     std::fs::write(src.join("types.rs"), types)?;
     std::fs::write(src.join("server.rs"), server)?;
     std::fs::write(src.join("client.rs"), client)?;
+    std::fs::write(src.join("permissions.rs"), permissions)?;
     std::fs::write(
         src.join("lib.rs"),
-        format!("pub mod client;\npub mod server;\npub mod types;\n{DRIVER}"),
+        format!("pub mod client;\npub mod permissions;\npub mod server;\npub mod types;\n{DRIVER}"),
     )?;
     std::fs::write(project.join("Cargo.toml"), manifest_for(&root)?)?;
 

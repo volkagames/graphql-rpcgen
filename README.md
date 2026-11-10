@@ -801,6 +801,10 @@ method, under either model.
   reason `@roles` is one. An API has one permission set, it is not the role set
   — a role is who acts and a permission is what is done — and it is not the
   error registry.
+- **One model per API.** An API declares `@roles` or `@permissions`, not both.
+  Under `@permissions` the roles are the implementation's data, so a `@roles`
+  enum beside it would be a second, static set of roles next to the dynamic
+  one, and an operation's check would depend on which of the two it named.
 - **`permission:`** on `@auth` names the one permission the operation needs. Not
   `op:` or `operation:`: here an operation is a field of a `@service`, and a
   permission routinely covers several of them.
@@ -830,8 +834,8 @@ method, under either model.
   carries `x-role` the same way.
 
 The compiler refuses: a second `@permissions` enum; `@permissions` on
-`ErrorCode` or beside `@roles`; `codes:` missing, empty, repeating a code or not a
-list of strings; `@inherits` on its values; a `permission:` that is quoted,
+`ErrorCode`, on the `@roles` enum or in an API that has one; `codes:` missing, empty, repeating a code or not a
+list of strings, or naming a code `ErrorCode` lacks; `@inherits` on its values; a `permission:` that is quoted,
 missing from the set, used without a set or outside `require: session`; `role:`
 and `permission:` on one operation; and an operation with a permission whose
 `@throws` misses one of the set's codes.
@@ -846,7 +850,8 @@ handler now takes `request: axum::extract::Request` and reads the body with
 extracts `ApiJson` in its parameters parses the body before the check. In a
 service with `role:` or `permission:`, an operation restating
 `@auth(require: session)` without a check of its own is refused; add
-`unguarded: true` where any session may call it.
+`unguarded: true` where any session may call it. An API declaring both a
+`@roles` and a `@permissions` enum is refused; keep one.
 
 **Upgrading from 0.11.** Declare the role set as a `@roles` enum and write each
 `role:` bare (`role: content_admin`). `require_role` takes the role type.
@@ -1114,8 +1119,8 @@ just ci                    # fmt-check, lints as errors, tests
   scratch cargo project, pinning the wire shape and the arm constraints at
   runtime rather than in emitted text
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
-  `@raw` form, a `@subscription`, a role reached through `@inherits` and a
-  permission held and one refused beside them, which is the only thing that
+  `@raw` form, a `@subscription` and a role reached through `@inherits`, and
+  for a second API a permission held and one refused, which is the only thing that
   checks the emitted handlers, client methods and streaming runtime against
   rustc rather than against a `contains`; the router is then served on a local
   port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it
