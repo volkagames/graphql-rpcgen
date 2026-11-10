@@ -693,7 +693,7 @@ Where each element of the model lives:
 | OPS, operations | an operation of a `@service` | its handler and client entry | — |
 | OBS, objects | — | — | whatever the operation acts on |
 | PRMS, permissions | an operation on every object it takes | — | a permission narrowed to some objects — a field, a protected branch — checked in the method, since `@auth` cannot see the request |
-| PA, permission assignment | `@auth(role:)` | the role guard; `role` on the `createApi` entry | — |
+| PA, permission assignment | `@auth(role:)` | the role guard; `Role::OPERATIONS`; `role` on the `createApi` entry | — |
 | UA, user assignment | — | — | whoever issues sessions |
 | SESSIONS | `require: session` | the `Ctx` extractor | which of the user's roles are active |
 | CheckAccess | — | the guard calling `require_role` | `require_role` |
@@ -827,6 +827,26 @@ method, under either model.
 - Rust: `impl Permission { from_name, as_str }` over the wire names — the
   `@variant(tag:)` when a value has one, since permission ids such as
   `admin.users.read` are seldom identifiers — and the awaited guard.
+- Rust: `Permission::OPERATIONS`, every operation of the API by its
+  `operationId` with the permission it needs (`Role::OPERATIONS` likewise for
+  roles). The guard sits in the handler, so a caller reaching a service other
+  than through its router — an MCP tool calling the method, a job runner —
+  passes none; this is what it checks instead of keeping a table of its own:
+
+  ```rust
+  let required = Permission::OPERATIONS
+      .iter()
+      .find(|(id, _)| *id == tool.operation_id)
+      .map(|(_, permission)| *permission);
+  match required {
+      None => return Err(unknown_tool()),        // no such operation: refuse
+      Some(None) => {}                           // needs no permission
+      Some(Some(permission)) => ctx.require_permission(permission).await?,
+  }
+  ```
+
+  An id the API lacks has no row, so a misspelt one is refused rather than
+  read as an operation that needs nothing.
 - TypeScript: `permissions`, the whole set in declaration order, and a
   `permission` field on each `createApi` entry that needs one. It says what the
   server asks for, not who passes: there is no client-side check to mirror.
@@ -1080,7 +1100,7 @@ just test-one registry     # by test name
 just ci                    # fmt-check, lints as errors, tests
 ```
 
-229 tests, none of which need a network:
+235 tests, none of which need a network:
 
 - **semantic** (96) — every validation rule, the error-code registry, path
   versioning, union tags, which constraint may sit on which type, plus
@@ -1094,14 +1114,16 @@ just ci                    # fmt-check, lints as errors, tests
 - **unit** (34) — config defaults and TOML rejection, the `rpcgen_version`
   requirement and every way it can fail, template variable validation,
   identifier casing
-- **auth** (27) — `@auth` on the trait signature, the handler's extractors, the
+- **auth** (28) — `@auth` on the trait signature, the handler's extractors, the
   role guard ahead of the body, the client's per-operation `role` field, the
-  `@roles` set and its `@inherits` closure on both sides, and the rejections
+  `@roles` set, its `@inherits` closure on both sides and its `OPERATIONS`
+  table, and the rejections
   that keep a declaration from being decorative
-- **permissions** (11) — `@permissions` and `@auth(permission:)`: the awaited
+- **permissions** (16) — `@permissions` and `@auth(permission:)`: the awaited
   guard and its inheritance, the context trait's check, the set's Rust and
-  TypeScript halves, `x-permission` / `x-role` in OpenAPI, a misspelt `@auth`
-  argument refused, and every other rejection
+  TypeScript halves and its `OPERATIONS` table, `x-permission` / `x-role` in
+  OpenAPI, a misspelt `@auth` argument refused, `unguarded`, one set per API,
+  and every other rejection
 - **mcp** (6) — `@mcp` inheritance, the `x-mcp` flag in the OpenAPI document,
   and the rejections of shapes a tool call cannot honour
 - **streaming** (10) — `@subscription` and `@raw` on both sides: the signature,

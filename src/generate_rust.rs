@@ -386,7 +386,7 @@ fn emit_types(out: &mut String, api: &Api) {
                     .as_ref()
                     .is_some_and(|p| p.enum_name == e.name)
                 {
-                    emit_permission_impl(out, e);
+                    emit_permission_impl(out, api, e);
                 }
             }
             ApiType::Object(o) => emit_object(out, api, o),
@@ -603,7 +603,20 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
             variant(role)
         );
     }
-    out.push_str("        }\n    }\n}\n");
+    out.push_str("        }\n    }\n");
+
+    emit_operations_table(
+        out,
+        api,
+        "/// Every operation of the API by its `operationId`, with the role\n    \
+         /// `@auth(role:)` assigns it to: the permission assignment.",
+        "assigned to no role",
+        |access| match access {
+            Access::Role(role) => Some(role),
+            Access::Permission(_) => None,
+        },
+    );
+    out.push_str("}\n");
 }
 
 /// What the server needs of the `@permissions` enum beyond the wire type:
@@ -611,7 +624,7 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
 ///
 /// No `authorizes`: unlike a role hierarchy, which permissions imply which is
 /// not declared in the SDL, so there is nothing to compile into a match.
-fn emit_permission_impl(out: &mut String, e: &EnumType) {
+fn emit_permission_impl(out: &mut String, api: &Api, e: &EnumType) {
     let variant = |name: &str| format!("Self::{}", pascal_case(name));
 
     let _ = writeln!(out, "\nimpl {} {{", e.name);
@@ -641,7 +654,55 @@ fn emit_permission_impl(out: &mut String, e: &EnumType) {
             v.wire_name()
         );
     }
-    out.push_str("        }\n    }\n}\n");
+    out.push_str("        }\n    }\n");
+
+    emit_operations_table(
+        out,
+        api,
+        "/// Every operation of the API by its `operationId`, with the permission\n    \
+         /// `@auth(permission:)` says it needs.",
+        "that needs none",
+        |access| match access {
+            Access::Permission(permission) => Some(permission),
+            Access::Role(_) => None,
+        },
+    );
+    out.push_str("}\n");
+}
+
+/// `OPERATIONS` on the role or the permission enum: every operation of the API
+/// by its `operationId`, with the check `@auth` demands of it.
+///
+/// The generated guard sits in the handler, so a caller reaching a service
+/// other than through its router — an MCP tool calling the method, a job
+/// runner — passes none. This is what it checks against instead of restating
+/// the SDL in a table of its own. An id missing from the table is no operation
+/// of the API and `None` one with no check, so a misspelt id never reads as an
+/// operation anyone may call.
+fn emit_operations_table(
+    out: &mut String,
+    api: &Api,
+    summary: &str,
+    unchecked: &str,
+    pick: impl Fn(&Access) -> Option<&String>,
+) {
+    let _ = write!(
+        out,
+        "\n    {summary}\n    \
+         ///\n    \
+         /// For a caller that reaches a service other than through its router,\n    \
+         /// and so passes no generated guard. An id missing here is no operation\n    \
+         /// of the API; `None` is one {unchecked}.\n    \
+         pub const OPERATIONS: &'static [(&'static str, Option<Self>)] = &[\n"
+    );
+    for op in api.services.iter().flat_map(|s| &s.operations) {
+        let check = match op.access.as_ref().and_then(&pick) {
+            Some(name) => format!("Some(Self::{})", pascal_case(name)),
+            None => "None".to_string(),
+        };
+        let _ = writeln!(out, "        ({:?}, {check}),", op.operation_id);
+    }
+    out.push_str("    ];\n");
 }
 
 /// The error registry, as a `treat` code enum.

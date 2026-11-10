@@ -188,6 +188,28 @@ fn the_rust_permission_set_reads_and_spells_ids() -> TestResult {
     Ok(())
 }
 
+/// A caller reaching a service other than through its router — an MCP tool
+/// calling the method — passes no generated guard, so the set lists what each
+/// operation needs by its `operationId`: every operation, `None` for one that
+/// needs nothing, so a misspelt id is a missing row rather than an open one.
+#[test]
+fn the_permission_set_lists_each_operations_permission() -> TestResult {
+    let out = generate_rust::generate_types(&api()?, &Config::default())?;
+    let table = out
+        .split("pub const OPERATIONS: &'static [(&'static str, Option<Self>)] = &[\n")
+        .nth(1)
+        .and_then(|s| s.split("    ];\n").next())
+        .ok_or_else(|| format!("the permission set must list its operations: {out}"))?;
+    assert_eq!(
+        table,
+        "        (\"users_delete\", Some(Self::UsersWrite)),\n        \
+         (\"users_list\", Some(Self::UsersRead)),\n        \
+         (\"users_me\", None),\n        \
+         (\"users_ping\", None),\n"
+    );
+    Ok(())
+}
+
 /// The browser reads each operation's permission from the entry it calls
 /// through, and the whole set from `permissions`; whether a session holds one
 /// is the server's, so there is no check to mirror.

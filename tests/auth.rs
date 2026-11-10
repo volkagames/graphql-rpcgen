@@ -628,6 +628,23 @@ fn the_role_check_takes_the_role_type() -> TestResult {
     Ok(())
 }
 
+/// The role set lists each operation's role by its `operationId` — the
+/// permission assignment the SDL declares — for a caller that reaches a service
+/// other than through its router and so passes no generated guard.
+#[test]
+fn the_role_set_lists_each_operations_role() -> TestResult {
+    let out = generate_rust::generate(&releases_api()?, &Config::default())?;
+    for row in [
+        "        (\"releases_start\", Some(Self::ContentRelease)),\n",
+        "        (\"releases_approve\", Some(Self::ContentRelease)),\n",
+        "        (\"releases_list\", None),\n",
+        "        (\"releases_feed\", None),\n",
+    ] {
+        assert!(out.contains(row), "{row}: {out}");
+    }
+    Ok(())
+}
+
 /// With no role set there is no role type to check against and no operation
 /// asking for one, so the context trait has no role check to implement.
 #[test]

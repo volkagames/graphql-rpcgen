@@ -484,6 +484,24 @@ mod wire {
         // The body is read after the check: a caller without the permission
         // hears that, never what its body got wrong; with it, the same body is
         // the `invalid_body` it is.
+        // What a caller other than the router reads instead of the guard: each
+        // operation's check by its id, and no row for an id the API lacks.
+        let check = |id: &str| {
+            crate::permissions::Permission::OPERATIONS
+                .iter()
+                .find(|(operation, _)| *operation == id)
+                .map(|(_, permission)| *permission)
+        };
+        assert_eq!(check("admin_purge"), Some(Some(crate::permissions::Permission::FilesPurge)));
+        assert_eq!(check("admin_wipe"), Some(Some(crate::permissions::Permission::FilesWipe)));
+        assert_eq!(check("admin_wip"), None);
+        let role = crate::server::Role::OPERATIONS
+            .iter()
+            .find(|(operation, _)| *operation == "files_echo")
+            .map(|(_, role)| *role);
+        assert_eq!(role, Some(Some(crate::server::Role::FilesRead)));
+        assert!(crate::server::Role::OPERATIONS.contains(&("files_upload", None)));
+
         for (path, code) in [("wipe", "permission_required"), ("purge", "invalid_body")] {
             let response = client
                 .post(format!("{base}/{path}"))
