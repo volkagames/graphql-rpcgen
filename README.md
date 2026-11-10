@@ -773,6 +773,12 @@ In the standard's terms, where the two models differ:
 | CheckAccess | `require_role`, over the session's roles and the compiled hierarchy | `require_permission`, over whatever the implementation keeps |
 | What the SDL says of an operation | which role it is assigned to | which permission it needs |
 
+Where they agree is OBS. The standard's permission is an operation on an object,
+and `@auth` sees no object: a permission here covers its operations on every
+object they take. A permission narrowed to some objects — one tenant's
+accounts, one drive, one folder — depends on the request, and is checked in the
+method, under either model.
+
 #### The names, and why
 
 - **`@permissions`** marks the enum whose values are PRMS, a directive for the
