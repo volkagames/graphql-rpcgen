@@ -634,8 +634,16 @@ fn emit_error_code_enum(out: &mut String, e: &EnumType) {
 }
 
 /// Human-readable default for a code: `clan_not_found` -> `clan not found`.
+///
+/// A namespaced code (`portal_db__clan_not_found`) reads as its last segment,
+/// `clan not found`: the namespace says where the code comes from, not what
+/// went wrong, and the `__` would otherwise leave a double space.
 fn default_message(code: &str) -> String {
-    code.replace('_', " ")
+    let name = code
+        .rsplit("__")
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(code);
+    name.replace('_', " ")
 }
 
 /// One error set per operation, in a single `error_set!` declaration.

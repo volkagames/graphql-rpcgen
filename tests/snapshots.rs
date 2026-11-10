@@ -281,7 +281,7 @@ fn rust_snapshot() -> TestResult {
     // everywhere a string is produced: `Display` (what `treat` writes into the
     // envelope), serde (what a client reads back) and the operation's set.
     assert!(out.contains(
-        "    #[message(\"things  gone\")]\n    #[code(\"things::gone\")]\n    #[serde(rename = \"things::gone\")]\n    things__gone,"
+        "    #[message(\"gone\")]\n    #[code(\"things::gone\")]\n    #[serde(rename = \"things::gone\")]\n    things__gone,"
     ));
     assert!(out.contains(r#"        #[display("things::gone")] ThingsGone,"#));
     assert!(!out.contains(r#"#[display("things__gone")]"#));
