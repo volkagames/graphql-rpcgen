@@ -61,7 +61,7 @@ type Users @service @auth(require: session, permission: users_read) {
     @auth(require: session, unguarded: true)
 
   "Opens the operation, overriding the service's session and permission alike."
-  ping(input: GetInput!): Thing! @query @rpc(path: "/users/ping") @auth(require: public)
+  ping(input: GetInput!): Thing! @query @rpc(path: "/users/ping") @auth(require: public, unguarded: true)
 }
 "#;
 
@@ -131,6 +131,104 @@ fn a_permission_is_checked_before_the_method_runs() -> TestResult {
             !body.contains("require_permission"),
             "{name} must not check: {body}"
         );
+    }
+    Ok(())
+}
+
+/// One operation per handler form, each needing a permission, in a service
+/// whose operations each state their own: every template carries the guard,
+/// and a template that lost it would open its form to every session.
+const EVERY_FORM: &str = r#"
+scalar UUID
+scalar Binary
+  @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  permission_required
+}
+
+enum Permission @permissions(codes: ["permission_required"]) { files_wipe }
+
+type Event { line: String! }
+input WatchInput { id: UUID! }
+input IngestInput { id: UUID! body: Binary! }
+type IngestResult { written: Int! }
+
+type Admin @service @auth(require: session, explicit: true) {
+  json(input: WatchInput!): IngestResult!
+    @mutation @rpc(path: "/json")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  no_input: IngestResult!
+    @mutation @rpc(path: "/no_input")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  watch(input: WatchInput!): Event!
+    @subscription @rpc(path: "/watch")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  watch_all: Event!
+    @subscription @rpc(path: "/watch_all")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  report(input: WatchInput!): Binary!
+    @query @rpc(path: "/report") @raw(response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  manifest: Binary!
+    @query @rpc(path: "/manifest") @raw(response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  ingest(input: IngestInput!): IngestResult!
+    @mutation @rpc(path: "/ingest") @raw(request: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  convert(input: IngestInput!): Binary!
+    @mutation @rpc(path: "/convert") @raw(request: ["text/csv"], response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  upload(input: IngestInput!): IngestResult!
+    @mutation @rpc(path: "/upload") @raw(request: ["application/octet-stream"], stream: true)
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+}
+"#;
+
+/// In every handler form the guard comes first: before the body or the query
+/// string is read, and before the method is called.
+#[test]
+fn every_handler_form_checks_before_reading_the_request() -> TestResult {
+    let api = graphql_rpcgen::compile_str(EVERY_FORM)?;
+    let out = generate_rust::generate(&api, &Config::default())?;
+    let guard = "    let access = ctx.require_permission(Permission::FilesWipe).await;\n    \
+                 if let Err(response) = access {\n        return response;\n    }\n";
+    // What a handler does with the request once the guard has let it through.
+    let reads = [
+        "from_request(",
+        "input_from_query(",
+        "into_parts()",
+        "raw_body(",
+        "service.",
+    ];
+
+    let forms = [
+        "json",
+        "no_input",
+        "watch",
+        "watch_all",
+        "report",
+        "manifest",
+        "ingest",
+        "convert",
+        "upload",
+    ];
+    for form in forms {
+        let name = format!("admin_{form}");
+        let body = handler(&out, &name)?;
+        let guard_at = body
+            .find(guard)
+            .ok_or(format!("{name} must check the permission: {body}"))?;
+        let first_read = reads
+            .iter()
+            .filter_map(|read| body.find(read))
+            .min()
+            .ok_or(format!(
+                "{name} must read the request or call the service: {body}"
+            ))?;
+        assert!(guard_at < first_read, "{name} must check first: {body}");
     }
     Ok(())
 }
@@ -290,7 +388,7 @@ type S @service {{
     ))?;
     assert!(
         e.contains(
-            "directive `@auth` has no argument `permisson`; it takes `require`, `role`, `permission`, `unguarded`"
+            "directive `@auth` has no argument `permisson`; it takes `require`, `role`, `permission`, `unguarded`, `explicit`"
         ),
         "{e}"
     );
@@ -407,17 +505,29 @@ fn a_permission_outside_a_session_set_is_rejected() -> TestResult {
 /// A restatement that leaves out its service's check must say so: a copied
 /// `@auth(require: session)` would otherwise open the operation to every
 /// session without a word, and the compiler cannot tell it from a deliberate
-/// one.
+/// one. `require: public` opens it wider still, so it says so too.
 #[test]
 fn a_restatement_drops_a_check_only_by_saying_so() -> TestResult {
-    for (rule, expected) in [
+    for (rule, restated, expected) in [
         (
             "permission: users_read",
+            "require: session",
             "`S.g`: @auth restates the rule without its service's `permission: users_read`; \
-             name a role or a permission, or write `unguarded: true` if any session may call it",
+             name a role or a permission, or write `unguarded: true` if it needs neither",
+        ),
+        (
+            "permission: users_read",
+            "require: public",
+            "`S.g`: @auth restates the rule without its service's `permission: users_read`",
+        ),
+        (
+            "permission: users_read",
+            "require: token",
+            "`S.g`: @auth restates the rule without its service's `permission: users_read`",
         ),
         (
             "role: admin",
+            "require: session",
             "`S.g`: @auth restates the rule without its service's `role: admin`",
         ),
     ] {
@@ -429,60 +539,60 @@ fn a_restatement_drops_a_check_only_by_saying_so() -> TestResult {
         let e = expect_error(&format!(
             r#"{set}
 type S @service @auth(require: session, {rule}) {{
-  g(input: GetInput!): Thing! @query @rpc(path: "/g") @auth(require: session)
+  g(input: GetInput!): Thing! @query @rpc(path: "/g") @auth({restated})
     @throws(codes: ["role_required", "role_forbidden", "scope_required"])
 }}
 "#
         ))?;
-        assert!(e.contains(expected), "{rule}: {e}");
+        assert!(e.contains(expected), "{rule} / {restated}: {e}");
     }
     Ok(())
 }
 
-/// `unguarded` is written only to drop a check: as `true`, on a session
-/// operation naming no check, in a service that has one to drop.
-#[test]
-fn unguarded_is_refused_where_it_says_nothing() -> TestResult {
-    let service = |service_rule: &str, op_rule: &str| {
-        format!(
-            r#"{PERMISSION_SET}
+/// One operation of `S`, under the service rule and the operation rule given;
+/// an empty operation rule leaves the operation without `@auth` of its own.
+fn one_operation(service_rule: &str, op_rule: &str) -> String {
+    let op_auth = match op_rule {
+        "" => String::new(),
+        rule => format!("@auth({rule})"),
+    };
+    format!(
+        r#"{PERMISSION_SET}
 type S @service {service_rule} {{
-  g(input: GetInput!): Thing! @query @rpc(path: "/g") @auth({op_rule})
+  g(input: GetInput!): Thing! @query @rpc(path: "/g") {op_auth}
     @throws(codes: ["role_forbidden", "scope_required"])
 }}
 "#
-        )
-    };
+    )
+}
+
+/// `unguarded` is written only to drop a check: as `true`, naming no check,
+/// in a service that has one to drop. Any `require:` may drop it.
+#[test]
+fn unguarded_is_refused_where_it_says_nothing() -> TestResult {
     let guarded = "@auth(require: session, permission: users_read)";
     for (sdl, expected) in [
         (
-            service(guarded, "require: session, unguarded: false"),
-            "`S.g`: @auth(unguarded: false) is the default; drop the argument",
+            one_operation(guarded, "require: session, unguarded: false"),
+            "`S.g`: @auth(unguarded:) `false` is the default; drop the argument",
         ),
         (
-            service(guarded, r#"require: session, unguarded: "yes""#),
+            one_operation(guarded, r#"require: session, unguarded: "yes""#),
             "`S.g`: @auth(unguarded:) must be `true`",
         ),
         (
-            service(
+            one_operation(
                 guarded,
                 "require: session, permission: users_write, unguarded: true",
             ),
-            "`S.g`: @auth(unguarded: true) says a session operation needs no role or permission",
+            "`S.g`: @auth(unguarded: true) says the operation needs no role or permission, so it names neither",
         ),
         (
-            service(guarded, "require: public, unguarded: true"),
-            "`S.g`: @auth(unguarded: true) says a session operation needs no role or permission",
-        ),
-        (
-            service(
-                "@auth(require: session)",
-                "require: session, unguarded: true",
-            ),
+            one_operation("@auth(require: session)", "require: session, unguarded: true"),
             "`S.g`: @auth(unguarded: true) has nothing to drop",
         ),
         (
-            service(
+            one_operation(
                 "@auth(require: session, unguarded: true)",
                 "require: session, permission: users_read",
             ),
@@ -491,6 +601,85 @@ type S @service {service_rule} {{
     ] {
         let e = expect_error(&sdl)?;
         assert!(e.contains(expected), "{sdl}: {e}");
+    }
+
+    for op_rule in [
+        "require: session, unguarded: true",
+        "require: public, unguarded: true",
+        "require: token, unguarded: true",
+    ] {
+        graphql_rpcgen::compile_str(&format!("{BASE}{}", one_operation(guarded, op_rule)))?;
+    }
+    Ok(())
+}
+
+/// An `explicit` service has no default: each operation states its own check,
+/// so a forgotten one is a compile error rather than an operation open to every
+/// session, and a write cannot inherit a read.
+#[test]
+fn an_explicit_service_has_each_operation_state_its_check() -> TestResult {
+    let explicit = "@auth(require: session, explicit: true)";
+    for (sdl, expected) in [
+        (
+            one_operation(explicit, ""),
+            "`S.g`: its service is @auth(explicit: true), so it states its own @auth: a role, \
+             a permission, or `unguarded: true`",
+        ),
+        (
+            one_operation(explicit, "require: session"),
+            "`S.g`: @auth restates the rule without a check its `explicit` service asks for",
+        ),
+        (
+            one_operation(explicit, "require: public"),
+            "`S.g`: @auth restates the rule without a check its `explicit` service asks for",
+        ),
+        (
+            one_operation(
+                "@auth(require: session)",
+                "require: session, explicit: true",
+            ),
+            "`S.g`: @auth(explicit:) applies to a service",
+        ),
+        (
+            one_operation(
+                "@auth(require: session, permission: users_read, explicit: true)",
+                "require: session, permission: users_read",
+            ),
+            "`S`: @auth(explicit: true) has each operation name its own check, so it takes \
+             `require: session` and no `role:` or `permission:`",
+        ),
+        (
+            one_operation(
+                "@auth(require: token, explicit: true)",
+                "require: session, permission: users_read",
+            ),
+            "`S`: @auth(explicit: true) has each operation name its own check",
+        ),
+        (
+            one_operation(
+                "@auth(require: session, explicit: false)",
+                "require: session, permission: users_read",
+            ),
+            "`S`: @auth(explicit:) `false` is the default; drop the argument",
+        ),
+    ] {
+        let e = expect_error(&sdl)?;
+        assert!(e.contains(expected), "{sdl}: {e}");
+    }
+
+    for op_rule in [
+        "require: session, permission: users_write",
+        "require: session, unguarded: true",
+        "require: public, unguarded: true",
+    ] {
+        let api =
+            graphql_rpcgen::compile_str(&format!("{BASE}{}", one_operation(explicit, op_rule)))?;
+        let op = &api.services[0].operations[0];
+        assert_eq!(
+            op.access.is_some(),
+            op_rule.contains("permission:"),
+            "{op_rule}"
+        );
     }
     Ok(())
 }

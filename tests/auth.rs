@@ -466,7 +466,8 @@ type Releases @service @auth(require: session, role: content_release) {
     @auth(require: session, unguarded: true)
 
   "Opens the operation, overriding the service's session and role alike."
-  feed(input: GetInput!): Thing! @query @rpc(path: "/releases/feed") @auth(require: public)
+  feed(input: GetInput!): Thing! @query @rpc(path: "/releases/feed")
+    @auth(require: public, unguarded: true)
 }
 "#;
 

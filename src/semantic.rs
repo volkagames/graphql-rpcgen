@@ -30,7 +30,10 @@ const DIRECTIVES: &[(&str, &[&str])] = &[
     ("raw", &["request", "response", "stream"]),
     ("rpc", &["path"]),
     ("version", &["n"]),
-    ("auth", &["require", "role", "permission", "unguarded"]),
+    (
+        "auth",
+        &["require", "role", "permission", "unguarded", "explicit"],
+    ),
     ("mcp", &["expose"]),
     ("throws", &["codes"]),
     ("length", &["min", "max"]),
@@ -131,6 +134,30 @@ struct AuthRule {
     /// permission needs neither. Said in so many words, because a restatement
     /// that merely leaves the check out reads the same as one that forgot it.
     unguarded: bool,
+    /// `explicit: true`, on a service: each operation states its own check,
+    /// and inherits none. See [`ServiceAuth::explicit`].
+    explicit: bool,
+}
+
+/// The rule a service hands its operations.
+#[derive(Debug, Clone, Default)]
+struct ServiceAuth {
+    require: AuthRequirement,
+    access: Option<Access>,
+    /// Each operation must state its own `@auth`, naming a role, a permission
+    /// or `unguarded: true`. For a service whose operations need different
+    /// checks: a default would hand a new operation whatever check it states —
+    /// a write inheriting the read — and no default would leave a forgotten
+    /// operation open to every session.
+    explicit: bool,
+}
+
+impl ServiceAuth {
+    /// Whether an operation of this service is held to a check, so that one
+    /// without its own role or permission must say `unguarded: true`.
+    fn guarded(&self) -> bool {
+        self.access.is_some() || self.explicit
+    }
 }
 
 /// An enum marked `@permissions`, as declared: where, and the codes its check
@@ -698,7 +725,7 @@ impl<'a> Analyzer<'a> {
         // before the directive existed.
         let service_rule = self.auth_rule(file, &t.name, &t.directives, t.position);
         let service_auth = match service_rule {
-            None => Default::default(),
+            None => ServiceAuth::default(),
             Some(rule) => {
                 // There is nothing above a service for it to drop.
                 if rule.unguarded {
@@ -712,7 +739,11 @@ impl<'a> Analyzer<'a> {
                         t.position,
                     ));
                 }
-                (rule.require, rule.access)
+                ServiceAuth {
+                    require: rule.require,
+                    access: rule.access,
+                    explicit: rule.explicit,
+                }
             }
         };
         // `@mcp` on the service exposes every operation; each may restate it.
@@ -785,7 +816,7 @@ impl<'a> Analyzer<'a> {
         service: &str,
         field: &GqlField<'static, String>,
         service_version: Option<&str>,
-        service_auth: &(AuthRequirement, Option<Access>),
+        service_auth: &ServiceAuth,
         service_mcp: bool,
     ) -> Option<Operation> {
         self.check_directives(
@@ -851,12 +882,16 @@ impl<'a> Analyzer<'a> {
         // narrower spelling.
         let owner = format!("{service}.{}", field.name);
         let own_rule = self.auth_rule(file, &owner, &field.directives, field.position);
+        self.check_operation_rule(
+            file,
+            &owner,
+            field.position,
+            own_rule.as_ref(),
+            service_auth,
+        );
         let (auth, access) = match own_rule {
-            None => service_auth.clone(),
-            Some(rule) => {
-                self.check_dropped_access(file, &owner, field.position, &rule, service_auth);
-                (rule.require, rule.access)
-            }
+            None => (service_auth.require, service_auth.access.clone()),
+            Some(rule) => (rule.require, rule.access),
         };
 
         // The operation's own `@mcp` wins over its service's, so a service can
@@ -1086,7 +1121,7 @@ impl<'a> Analyzer<'a> {
                     self.errors.push(CompileError::at(
                         format!(
                             "`{owner}`: @auth({argument}:) names a value of the @{set} enum, \
-                             written bare — `{argument}: {example}`, not a string"
+                             written bare: `{argument}: {example}`"
                         ),
                         file,
                         pos,
@@ -1097,7 +1132,9 @@ impl<'a> Analyzer<'a> {
         };
         let role = bare("role", "roles", "content_edit");
         let permission = bare("permission", "permissions", "admin_users_read");
-        let access = match (role.ok()?, permission.ok()?) {
+        let role = role.ok()?;
+        let permission = permission.ok()?;
+        let access = match (role, permission) {
             (None, None) => None,
             (Some(role), None) => Some(Access::Role(role)),
             (None, Some(permission)) => Some(Access::Permission(permission)),
@@ -1142,33 +1179,26 @@ impl<'a> Analyzer<'a> {
             return None;
         }
 
-        // Written only to say there is no check, so `false` — the default —
-        // and an argument beside a check are each refused.
-        let unguarded = match bool_arg(d, "unguarded") {
-            None if d.arguments.iter().all(|(n, _)| n != "unguarded") => false,
-            Some(true) => true,
-            Some(false) => {
-                self.errors.push(CompileError::at(
-                    format!("`{owner}`: @auth(unguarded: false) is the default; drop the argument"),
-                    file,
-                    pos,
-                ));
-                return None;
-            }
-            None => {
-                self.errors.push(CompileError::at(
-                    format!("`{owner}`: @auth(unguarded:) must be `true`"),
-                    file,
-                    pos,
-                ));
-                return None;
-            }
-        };
-        if unguarded && (access.is_some() || require != AuthRequirement::Session) {
+        let unguarded = self.true_flag(file, owner, pos, d, "unguarded").ok()?;
+        let explicit = self.true_flag(file, owner, pos, d, "explicit").ok()?;
+        if unguarded && access.is_some() {
             self.errors.push(CompileError::at(
                 format!(
-                    "`{owner}`: @auth(unguarded: true) says a session operation needs no role or \
-                     permission; it names neither, and only `require: session` checks one"
+                    "`{owner}`: @auth(unguarded: true) says the operation needs no role or \
+                     permission, so it names neither"
+                ),
+                file,
+                pos,
+            ));
+            return None;
+        }
+        // The service names no check of its own, since each operation states
+        // one, and the checks need a session to run on.
+        if explicit && (access.is_some() || require != AuthRequirement::Session) {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{owner}`: @auth(explicit: true) has each operation name its own check, so \
+                     it takes `require: session` and no `role:` or `permission:`"
                 ),
                 file,
                 pos,
@@ -1180,52 +1210,85 @@ impl<'a> Analyzer<'a> {
             require,
             access,
             unguarded,
+            explicit,
         })
     }
 
-    /// An operation restating `@auth` keeps its service's role or permission
-    /// only by naming one, so a restatement that leaves the check out must say
-    /// `unguarded: true` — otherwise a copied `@auth(require: session)` would
-    /// open the operation to every session without a word.
-    ///
-    /// `require: token` and `require: public` are departures of their own,
-    /// spelled out, and drop the check by saying so.
-    fn check_dropped_access(
+    /// A flag of `@auth` written only to switch something on: `false` is the
+    /// default and refused, so there is one way to write each rule.
+    fn true_flag(
         &mut self,
         file: &Path,
         owner: &str,
         pos: Pos,
-        rule: &AuthRule,
-        service_auth: &(AuthRequirement, Option<Access>),
+        d: &Directive<'static, String>,
+        name: &str,
+    ) -> Result<bool, ()> {
+        let problem = match bool_arg(d, name) {
+            None if d.arguments.iter().all(|(n, _)| n != name) => return Ok(false),
+            Some(true) => return Ok(true),
+            Some(false) => "`false` is the default; drop the argument",
+            None => "must be `true`",
+        };
+        self.errors.push(CompileError::at(
+            format!("`{owner}`: @auth({name}:) {problem}"),
+            file,
+            pos,
+        ));
+        Err(())
+    }
+
+    /// An operation drops its service's check only by saying so.
+    ///
+    /// In a service that checks a role or a permission, or that is
+    /// `explicit`, an operation's own `@auth` without a role or a permission
+    /// must say `unguarded: true` — whatever its `require:`, since `public`
+    /// opens the operation wider still. Otherwise a copied
+    /// `@auth(require: session)` would open it without a word. An `explicit`
+    /// service's operations must each state their `@auth`.
+    fn check_operation_rule(
+        &mut self,
+        file: &Path,
+        owner: &str,
+        pos: Pos,
+        rule: Option<&AuthRule>,
+        service: &ServiceAuth,
     ) {
-        let session = rule.require == AuthRequirement::Session;
-        match (&service_auth.1, &rule.access, rule.unguarded) {
-            (Some(inherited), None, false) if session => {
-                let (argument, value) = match inherited {
-                    Access::Role(role) => ("role", role),
-                    Access::Permission(permission) => ("permission", permission),
+        let problem = match rule {
+            None if service.explicit => Some(
+                "its service is @auth(explicit: true), so it states its own @auth: a role, a \
+                 permission, or `unguarded: true`"
+                    .to_string(),
+            ),
+            None => None,
+            Some(rule) if rule.explicit => Some(
+                "@auth(explicit:) applies to a service, whose operations then each state their \
+                 own check"
+                    .to_string(),
+            ),
+            Some(rule) if rule.access.is_none() && !rule.unguarded && service.guarded() => {
+                let dropped = match &service.access {
+                    Some(Access::Role(role)) => format!("its service's `role: {role}`"),
+                    Some(Access::Permission(permission)) => {
+                        format!("its service's `permission: {permission}`")
+                    }
+                    None => "a check its `explicit` service asks for".to_string(),
                 };
-                self.errors.push(CompileError::at(
-                    format!(
-                        "`{owner}`: @auth restates the rule without its service's \
-                         `{argument}: {value}`; name a role or a permission, or write \
-                         `unguarded: true` if any session may call it"
-                    ),
-                    file,
-                    pos,
-                ));
+                Some(format!(
+                    "@auth restates the rule without {dropped}; name a role or a permission, or \
+                     write `unguarded: true` if it needs neither"
+                ))
             }
-            (None, _, true) => {
-                self.errors.push(CompileError::at(
-                    format!(
-                        "`{owner}`: @auth(unguarded: true) has nothing to drop; its service \
-                         checks no role or permission"
-                    ),
-                    file,
-                    pos,
-                ));
-            }
-            _ => {}
+            Some(rule) if rule.unguarded && !service.guarded() => Some(
+                "@auth(unguarded: true) has nothing to drop; its service checks no role or \
+                 permission"
+                    .to_string(),
+            ),
+            Some(_) => None,
+        };
+        if let Some(problem) = problem {
+            self.errors
+                .push(CompileError::at(format!("`{owner}`: {problem}"), file, pos));
         }
     }
 
@@ -1774,11 +1837,11 @@ impl<'a> Analyzer<'a> {
         let problem = match string_list_arg(d, "codes") {
             Some(codes) if codes.is_empty() => "lists no code",
             Some(codes) => {
-                let mut seen: BTreeSet<&str> = BTreeSet::new();
-                match codes.iter().find(|code| !seen.insert(code.as_str())) {
-                    None => return codes,
-                    Some(_) => "lists a code twice",
+                let distinct: BTreeSet<&str> = codes.iter().map(String::as_str).collect();
+                if distinct.len() == codes.len() {
+                    return codes;
                 }
+                "lists a code twice"
             }
             None if d.arguments.iter().all(|(n, _)| n != "codes") => "is missing",
             None => "must be a list of strings",

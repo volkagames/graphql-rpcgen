@@ -451,7 +451,7 @@ type PaymentInput =
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
 | `@subscription` | FIELD | a stream of events over SSE; the field's type is one event |
 | `@raw(request:, response:, stream:)` | FIELD | a body that is bytes rather than the JSON envelope; `stream: true` hands the request body to the service unread |
-| `@auth(require:, role:, permission:, unguarded:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role; `permission` names the permission it needs; `unguarded: true` drops its service's check |
+| `@auth(require:, role:, permission:, unguarded:, explicit:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role; `permission` names the permission it needs; `unguarded: true` drops its service's check; `explicit: true` on a service has each operation state its own |
 | `@roles` | ENUM | the enum's values are the API's roles |
 | `@inherits(roles:)` | ENUM_VALUE | on a role: the roles it inherits the permissions of |
 | `@permissions(codes:)` | ENUM | the enum's values are the API's permissions; `codes` are what the permission check answers with |
@@ -521,22 +521,47 @@ it to differ. A restatement replaces the rule whole rather than merging, so a
 narrower spelling cannot inherit a role or a permission it dropped.
 
 Dropping one is said in so many words. In a service whose `@auth` names a role
-or a permission, an operation restating `@auth(require: session)` without
-naming one of its own is refused: a copied rule would otherwise open the
-operation to every session, and nothing would tell it from a deliberate one.
-An operation any session may call says `unguarded: true`:
+or a permission, an operation restating `@auth` without naming one of its own is
+refused, whatever its `require:`: a copied `@auth(require: session)` would
+otherwise open the operation to every session, a `require: public` to everyone,
+and nothing would tell either from a deliberate one. An operation that needs
+neither says `unguarded: true`:
 
 ```graphql
 type Users @service @auth(require: session, permission: users_read) {
   "Any session reads its own account."
   me: Me! @query @rpc(path: "/users/me") @auth(require: session, unguarded: true)
+
+  "Anyone, signed in or not."
+  status: Status! @query @rpc(path: "/users/status") @auth(require: public, unguarded: true)
 }
 ```
 
 `unguarded` is refused where it would say nothing: as `false`, beside a `role:`
-or a `permission:`, with `require: token` or `public` — those drop the check by
-being departures of their own — on a service, or in a service with no check to
-drop.
+or a `permission:`, on a service, or in a service with no check to drop.
+
+A service whose operations need different checks — a read and a write, or
+several sections of an administration — is better off without a default: one
+would hand a new operation whatever check it names, a write inheriting the read.
+`explicit: true` says the service has none, and that each operation states its
+own `@auth` with a role, a permission or `unguarded: true`:
+
+```graphql
+type AdminUsers @service @auth(require: session, explicit: true) {
+  list(input: UserListInput!): UserListResponse!
+    @query @rpc(path: "/admin/users/list")
+    @auth(permission: users_read) @throws(codes: ["role_forbidden", "scope_required"])
+
+  delete(input: UserDeleteInput!): UserDeleteResponse!
+    @mutation @rpc(path: "/admin/users/delete")
+    @auth(permission: users_write) @throws(codes: ["role_forbidden", "scope_required"])
+}
+```
+
+An operation added without `@auth`, or with one naming no check, is a compile
+error rather than an operation open to every session. `explicit` takes
+`require: session` and no `role:` or `permission:`, and applies to a service
+only.
 
 `require:` is `session`, `token` or `public`. Only `session` produces a
 parameter, because the context carries the caller and only a session names one:
@@ -890,7 +915,8 @@ Two more rules:
   `operationId` with the permission it needs (`Role::OPERATIONS` likewise for
   roles). The guard sits in the handler, so a caller reaching a service other
   than through its router — an MCP tool calling the method, a job runner —
-  passes none; this is what it checks instead of keeping a table of its own:
+  passes none. This is where such a caller reads the check, rather than
+  restating which operation needs what:
 
   ```rust
   let required = Permission::OPERATIONS
@@ -905,7 +931,12 @@ Two more rules:
   ```
 
   An id the API lacks has no row, so a misspelt one is refused rather than
-  read as an operation that needs nothing.
+  read as an operation that needs nothing. `None` means no check beyond
+  `require:` — which for a `token` or `public` operation is no session at all.
+  The caller still maps its own names to operation ids: an MCP tool written by
+  hand, named otherwise or calling several methods, keeps that map; what the
+  table removes is the check column beside it. The table checks nothing by
+  itself: a caller that skips it runs the method unchecked.
 - TypeScript: `permissions`, the whole set in declaration order, and a
   `permission` field on each `createApi` entry that needs one. It says what the
   server asks for, not who passes: there is no client-side check to mirror.
@@ -923,13 +954,14 @@ and `permission:` on one operation; and an operation with a permission whose
 rather than ignored. In the library, `Operation::role` is `Operation::access`, an
 `Option<Access>` holding a role or a permission. A custom handler template names
 the gate `{{{access_guard}}}` instead of `{{{role_guard}}}`, and a custom context
-template carries `{{{require_permission}}}` beside `{{{require_role}}}`. A JSON
-handler now takes `request: axum::extract::Request` and reads the body with
-`ApiJson` after `{{{access_guard}}}`, so a custom handler template that still
-extracts `ApiJson` in its parameters parses the body before the check. In a
-service with `role:` or `permission:`, an operation restating
-`@auth(require: session)` without a check of its own is refused; add
-`unguarded: true` where any session may call it. An API declaring both a
+template carries `{{{require_permission}}}` beside `{{{require_role}}}`. The
+JSON-bodied handlers — `handler`, `handler_no_input`, `handler_raw_response` and
+`handler_raw_response_no_input` — now take `request: axum::extract::Request`
+and read the body with `ApiJson` after `{{{access_guard}}}`, so a custom one
+that still extracts `ApiJson` in its parameters parses the body before the
+check. In a service with `role:` or `permission:`, an operation restating
+`@auth` without a check of its own — `require: session`, `token` or `public` —
+is refused; add `unguarded: true` where it needs none. An API declaring both a
 `@roles` and a `@permissions` enum is refused; keep one.
 
 **Upgrading from 0.11.** Declare the role set as a `@roles` enum and write each
@@ -1159,7 +1191,7 @@ just test-one registry     # by test name
 just ci                    # fmt-check, lints as errors, tests
 ```
 
-235 tests, none of which need a network:
+237 tests, none of which need a network:
 
 - **semantic** (96) — every validation rule, the error-code registry, path
   versioning, union tags, which constraint may sit on which type, plus
@@ -1178,10 +1210,10 @@ just ci                    # fmt-check, lints as errors, tests
   `@roles` set, its `@inherits` closure on both sides and its `OPERATIONS`
   table, and the rejections
   that keep a declaration from being decorative
-- **permissions** (16) — `@permissions` and `@auth(permission:)`: the awaited
-  guard and its inheritance, the context trait's check, the set's Rust and
+- **permissions** (18) — `@permissions` and `@auth(permission:)`: the awaited
+  guard ahead of the request in every handler form, its inheritance, the context trait's check, the set's Rust and
   TypeScript halves and its `OPERATIONS` table, `x-permission` / `x-role` in
-  OpenAPI, a misspelt `@auth` argument refused, `unguarded`, one set per API,
+  OpenAPI, a misspelt `@auth` argument refused, `unguarded`, `explicit`, one set per API,
   and every other rejection
 - **mcp** (6) — `@mcp` inheritance, the `x-mcp` flag in the OpenAPI document,
   and the rejections of shapes a tool call cannot honour
@@ -1201,7 +1233,7 @@ just ci                    # fmt-check, lints as errors, tests
   runtime rather than in emitted text
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
   `@raw` form, a `@subscription` and a role reached through `@inherits`, and
-  for a second API a permission held and one refused, which is the only thing that
+  for a second API a permission held and one refused in every handler form, which is the only thing that
   checks the emitted handlers, client methods and streaming runtime against
   rustc rather than against a `contains`; the router is then served on a local
   port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it
