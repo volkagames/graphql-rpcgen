@@ -451,9 +451,10 @@ type PaymentInput =
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
 | `@subscription` | FIELD | a stream of events over SSE; the field's type is one event |
 | `@raw(request:, response:, stream:)` | FIELD | a body that is bytes rather than the JSON envelope; `stream: true` hands the request body to the service unread |
-| `@auth(require:, role:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role |
+| `@auth(require:, role:, permission:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role; `permission` names the permission it needs |
 | `@roles` | ENUM | the enum's values are the API's roles |
 | `@inherits(roles:)` | ENUM_VALUE | on a role: the roles it inherits the permissions of |
+| `@permissions(codes:)` | ENUM | the enum's values are the API's permissions; `codes` are what the permission check answers with |
 | `@mcp(expose:)` | OBJECT/FIELD | the operation is an MCP tool; surfaces as `x-mcp` in OpenAPI |
 | `@throws(codes:)` | FIELD | error codes the operation may return |
 | `@length(min:, max:)` | FIELD/INPUT | `minLength` / `maxLength` |
@@ -469,7 +470,9 @@ Directives are pure metadata; no user code is ever executed. There is no plugin
 system and nothing in an SDL document can run code at generation time.
 
 An unsupported SDL construct is a compile error naming the offending type or
-field, not a silently dropped declaration.
+field, not a silently dropped declaration. That includes an argument a directive
+does not read: `@auth(require: session, permisson: users_read)` is refused, since
+dropping the misspelt argument would leave the operation open to every session.
 
 ### Names the targets have to be able to spell
 
@@ -515,7 +518,12 @@ type Documents @service @auth(require: session) {
 
 Declared on the service and inherited by each operation; an operation restates
 it to differ. A restatement replaces the rule whole rather than merging, so a
-narrower spelling cannot inherit a role it dropped.
+narrower spelling cannot inherit a role or a permission it dropped. The
+converse holds too: an operation that restates `@auth(require: session)` in a
+service with a role or a permission needs neither, which is the way to say so —
+and the way to lose one by accident. An API whose every operation on some
+surface must carry a check holds it there with a test over `x-role` /
+`x-permission` in the OpenAPI document.
 
 `require:` is `session`, `token` or `public`. Only `session` produces a
 parameter, because the context carries the caller and only a session names one:
@@ -548,11 +556,24 @@ async fn documents_revert<S: DocumentsService>(
 ```
 
 A declaration the implementation could forget to apply would be a comment, so
-the check is not left to it. It runs before the body is validated, so a caller
-without the role learns that rather than which field it also got wrong. The
-compiler requires `role_required` in `@throws`: the check answers with that
-code, and an operation may only answer with what it declares — undeclared, it
-would narrow to `internal_error` and a denial would read as a server fault.
+the check is not left to it. It runs once the body has been read and parsed and
+before the input's constraints are validated, so a caller without the role
+learns that rather than which constraint it also broke; a body that is not the
+input at all is still `invalid_body`. The compiler requires `role_required` in
+`@throws`: the check answers with that code, and an operation's declared codes
+are what its clients are typed against — a refusal missing from them would be
+one no client expects.
+
+`permission:` names a value of the `@permissions` enum instead — see
+[Permissions](#permissions-permissions) — and is enforced the same way, awaited:
+
+```rust
+    if let Err(response) = ctx.require_permission(Permission::UsersWrite).await {
+        return response;
+    }
+```
+
+An operation names a role or a permission, never both.
 
 The TypeScript client carries the same declaration, so a UI that says who may
 do what reads it rather than restating it by hand. Each operation in
@@ -606,18 +627,22 @@ pub trait DocumentsService: Clone + Send + Sync + 'static {
 ```
 
 `FromRequestContext` is generated beside the extractor. It asks for the caller,
-and, in an API with a `@roles` enum, for the role check:
+and, in an API with a `@roles` enum, for the role check, and in one with a
+`@permissions` enum, for the permission check:
 
 ```rust
 pub trait FromRequestContext: Sized + Send + Sync + 'static {
     fn from_parts(parts: &mut Parts)
         -> impl Future<Output = Result<Self, Response>> + Send;
     fn require_role(&self, role: Role) -> Result<(), Response>;
+    fn require_permission(&self, permission: Permission)
+        -> impl Future<Output = Result<(), Response>> + Send;
 }
 ```
 
 Without a `@roles` enum there is no role type to check against and no operation
-asking for one, so `require_role` is not part of the trait.
+asking for one, so `require_role` is not part of the trait; likewise
+`require_permission` without a `@permissions` enum.
 
 What a session *is* — the cookie, the exchange with the identity provider, the
 user lookup, what a denial says — is the server's, and no schema can describe
@@ -710,6 +735,90 @@ that is quoted, missing from the set, or used without a set; `@inherits` outside
 the role set, empty, naming a value the enum lacks, the role itself or one role
 twice; and a cycle, since the standard's hierarchy is a partial order and roles
 that inherit each other are one role under two names.
+
+### Permissions: `@permissions`
+
+`@roles` compiles the permission assignment into the API: an operation is
+assigned to a role in the SDL, and the role hierarchy decides the rest. That is
+the wrong shape for an application whose roles are data — made by its
+administrators, different per tenant, built on one another at run time. Such an
+application decides access by permission: an operation needs a permission, and
+which roles hold it is a table the application keeps.
+
+```graphql
+"What a session may be allowed to do."
+enum Permission @permissions(codes: ["role_forbidden", "scope_required"]) {
+  users_read @variant(tag: "admin.users.read")
+  users_write @variant(tag: "admin.users.write")
+}
+
+type Users @service @auth(require: session, permission: users_read) {
+  list(input: UserListInput!): UserListResponse!
+    @query @rpc(path: "/users/list")
+    @throws(codes: ["role_forbidden", "scope_required"])
+
+  delete(input: UserDeleteInput!): UserDeleteResponse!
+    @mutation @rpc(path: "/users/delete")
+    @auth(require: session, permission: users_write)
+    @throws(codes: ["role_forbidden", "scope_required"])
+}
+```
+
+In the standard's terms, where the two models differ:
+
+| Standard | With `@roles` | With `@permissions` |
+| --- | --- | --- |
+| PRMS, permissions | the operation itself | the values of the `@permissions` enum, each covering the operations that name it |
+| PA, permission assignment | `@auth(role:)`, in the SDL | the implementation's |
+| CheckAccess | `require_role`, over the session's roles and the compiled hierarchy | `require_permission`, over whatever the implementation keeps |
+| What the SDL says of an operation | which role it is assigned to | which permission it needs |
+
+#### The names, and why
+
+- **`@permissions`** marks the enum whose values are PRMS, a directive for the
+  reason `@roles` is one. An API has one permission set, it is not the role set
+  — a role is who acts and a permission is what is done — and it is not the
+  error registry.
+- **`permission:`** on `@auth` names the one permission the operation needs. Not
+  `op:` or `operation:`: here an operation is a field of a `@service`, and a
+  permission routinely covers several of them.
+- **`require_permission`** follows `require_role`. It is async where
+  `require_role` is not: a role is read off the session, while which roles hold
+  a permission is the implementation's data, which it may have to fetch.
+- **`codes:`** on `@permissions` lists what the check answers with, and every
+  operation with a permission must list them in `@throws`. They are the
+  project's rather than a fixed `permission_required`, because whether a
+  credential that does not reach a permission and a user who lacks it are one
+  refusal or two is the implementation's to say — a fixed code would describe a
+  refusal the server may never send. The list is required, so there is one way
+  to write it.
+- **No hierarchy.** Which permissions imply which (`write` covering `read`) is
+  part of the assignment the implementation keeps, so the set carries no
+  `@inherits` and there is no `authorizes`.
+
+#### What is generated
+
+- Rust: `impl Permission { from_name, as_str }` over the wire names — the
+  `@variant(tag:)` when a value has one, since permission ids such as
+  `admin.users.read` are seldom identifiers — and the awaited guard.
+- TypeScript: `permissions`, the whole set in declaration order, and a
+  `permission` field on each `createApi` entry that needs one. It says what the
+  server asks for, not who passes: there is no client-side check to mirror.
+- OpenAPI: `x-permission` on the operation, its wire name; a role-checked one
+  carries `x-role` the same way.
+
+The compiler refuses: a second `@permissions` enum; `@permissions` on
+`ErrorCode` or beside `@roles`; `codes:` missing, empty, repeating a code or not a
+list of strings; `@inherits` on its values; a `permission:` that is quoted,
+missing from the set, used without a set or outside `require: session`; `role:`
+and `permission:` on one operation; and an operation with a permission whose
+`@throws` misses one of the set's codes.
+
+**Upgrading from 0.12.** An argument a directive does not read is now refused
+rather than ignored. In the library, `Operation::role` is `Operation::access`, an
+`Option<Access>` holding a role or a permission. A custom handler template names
+the gate `{{{access_guard}}}` instead of `{{{role_guard}}}`, and a custom context
+template carries `{{{require_permission}}}` beside `{{{require_role}}}`.
 
 **Upgrading from 0.11.** Declare the role set as a `@roles` enum and write each
 `role:` bare (`role: content_admin`). `require_role` takes the role type.
@@ -908,7 +1017,7 @@ Template paths resolve relative to the config file that names them.
 |---|---|---|
 | `[rust]` | preamble | `error_code_enum`, `types_import` |
 | `[rust]` | router | `service`, `module`, `trait_name`, `routes` |
-| `[rust]` | handler | `handler`, `trait_name`, `input`, `output`, `method`, `path`, `query_fields`, `body_field`, `context_extractor`, `context_arg`, `role_guard` |
+| `[rust]` | handler | `handler`, `trait_name`, `input`, `output`, `method`, `path`, `query_fields`, `body_field`, `context_extractor`, `context_arg`, `access_guard` |
 | `[rust]` | handler_no_input | same, with `input` empty |
 | `[rust_client]` | preamble | `error_code_enum`, `types_import`, `client_name` |
 | `[rust_client]` | method | `method`, `input`, `output`, `path`, `operation_id` |
@@ -938,7 +1047,7 @@ just test-one registry     # by test name
 just ci                    # fmt-check, lints as errors, tests
 ```
 
-218 tests, none of which need a network:
+229 tests, none of which need a network:
 
 - **semantic** (96) — every validation rule, the error-code registry, path
   versioning, union tags, which constraint may sit on which type, plus
@@ -953,9 +1062,13 @@ just ci                    # fmt-check, lints as errors, tests
   requirement and every way it can fail, template variable validation,
   identifier casing
 - **auth** (27) — `@auth` on the trait signature, the handler's extractors, the
-  role guard ahead of the body, the client's per-operation `role` field, the
+  role guard ahead of the input's validation, the client's per-operation `role` field, the
   `@roles` set and its `@inherits` closure on both sides, and the rejections
   that keep a declaration from being decorative
+- **permissions** (11) — `@permissions` and `@auth(permission:)`: the awaited
+  guard and its inheritance, the context trait's check, the set's Rust and
+  TypeScript halves, `x-permission` / `x-role` in OpenAPI, a misspelt `@auth`
+  argument refused, and every other rejection
 - **mcp** (6) — `@mcp` inheritance, the `x-mcp` flag in the OpenAPI document,
   and the rejections of shapes a tool call cannot honour
 - **streaming** (10) — `@subscription` and `@raw` on both sides: the signature,
@@ -973,8 +1086,8 @@ just ci                    # fmt-check, lints as errors, tests
   scratch cargo project, pinning the wire shape and the arm constraints at
   runtime rather than in emitted text
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
-  `@raw` form, a `@subscription` and a role reached through `@inherits` beside
-  them, which is the only thing that
+  `@raw` form, a `@subscription`, a role reached through `@inherits` and a
+  permission held and one refused beside them, which is the only thing that
   checks the emitted handlers, client methods and streaming runtime against
   rustc rather than against a `contains`; the router is then served on a local
   port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it

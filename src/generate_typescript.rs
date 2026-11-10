@@ -15,6 +15,7 @@ pub fn generate(api: &Api) -> String {
 
     emit_types(&mut out, api);
     emit_roles(&mut out, api);
+    emit_permissions(&mut out, api);
     emit_error_types(&mut out, api);
     emit_client(&mut out);
     emit_services(&mut out, api);
@@ -622,8 +623,30 @@ fn emit_roles(out: &mut String, api: &Api) {
     );
 }
 
+/// The `@permissions` enum's runtime half: the list of permissions, for a client
+/// that edits which roles hold which. Whether a session holds one is the
+/// server's to decide, so there is no counterpart to `roleAuthorizes`.
+///
+/// The type itself is the enum's literal union, emitted with the other types.
+fn emit_permissions(out: &mut String, api: &Api) {
+    let Some(e) = api.permission_enum() else {
+        return;
+    };
+    let ty = &e.name;
+    let list = e
+        .values
+        .iter()
+        .map(|v| quoted(v.wire_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "\n/** Every permission of `{ty}`, in declaration order. */\nexport const permissions: readonly {ty}[] = [{list}]"
+    );
+}
+
 /// The `api` factory: per operation, its call, the TanStack helpers layered
-/// over it, and the role `@auth(role:)` asks for.
+/// over it, and the role or the permission `@auth` asks for.
 fn emit_api_object(out: &mut String, api: &Api) {
     out.push_str(
         r#"
@@ -664,12 +687,22 @@ export interface MutationOptionsResult<Input, Output> {
                 "undefined"
             };
             let _ = writeln!(out, "      {}: {{", op.name);
-            if let Some(role) = op.role.as_deref() {
-                let _ = writeln!(
-                    out,
-                    "        role: {} as const,",
-                    quoted(api.role_wire_name(role))
-                );
+            match &op.access {
+                None => {}
+                Some(access @ Access::Role(_)) => {
+                    let _ = writeln!(
+                        out,
+                        "        role: {} as const,",
+                        quoted(api.access_wire_name(access))
+                    );
+                }
+                Some(access @ Access::Permission(_)) => {
+                    let _ = writeln!(
+                        out,
+                        "        permission: {} as const,",
+                        quoted(api.access_wire_name(access))
+                    );
+                }
             }
             let verb = if op.kind == OperationKind::Subscription {
                 "subscribe"

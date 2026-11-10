@@ -48,6 +48,7 @@ enum ErrorCode {
   internal_error
   not_found
   role_required
+  permission_required
   "Declared by no operation, so every generated set keeps a reachable fallback."
   database_error
 }
@@ -56,6 +57,12 @@ enum ErrorCode {
 enum Role @roles {
   files_read
   files_write @inherits(roles: [files_read])
+}
+
+"Permission ids are not GraphQL identifiers, so each travels by its tag."
+enum Permission @permissions(codes: ["permission_required"]) {
+  files_purge @variant(tag: "files.purge")
+  files_wipe @variant(tag: "files.wipe")
 }
 
 type Event { line: String! }
@@ -140,6 +147,20 @@ type Files @service {
     @raw(request: ["application/octet-stream"], response: ["application/octet-stream"], stream: true)
     @auth(require: session, role: files_read)
     @throws(codes: ["role_required"])
+
+  "A permission the caller holds, so the call reaches the service."
+  purge(input: WatchInput!): IngestResult!
+    @mutation
+    @rpc(path: "/purge")
+    @auth(require: session, permission: files_purge)
+    @throws(codes: ["permission_required"])
+
+  "A permission the caller lacks, so the call is refused before the service."
+  wipe(input: WatchInput!): IngestResult!
+    @mutation
+    @rpc(path: "/wipe")
+    @auth(require: session, permission: files_wipe)
+    @throws(codes: ["permission_required"])
 }
 "#;
 
@@ -180,6 +201,23 @@ impl server::FromRequestContext for Caller {
         Err(axum::response::IntoResponse::into_response(
             axum::http::StatusCode::FORBIDDEN,
         ))
+    }
+
+    /// Holds `files.purge` only, read by its id as an implementation keeping the
+    /// assignment in data would: `wipe` is refused before its method runs.
+    async fn require_permission(
+        &self,
+        permission: server::Permission,
+    ) -> Result<(), axum::response::Response> {
+        if server::Permission::from_name("files.purge") == Some(permission) {
+            return Ok(());
+        }
+        Err(axum::response::IntoResponse::into_response((
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "errors": [{ "code": "permission_required", "message": permission.as_str() }]
+            })),
+        )))
     }
 }
 
@@ -278,6 +316,28 @@ impl server::FilesService for Files {
         }
         Ok(server::RawBody::new(content_type, bytes))
     }
+
+    async fn purge(
+        &self,
+        _ctx: &Caller,
+        _input: server::WatchInput,
+    ) -> Result<
+        server::ApiResponse<server::IngestResult>,
+        server::ApiError<server::FilesPurgeCodes>,
+    > {
+        Ok(server::success(server::IngestResult { written: 1 }))
+    }
+
+    async fn wipe(
+        &self,
+        _ctx: &Caller,
+        _input: server::WatchInput,
+    ) -> Result<
+        server::ApiResponse<server::IngestResult>,
+        server::ApiError<server::FilesWipeCodes>,
+    > {
+        panic!("a permission the caller lacks must stop the call before the method")
+    }
 }
 
 /// Mounting every raw handler, which is what discharges axum's `Handler` bound.
@@ -310,6 +370,8 @@ async fn client_forms(api: &client::ApiClient) {
     let _ = files.report(&report).await;
     let _ = files.upload(&upload, "application/octet-stream").await;
     let _ = files.watch(&watch).await;
+    let _ = files.purge(&watch).await;
+    let _ = files.wipe(&watch).await;
 }
 
 #[cfg(test)]
@@ -364,6 +426,25 @@ mod wire {
             .await?;
         let json: serde_json::Value = response.json().await?;
         assert_eq!(json["errors"][0]["code"], "invalid_body", "{json}");
+        Ok(())
+    }
+
+    /// The permission check runs before the method: a held permission reaches
+    /// the service, a missing one is answered by the implementation's refusal.
+    #[tokio::test]
+    async fn a_permission_is_checked_before_the_method() -> TestResult {
+        let base = serve().await?;
+        let client = reqwest::Client::new();
+        let held = client.post(format!("{base}/purge")).json(&serde_json::json!({ "id": ID })).send().await?;
+        assert_eq!(held.status(), 200);
+        let json: serde_json::Value = held.json().await?;
+        assert_eq!(json["data"]["written"], 1, "{json}");
+
+        let missing = client.post(format!("{base}/wipe")).json(&serde_json::json!({ "id": ID })).send().await?;
+        assert_eq!(missing.status(), 403);
+        let json: serde_json::Value = missing.json().await?;
+        assert_eq!(json["errors"][0]["code"], "permission_required", "{json}");
+        assert_eq!(json["errors"][0]["message"], "files.wipe", "{json}");
         Ok(())
     }
 

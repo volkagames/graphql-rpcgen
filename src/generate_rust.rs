@@ -106,17 +106,18 @@ const HANDLER_VARS: [&str; 11] = [
     // set of variables serves every form rather than doubling the templates.
     "context_extractor",
     "context_arg",
-    // The role gate, run before the service is called so a denial never reaches
-    // the method.
-    "role_guard",
+    // The access gate — a role or a permission — run before the service is
+    // called so a denial never reaches the method.
+    "access_guard",
 ];
 /// Variables the runtime template may reference, besides `template_vars`.
 const RUNTIME_VARS: [&str; 2] = ["invalid_body_code", "internal_error_code"];
 /// The context runtime names the project's trait and the extractor, both
-/// spelled the same in every project. `require_role` is the trait's role check,
-/// empty for an API without a `@roles` enum: with no role type there is no
-/// signature to give it, and nothing would call it.
-const CONTEXT_RUNTIME_VARS: [&str; 1] = ["require_role"];
+/// spelled the same in every project. `require_role` and `require_permission`
+/// are the trait's access checks, each empty for an API without its enum: with
+/// no role or permission type there is no signature to give it, and nothing
+/// would call it.
+const CONTEXT_RUNTIME_VARS: [&str; 2] = ["require_role", "require_permission"];
 /// Nor does the stream runtime.
 const STREAM_RUNTIME_VARS: [&str; 0] = [];
 /// Variables the router template may reference, besides `template_vars`.
@@ -327,11 +328,10 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
         .flat_map(|service| &service.operations)
         .any(needs_context)
     {
-        out.push_str(
-            &templates
-                .context_runtime
-                .render(&templates.vars(&[("require_role", &require_role_method(api))]))?,
-        );
+        out.push_str(&templates.context_runtime.render(&templates.vars(&[
+            ("require_role", &require_role_method(api)),
+            ("require_permission", &require_permission_method(api)),
+        ]))?);
     }
 
     // Without a types module of their own, the types belong here: the server
@@ -380,6 +380,13 @@ fn emit_types(out: &mut String, api: &Api) {
                 emit_enum(out, e);
                 if api.roles.as_ref().is_some_and(|r| r.enum_name == e.name) {
                     emit_role_impl(out, api, e);
+                }
+                if api
+                    .permissions
+                    .as_ref()
+                    .is_some_and(|p| p.enum_name == e.name)
+                {
+                    emit_permission_impl(out, e);
                 }
             }
             ApiType::Object(o) => emit_object(out, api, o),
@@ -594,6 +601,44 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
             out,
             "            {} => matches!(required, {granted}),",
             variant(role)
+        );
+    }
+    out.push_str("        }\n    }\n}\n");
+}
+
+/// What the server needs of the `@permissions` enum beyond the wire type:
+/// reading a permission from the id the implementation stores, and spelling it.
+///
+/// No `authorizes`: unlike a role hierarchy, which permissions imply which is
+/// not declared in the SDL, so there is nothing to compile into a match.
+fn emit_permission_impl(out: &mut String, e: &EnumType) {
+    let variant = |name: &str| format!("Self::{}", pascal_case(name));
+
+    let _ = writeln!(out, "\nimpl {} {{", e.name);
+    out.push_str(
+        "    /// The permission whose id is `name`, or `None` for an id outside this set.\n    \
+         pub fn from_name(name: &str) -> Option<Self> {\n        match name {\n",
+    );
+    for v in &e.values {
+        let _ = writeln!(
+            out,
+            "            {:?} => Some({}),",
+            v.wire_name(),
+            variant(&v.name)
+        );
+    }
+    out.push_str("            _ => None,\n        }\n    }\n");
+
+    out.push_str(
+        "\n    /// The id the implementation checks for this permission.\n    \
+         pub fn as_str(self) -> &'static str {\n        match self {\n",
+    );
+    for v in &e.values {
+        let _ = writeln!(
+            out,
+            "            {} => {:?},",
+            variant(&v.name),
+            v.wire_name()
         );
     }
     out.push_str("        }\n    }\n}\n");
@@ -1252,7 +1297,7 @@ fn emit_service(
             ("body_field", &body_field),
             ("context_extractor", &context_extractor(op)),
             ("context_arg", &context_arg),
-            ("role_guard", &role_guard(api, op)),
+            ("access_guard", &access_guard(api, op)),
         ]))?);
     }
 
@@ -1322,17 +1367,42 @@ fn context_extractor(op: &Operation) -> String {
     }
 }
 
-/// The role gate, emitted between the extractors and the call.
-fn role_guard(api: &Api, op: &Operation) -> String {
-    match (&op.role, &api.roles, op.auth.has_context()) {
-        (Some(role), Some(roles), true) => format!(
-            "    if let Err(response) = ctx.require_role({}::{}) {{\n        \
-             return response;\n    }}\n",
-            roles.enum_name,
-            pascal_case(role)
-        ),
-        _ => String::new(),
+/// The access gate, emitted between the extractors and the call: the role or
+/// the permission `@auth` demands, handed to the context's check.
+///
+/// The permission check is awaited and the role check is not: a role is read
+/// off the session, while which roles hold a permission is the
+/// implementation's data, which it may have to fetch.
+fn access_guard(api: &Api, op: &Operation) -> String {
+    if !op.auth.has_context() {
+        return String::new();
     }
+    // A check with no set to name it by was refused by the compiler, so the
+    // `else` arms are unreachable for a compiled API.
+    let check = match &op.access {
+        None => return String::new(),
+        Some(Access::Role(role)) => {
+            let Some(roles) = &api.roles else {
+                return String::new();
+            };
+            format!(
+                "ctx.require_role({}::{})",
+                roles.enum_name,
+                pascal_case(role)
+            )
+        }
+        Some(Access::Permission(permission)) => {
+            let Some(permissions) = &api.permissions else {
+                return String::new();
+            };
+            format!(
+                "ctx.require_permission({}::{}).await",
+                permissions.enum_name,
+                pascal_case(permission)
+            )
+        }
+    };
+    format!("    if let Err(response) = {check} {{\n        return response;\n    }}\n")
 }
 
 /// `FromRequestContext::require_role`, for an API with a `@roles` enum.
@@ -1354,6 +1424,38 @@ fn require_role_method(api: &Api) -> String {
          /// here. Only called for an operation that declares a role.\n    \
          fn require_role(&self, role: {name}) -> Result<(), Response>;\n",
         name = roles.enum_name
+    )
+}
+
+/// `FromRequestContext::require_permission`, for an API with a `@permissions`
+/// enum.
+///
+/// The standard's CheckAccess with the permission named by the SDL and the
+/// rest — which roles hold it, which of them the session has active — left to
+/// the implementation. Async, since that assignment is data the implementation
+/// keeps, and reading it may mean a round trip.
+fn require_permission_method(api: &Api) -> String {
+    let Some(permissions) = &api.permissions else {
+        return String::new();
+    };
+    let codes = permissions
+        .codes
+        .iter()
+        .map(|code| format!("`{code}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n    /// Whether this caller holds `permission`, as `@auth(permission:)` demands.\n    \
+         /// Which roles hold a permission is the implementation's to decide.\n    \
+         ///\n    \
+         /// Returns the response to send when it is not, answering with one of the\n    \
+         /// codes `@permissions(codes:)` declares ({codes}), which every guarded\n    \
+         /// operation lists. Only called for an operation that declares a permission.\n    \
+         fn require_permission(\n        \
+         &self,\n        \
+         permission: {name},\n    \
+         ) -> impl std::future::Future<Output = Result<(), Response>> + Send;\n",
+        name = permissions.enum_name
     )
 }
 

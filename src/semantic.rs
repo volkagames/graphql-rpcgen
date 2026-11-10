@@ -17,28 +17,43 @@ use crate::error::{CompileError, Errors};
 use crate::ir::*;
 use crate::parser::SdlFile;
 
-/// Directives consumed by the compiler. Anything else is rejected, since a
-/// silently ignored directive would look like it had an effect.
-const KNOWN_DIRECTIVES: &[&str] = &[
-    "service",
-    "query",
-    "mutation",
-    "subscription",
-    "raw",
-    "rpc",
-    "version",
-    "auth",
-    "mcp",
-    "throws",
-    "length",
-    "range",
-    "pattern",
-    "oneOf",
-    "discriminator",
-    "variant",
-    "scalar",
-    "roles",
-    "inherits",
+/// Directives consumed by the compiler, each with the arguments it reads.
+/// Anything else is rejected — an unknown directive, or an argument the
+/// directive does not read — since a silently ignored declaration would look
+/// like it had an effect. A misspelt `@auth` argument would leave an operation
+/// open to every caller.
+const DIRECTIVES: &[(&str, &[&str])] = &[
+    ("service", &[]),
+    ("query", &[]),
+    ("mutation", &[]),
+    ("subscription", &[]),
+    ("raw", &["request", "response", "stream"]),
+    ("rpc", &["path"]),
+    ("version", &["n"]),
+    ("auth", &["require", "role", "permission"]),
+    ("mcp", &["expose"]),
+    ("throws", &["codes"]),
+    ("length", &["min", "max"]),
+    ("range", &["min", "max"]),
+    ("pattern", &["value"]),
+    ("oneOf", &[]),
+    ("discriminator", &["field", "sibling"]),
+    ("variant", &["tag"]),
+    (
+        "scalar",
+        &[
+            "rust",
+            "typescript",
+            "rustNewtype",
+            "rustCopy",
+            "rustRange",
+            "openapiType",
+            "openapiFormat",
+        ],
+    ),
+    ("roles", &[]),
+    ("inherits", &["roles"]),
+    ("permissions", &["codes"]),
 ];
 
 const DEFAULT_DISCRIMINATOR: &str = "kind";
@@ -94,6 +109,9 @@ struct Analyzer<'a> {
     /// Resolved into [`Roles`] once every file is read, since there must be
     /// exactly one and only then is it known whether there is.
     role_enums: Vec<RoleEnum>,
+    /// Every enum marked `@permissions`, with the codes it declares. Resolved
+    /// into [`Permissions`] once every file is read, for the same reason.
+    permission_enums: Vec<PermissionEnum>,
 }
 
 /// An enum marked `@roles`, as declared: where, and what each value inherits
@@ -105,6 +123,15 @@ struct RoleEnum {
     inherits: Vec<(String, Vec<String>)>,
 }
 
+/// An enum marked `@permissions`, as declared: where, and the codes its check
+/// answers with.
+struct PermissionEnum {
+    file: PathBuf,
+    pos: Pos,
+    name: String,
+    codes: Vec<String>,
+}
+
 impl<'a> Analyzer<'a> {
     fn new(files: &'a [SdlFile]) -> Self {
         Self {
@@ -113,6 +140,7 @@ impl<'a> Analyzer<'a> {
             declared: HashMap::new(),
             variant_tags: HashMap::new(),
             role_enums: Vec::new(),
+            permission_enums: Vec::new(),
         }
     }
 
@@ -156,6 +184,7 @@ impl<'a> Analyzer<'a> {
         self.resolve_variant_tags(&mut types);
         self.resolve_sibling_contents(&mut types);
         let roles = self.resolve_roles();
+        let permissions = self.resolve_permissions();
 
         // Sorting here is what makes generation deterministic; every generator
         // walks these vectors in order.
@@ -166,6 +195,7 @@ impl<'a> Analyzer<'a> {
             types,
             services,
             roles,
+            permissions,
         };
         self.check_references(&api);
         self.check_paths(&api);
@@ -176,7 +206,7 @@ impl<'a> Analyzer<'a> {
         self.check_constraints(&api);
         self.check_raw_bodies(&api);
         self.check_union_discriminators(&api);
-        self.check_operation_roles(&api);
+        self.check_operation_access(&api);
 
         self.errors.into_result()?;
         Ok(api)
@@ -392,18 +422,45 @@ impl<'a> Analyzer<'a> {
                 }));
             }
             TypeDefinition::Enum(t) => {
-                self.check_directives(file, &t.directives, &["roles"]);
+                self.check_directives(file, &t.directives, &["roles", "permissions"]);
                 let is_roles = find_directive(&t.directives, "roles").is_some();
+                let permissions = find_directive(&t.directives, "permissions");
                 // The registry names what can go wrong, not who may act, and
-                // its Rust form is not the one a role enum gets.
-                if is_roles && t.name == ERROR_CODE_ENUM {
+                // its Rust form is not the one an access enum gets.
+                for (marked, directive) in
+                    [(is_roles, "roles"), (permissions.is_some(), "permissions")]
+                {
+                    if marked && t.name == ERROR_CODE_ENUM {
+                        self.errors.push(CompileError::at(
+                            format!(
+                                "`{ERROR_CODE_ENUM}` is the error code registry; it cannot be \
+                                 @{directive}"
+                            ),
+                            file,
+                            t.position,
+                        ));
+                    }
+                }
+                // A role is who acts and a permission is what is done: one value
+                // cannot be both, and `@auth` names either by its set.
+                if is_roles && permissions.is_some() {
                     self.errors.push(CompileError::at(
                         format!(
-                            "`{ERROR_CODE_ENUM}` is the error code registry; it cannot be @roles"
+                            "enum `{}`: @roles and @permissions are two sets; mark one",
+                            t.name
                         ),
                         file,
                         t.position,
                     ));
+                }
+                if let Some(d) = permissions {
+                    let codes = self.permission_codes(file, &t.name, d);
+                    self.permission_enums.push(PermissionEnum {
+                        file: file.to_path_buf(),
+                        pos: t.position,
+                        name: t.name.clone(),
+                        codes,
+                    });
                 }
                 let mut inherits = Vec::new();
                 let values: Vec<EnumValue> = t
@@ -687,7 +744,7 @@ impl<'a> Analyzer<'a> {
         service: &str,
         field: &GqlField<'static, String>,
         service_version: Option<&str>,
-        service_auth: &(AuthRequirement, Option<String>),
+        service_auth: &(AuthRequirement, Option<Access>),
         service_mcp: bool,
     ) -> Option<Operation> {
         self.check_directives(
@@ -749,8 +806,9 @@ impl<'a> Analyzer<'a> {
 
         // The operation's own rule wins whole rather than field by field: a
         // restatement says what this operation requires, and inheriting a role
-        // into a rule that dropped it would contradict the narrower spelling.
-        let (auth, role) = self
+        // or a permission into a rule that dropped it would contradict the
+        // narrower spelling.
+        let (auth, access) = self
             .auth_rule(
                 file,
                 &format!("{service}.{}", field.name),
@@ -904,7 +962,7 @@ impl<'a> Analyzer<'a> {
             raw_request_stream,
             raw_response,
             auth,
-            role,
+            access,
             mcp,
         })
     }
@@ -950,7 +1008,7 @@ impl<'a> Analyzer<'a> {
         owner: &str,
         directives: &[Directive<'static, String>],
         pos: Pos,
-    ) -> Option<(AuthRequirement, Option<String>)> {
+    ) -> Option<(AuthRequirement, Option<Access>)> {
         let d = find_directive(directives, "auth")?;
 
         // `require:` defaults to `session`, so the common case is `@auth` bare
@@ -974,17 +1032,43 @@ impl<'a> Analyzer<'a> {
             }
         };
 
-        // A role is a value of the `@roles` enum, so it is written bare, as an
-        // enum-typed argument is in GraphQL. Whether the value exists is checked
-        // once every file is read: the enum may be declared after the service.
-        let role = match d.arguments.iter().find(|(n, _)| n == "role") {
-            None => None,
-            Some((_, Value::Enum(role))) => Some(role.clone()),
-            Some(_) => {
+        // A role and a permission are values of their enums, so each is written
+        // bare, as an enum-typed argument is in GraphQL. Whether the value
+        // exists is checked once every file is read: the enum may be declared
+        // after the service.
+        let mut bare = |argument: &str, set: &str, example: &str| -> Result<Option<String>, ()> {
+            match d.arguments.iter().find(|(n, _)| n == argument) {
+                None => Ok(None),
+                Some((_, Value::Enum(value))) => Ok(Some(value.clone())),
+                Some(_) => {
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "`{owner}`: @auth({argument}:) names a value of the @{set} enum, \
+                             written bare — `{argument}: {example}`, not a string"
+                        ),
+                        file,
+                        pos,
+                    ));
+                    Err(())
+                }
+            }
+        };
+        let role = bare("role", "roles", "content_edit");
+        let permission = bare("permission", "permissions", "admin_users_read");
+        let access = match (role.ok()?, permission.ok()?) {
+            (None, None) => None,
+            (Some(role), None) => Some(Access::Role(role)),
+            (None, Some(permission)) => Some(Access::Permission(permission)),
+            // Two answers to one question. Under a static assignment the
+            // permission adds nothing the role does not say; under a dynamic
+            // one the role cannot be named in the SDL. Both together would
+            // also leave open whether either or both must hold.
+            (Some(_), Some(_)) => {
                 self.errors.push(CompileError::at(
                     format!(
-                        "`{owner}`: @auth(role:) names a value of the @roles enum, written bare — \
-                         `role: content_edit`, not a string"
+                        "`{owner}`: @auth takes `role:` or `permission:`, not both — a role \
+                         assigned in the SDL, or a permission whose holders the implementation \
+                         decides"
                     ),
                     file,
                     pos,
@@ -995,20 +1079,26 @@ impl<'a> Analyzer<'a> {
 
         // A role is assigned to a user, and the other two requirements name no
         // user: a token is not one, and `public` is nobody. ANSI RBAC's users
-        // are people, so demanding a role there could never be satisfied.
-        if role.is_some() && require != AuthRequirement::Session {
-            self.errors.push(CompileError::at(
-                format!(
-                    "`{owner}`: @auth(role:) needs `require: session`; a token or a public \
-                     operation identifies no user whose roles could be checked"
-                ),
-                file,
-                pos,
-            ));
+        // are people, so demanding a role there could never be satisfied. A
+        // permission is checked against the same session, and only a session
+        // operation has a context to check it on.
+        if let (Some(access), false) = (&access, require == AuthRequirement::Session) {
+            let message = match access {
+                Access::Role(_) => {
+                    "@auth(role:) needs `require: session`; a token or a public operation \
+                     identifies no user whose roles could be checked"
+                }
+                Access::Permission(_) => {
+                    "@auth(permission:) needs `require: session`; a token or a public operation \
+                     has no context to check the permission against"
+                }
+            };
+            self.errors
+                .push(CompileError::at(format!("`{owner}`: {message}"), file, pos));
             return None;
         }
 
-        Some((require, role))
+        Some((require, access))
     }
 
     /// The media types `@raw` declares for each direction, and whether the
@@ -1487,36 +1577,118 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    /// Every `@auth(role:)` names a value of the `@roles` enum.
+    /// Every `@auth(role:)` names a value of the `@roles` enum, and every
+    /// `@auth(permission:)` a value of the `@permissions` enum.
     ///
     /// Here rather than where the directive is read, since the enum may be
-    /// declared after — or in another file than — the service naming it. A role
+    /// declared after — or in another file than — the service naming it. A value
     /// outside the set would otherwise reach the server as a name no session
-    /// can carry, refusing everyone.
-    fn check_operation_roles(&mut self, api: &Api) {
-        let values: Option<BTreeSet<&str>> = api
-            .role_enum()
-            .map(|e| e.values.iter().map(|v| v.name.as_str()).collect());
+    /// can hold, refusing everyone.
+    fn check_operation_access(&mut self, api: &Api) {
+        let values = |e: Option<&EnumType>| -> Option<BTreeSet<String>> {
+            e.map(|e| e.values.iter().map(|v| v.name.clone()).collect())
+        };
+        let roles = values(api.role_enum());
+        let permissions = values(api.permission_enum());
         for s in &api.services {
             for op in &s.operations {
-                let Some(role) = &op.role else { continue };
-                match &values {
+                let (argument, value, set, set_name) = match &op.access {
+                    None => continue,
+                    Some(Access::Role(role)) => (
+                        "role",
+                        role,
+                        &roles,
+                        api.roles.as_ref().map(|r| r.enum_name.as_str()),
+                    ),
+                    Some(Access::Permission(permission)) => (
+                        "permission",
+                        permission,
+                        &permissions,
+                        api.permissions.as_ref().map(|p| p.enum_name.as_str()),
+                    ),
+                };
+                let marker = if argument == "role" {
+                    "roles"
+                } else {
+                    "permissions"
+                };
+                match set {
                     None => self.errors.push(CompileError::new(format!(
-                        "`{}.{}`: @auth(role: {role}) needs an enum marked @roles listing it",
+                        "`{}.{}`: @auth({argument}: {value}) needs an enum marked @{marker} \
+                         listing it",
                         s.name, op.name
                     ))),
-                    Some(values) if !values.contains(role.as_str()) => {
+                    Some(values) if !values.contains(value) => {
                         self.errors.push(CompileError::new(format!(
-                            "`{}.{}`: @auth(role: {role}) is not a value of the @roles enum `{}`",
+                            "`{}.{}`: @auth({argument}: {value}) is not a value of the @{marker} \
+                             enum `{}`",
                             s.name,
                             op.name,
-                            api.roles.as_ref().map_or("", |r| r.enum_name.as_str())
+                            set_name.unwrap_or_default()
                         )));
                     }
                     Some(_) => {}
                 }
             }
         }
+    }
+
+    /// The codes `@permissions(codes:)` names: the refusals the permission check
+    /// may answer with, which every operation with a permission must declare.
+    ///
+    /// Required rather than defaulted, because the check's answer is the
+    /// implementation's — whether a credential that does not reach the
+    /// permission and a user who lacks it are one refusal or two — and a default
+    /// would describe a refusal the server may never send.
+    fn permission_codes(
+        &mut self,
+        file: &Path,
+        owner: &str,
+        d: &Directive<'static, String>,
+    ) -> Vec<String> {
+        let problem = match string_list_arg(d, "codes") {
+            Some(codes) if codes.is_empty() => "lists no code",
+            Some(codes) => {
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                match codes.iter().find(|code| !seen.insert(code.as_str())) {
+                    None => return codes,
+                    Some(_) => "lists a code twice",
+                }
+            }
+            None if d.arguments.iter().all(|(n, _)| n != "codes") => "is missing",
+            None => "must be a list of strings",
+        };
+        self.errors.push(CompileError::at(
+            format!(
+                "enum `{owner}`: @permissions(codes:) {problem}; it names the codes the \
+                 permission check answers with, which each guarded operation declares"
+            ),
+            file,
+            d.position,
+        ));
+        Vec::new()
+    }
+
+    /// The `@permissions` enum resolved into [`Permissions`]: one set per API,
+    /// since `permission:` names a bare value and that means something against
+    /// one enum only.
+    fn resolve_permissions(&mut self) -> Option<Permissions> {
+        let mut enums = std::mem::take(&mut self.permission_enums).into_iter();
+        let PermissionEnum { name, codes, .. } = enums.next()?;
+        for other in enums {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{}`: @permissions is already on `{name}`; an API has one permission set",
+                    other.name
+                ),
+                &other.file,
+                other.pos,
+            ));
+        }
+        Some(Permissions {
+            enum_name: name,
+            codes,
+        })
     }
 
     /// Reject two values of one enum that serialise to the same string.
@@ -1560,19 +1732,12 @@ impl<'a> Analyzer<'a> {
         };
         let field = d.arguments.iter().find(|(name, _)| name == "field");
         let sibling = d.arguments.iter().find(|(name, _)| name == "sibling");
-        let unknown = d
-            .arguments
+        // An argument other than these two is refused with the directive's
+        // others, in `check_directives`.
+        if d.arguments
             .iter()
-            .find(|(name, _)| name != "field" && name != "sibling");
-        if let Some((name, _)) = unknown {
-            self.errors.push(CompileError::at(
-                format!(
-                    "union `{}`: @discriminator has no argument `{name}`; it takes `field` or `sibling`",
-                    t.name
-                ),
-                file,
-                t.position,
-            ));
+            .any(|(name, _)| name != "field" && name != "sibling")
+        {
             return default();
         }
 
@@ -1950,14 +2115,14 @@ impl<'a> Analyzer<'a> {
     ) {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for d in directives {
-            if !KNOWN_DIRECTIVES.contains(&d.name.as_str()) {
+            let Some((_, arguments)) = DIRECTIVES.iter().find(|(name, _)| *name == d.name) else {
                 self.errors.push(CompileError::at(
                     format!("unknown directive `@{}`", d.name),
                     file,
                     d.position,
                 ));
                 continue;
-            }
+            };
             if !allowed.contains(&d.name.as_str()) {
                 self.errors.push(CompileError::at(
                     format!("directive `@{}` is not valid in this position", d.name),
@@ -1977,6 +2142,24 @@ impl<'a> Analyzer<'a> {
             // first-wins would make the ignored one look like it had an effect.
             let mut args: BTreeSet<&str> = BTreeSet::new();
             for (name, _) in &d.arguments {
+                if !arguments.contains(&name.as_str()) {
+                    let takes = match arguments {
+                        [] => "it takes none".to_string(),
+                        _ => format!(
+                            "it takes {}",
+                            arguments
+                                .iter()
+                                .map(|a| format!("`{a}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    };
+                    self.errors.push(CompileError::at(
+                        format!("directive `@{}` has no argument `{name}`; {takes}", d.name),
+                        file,
+                        d.position,
+                    ));
+                }
                 if !args.insert(name) {
                     self.errors.push(CompileError::at(
                         format!("directive `@{}`: argument `{name}` is repeated", d.name),
@@ -2177,16 +2360,30 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
-                // A generated role check answers with `role_required`, and an
-                // operation may only answer with what it declares: undeclared,
-                // the code would narrow to `internal_error` and a 403 would
-                // read as a server fault.
-                if op.role.is_some() && !op.errors.iter().any(|c| c == ROLE_REQUIRED_CODE) {
-                    self.errors.push(CompileError::new(format!(
-                        "`{}.{}`: @auth(role:) is checked before the handler, so \
-                         @throws(codes:) must list `{ROLE_REQUIRED_CODE}`",
-                        s.name, op.name
-                    )));
+                // A generated check refuses before the method runs, and an
+                // operation's declared codes are what its clients are typed
+                // against: a refusal missing from them is one no client
+                // expects. A role check answers `role_required`; a permission
+                // check, the codes its set declares.
+                let (argument, required): (&str, Vec<&str>) = match &op.access {
+                    None => continue,
+                    Some(Access::Role(_)) => ("role", vec![ROLE_REQUIRED_CODE]),
+                    Some(Access::Permission(_)) => (
+                        "permission",
+                        api.permissions
+                            .iter()
+                            .flat_map(|p| p.codes.iter().map(String::as_str))
+                            .collect(),
+                    ),
+                };
+                for code in required {
+                    if !op.errors.iter().any(|c| c == code) {
+                        self.errors.push(CompileError::new(format!(
+                            "`{}.{}`: @auth({argument}:) is checked before the handler, so \
+                             @throws(codes:) must list `{code}`",
+                            s.name, op.name
+                        )));
+                    }
                 }
             }
         }

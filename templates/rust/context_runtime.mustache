@@ -30,8 +30,8 @@ where
     }
 }
 
-/// What a request context must do to be extracted and, for an API with roles,
-/// role-checked.
+/// What a request context must do to be extracted and, for an API with roles or
+/// permissions, access-checked.
 ///
 /// The generator names this contract; the project's own context type implements
 /// it. Named for what it does rather than for what it holds, so it does not
@@ -53,4 +53,4 @@ pub trait FromRequestContext: Sized + Send + Sync + 'static {
     fn from_parts(
         parts: &mut axum::http::request::Parts,
     ) -> impl std::future::Future<Output = Result<Self, Response>> + Send;
-{{{require_role}}}}
+{{{require_role}}}{{{require_permission}}}}

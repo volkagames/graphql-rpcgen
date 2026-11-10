@@ -107,6 +107,19 @@ fn paths(api: &Api) -> Map<String, Value> {
             if op.mcp {
                 operation.insert("x-mcp".into(), json!(true));
             }
+            // What `@auth` checks beyond a session, by its wire name, so a
+            // consumer reading the document — an MCP server deciding whether a
+            // tool may run, a test holding every operation of a surface to a
+            // check — sees the requirement rather than restating it.
+            match &op.access {
+                None => {}
+                Some(access @ Access::Role(_)) => {
+                    operation.insert("x-role".into(), json!(api.access_wire_name(access)));
+                }
+                Some(access @ Access::Permission(_)) => {
+                    operation.insert("x-permission".into(), json!(api.access_wire_name(access)));
+                }
+            }
 
             // An input that cannot ride in the body rides in the URL: a
             // subscription is opened by `EventSource`, which only GETs, and a

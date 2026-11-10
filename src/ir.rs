@@ -314,13 +314,13 @@ pub struct Operation {
     pub raw_response: Option<Vec<String>>,
     /// What the caller must prove, from `@auth` on the operation or its service.
     pub auth: AuthRequirement,
-    /// The role this operation's permission is assigned to, checked before the
-    /// method is called.
+    /// What the session must be authorized for, checked before the method is
+    /// called: a role or a permission, never both.
     ///
-    /// Set by `@auth(role:)`, and the SDL name of a value of the `@roles` enum
-    /// (see [`Roles`]). `None` means any authenticated caller, which is what
-    /// most operations want — a role is the exception, not the rule.
-    pub role: Option<String>,
+    /// Set by `@auth(role:)` or `@auth(permission:)`. `None` means any
+    /// authenticated caller, which is what most operations want — a check is
+    /// the exception, not the rule.
+    pub access: Option<Access>,
     /// Whether the operation is exposed as an MCP tool, from `@mcp` on the
     /// operation or its service.
     ///
@@ -356,6 +356,22 @@ impl Operation {
     }
 }
 
+/// The check `@auth` demands of an operation beyond a session.
+///
+/// One enum rather than a field per kind, so a target that handles one kind
+/// and not the other fails to compile instead of emitting an operation with no
+/// check: an omission here would open the operation to every session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// `@auth(role:)`: the operation's permission is assigned to this role in
+    /// the SDL. The SDL name of a value of the `@roles` enum (see [`Roles`]).
+    Role(String),
+    /// `@auth(permission:)`: the operation needs this permission, and which
+    /// roles hold it is the implementation's. The SDL name of a value of the
+    /// `@permissions` enum (see [`Permissions`]).
+    Permission(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Service {
     pub name: String,
@@ -382,6 +398,23 @@ pub struct Roles {
     pub inherits: Vec<(String, Vec<String>)>,
 }
 
+/// The permission set, from the enum marked `@permissions`.
+///
+/// In ANSI INCITS 359-2012 terms the enum's values are PRMS, and
+/// `@auth(permission:)` names the permission an operation needs. Which roles
+/// hold a permission (PA) is the implementation's, which is what sets this
+/// apart from `@roles`: there the assignment is compiled from the SDL.
+#[derive(Debug, Clone)]
+pub struct Permissions {
+    /// Name of the `@permissions` enum. Its values are the permissions; their
+    /// wire names are the strings the implementation checks.
+    pub enum_name: String,
+    /// The codes the permission check may answer with, from
+    /// `@permissions(codes:)`. Every operation with a permission lists them in
+    /// `@throws`, so its declared outcomes include the refusal it can get.
+    pub codes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Api {
     pub types: Vec<ApiType>,
@@ -389,6 +422,9 @@ pub struct Api {
     /// `None` for an API without a `@roles` enum, which then declares no
     /// `@auth(role:)` either: the compiler refuses one without the other.
     pub roles: Option<Roles>,
+    /// `None` for an API without a `@permissions` enum, which then declares no
+    /// `@auth(permission:)` either.
+    pub permissions: Option<Permissions>,
 }
 
 impl Api {
@@ -409,6 +445,32 @@ impl Api {
         self.role_enum()
             .and_then(|e| e.values.iter().find(|v| v.name == name))
             .map_or(name, EnumValue::wire_name)
+    }
+
+    /// The `@permissions` enum, when the API declares one.
+    pub fn permission_enum(&self) -> Option<&EnumType> {
+        let permissions = self.permissions.as_ref()?;
+        match self.find_type(&permissions.enum_name) {
+            Some(ApiType::Enum(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The string the implementation checks for the permission named `name` in
+    /// the SDL: its `@variant(tag:)` when it has one, since permission ids such
+    /// as `admin.users.read` are not GraphQL identifiers.
+    pub fn permission_wire_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.permission_enum()
+            .and_then(|e| e.values.iter().find(|v| v.name == name))
+            .map_or(name, EnumValue::wire_name)
+    }
+
+    /// The wire name of what `access` checks: a role's or a permission's.
+    pub fn access_wire_name<'a>(&'a self, access: &'a Access) -> &'a str {
+        match access {
+            Access::Role(role) => self.role_wire_name(role),
+            Access::Permission(permission) => self.permission_wire_name(permission),
+        }
     }
 
     pub fn find_type(&self, name: &str) -> Option<&ApiType> {
