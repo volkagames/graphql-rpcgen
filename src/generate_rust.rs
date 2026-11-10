@@ -1358,7 +1358,7 @@ fn emit_service(
             ("body_field", &body_field),
             ("context_extractor", &context_extractor(op)),
             ("context_arg", &context_arg),
-            ("access_guard", &access_guard(api, op)),
+            ("access_guard", &access_guard(api, op)?),
         ]))?);
     }
 
@@ -1438,17 +1438,28 @@ fn context_extractor(op: &Operation) -> String {
 /// The permission check is awaited and the role check is not: a role is read
 /// off the session, while which roles hold a permission is the
 /// implementation's data, which it may have to fetch.
-fn access_guard(api: &Api, op: &Operation) -> String {
+///
+/// An `Api` the compiler would refuse — a check without a session, or without
+/// the set naming it — is an error rather than a handler without the check:
+/// `generate` is public, and an `Api` built or changed by hand reaches it
+/// without the compiler's checks.
+fn access_guard(api: &Api, op: &Operation) -> Result<String, CompileError> {
+    let Some(access) = &op.access else {
+        return Ok(String::new());
+    };
+    let unchecked = |why: &str| {
+        CompileError::new(format!(
+            "`{}`: @auth demands a check, but {why}; the handler would run without it",
+            op.operation_id
+        ))
+    };
     if !op.auth.has_context() {
-        return String::new();
+        return Err(unchecked("the operation has no session to check it on"));
     }
-    // A check with no set to name it by was refused by the compiler, so the
-    // `else` arms are unreachable for a compiled API.
-    let check = match &op.access {
-        None => return String::new(),
-        Some(Access::Role(role)) => {
+    let check = match access {
+        Access::Role(role) => {
             let Some(roles) = &api.roles else {
-                return String::new();
+                return Err(unchecked("the API has no @roles enum"));
             };
             format!(
                 "ctx.require_role({}::{})",
@@ -1456,9 +1467,9 @@ fn access_guard(api: &Api, op: &Operation) -> String {
                 pascal_case(role)
             )
         }
-        Some(Access::Permission(permission)) => {
+        Access::Permission(permission) => {
             let Some(permissions) = &api.permissions else {
-                return String::new();
+                return Err(unchecked("the API has no @permissions enum"));
             };
             format!(
                 "ctx.require_permission({}::{}).await",
@@ -1467,9 +1478,9 @@ fn access_guard(api: &Api, op: &Operation) -> String {
             )
         }
     };
-    format!(
+    Ok(format!(
         "    let access = {check};\n    if let Err(response) = access {{\n        return response;\n    }}\n"
-    )
+    ))
 }
 
 /// `FromRequestContext::require_role`, for an API with a `@roles` enum.
