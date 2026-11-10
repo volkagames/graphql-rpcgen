@@ -1078,10 +1078,12 @@ impl<'a> Analyzer<'a> {
         };
 
         // A role is assigned to a user, and the other two requirements name no
-        // user: a token is not one, and `public` is nobody. ANSI RBAC's users
-        // are people, so demanding a role there could never be satisfied. A
-        // permission is checked against the same session, and only a session
-        // operation has a context to check it on.
+        // user: a token is not one, and `public` is nobody. ANSI RBAC defines a
+        // user as a person — the notion may be stretched to programs, but a
+        // token here authenticates one without naming whose roles it carries —
+        // so demanding a role there could never be satisfied. A permission is
+        // checked against the same session, and only a session operation has a
+        // context to check it on.
         if let (Some(access), false) = (&access, require == AuthRequirement::Session) {
             let message = match access {
                 Access::Role(_) => {
@@ -1592,25 +1594,22 @@ impl<'a> Analyzer<'a> {
         let permissions = values(api.permission_enum());
         for s in &api.services {
             for op in &s.operations {
-                let (argument, value, set, set_name) = match &op.access {
+                let (argument, marker, value, set, set_name) = match &op.access {
                     None => continue,
                     Some(Access::Role(role)) => (
                         "role",
+                        "roles",
                         role,
                         &roles,
                         api.roles.as_ref().map(|r| r.enum_name.as_str()),
                     ),
                     Some(Access::Permission(permission)) => (
                         "permission",
+                        "permissions",
                         permission,
                         &permissions,
                         api.permissions.as_ref().map(|p| p.enum_name.as_str()),
                     ),
-                };
-                let marker = if argument == "role" {
-                    "roles"
-                } else {
-                    "permissions"
                 };
                 match set {
                     None => self.errors.push(CompileError::new(format!(
@@ -2340,6 +2339,21 @@ impl<'a> Analyzer<'a> {
             // here so one mistake does not produce an error per operation.
             _ => return,
         };
+
+        // The set's codes are checked here rather than through the operations
+        // that list them, so a misspelt code is caught before any operation
+        // names a permission.
+        if let Some(permissions) = &api.permissions {
+            for code in &permissions.codes {
+                if !registry.contains(code.as_str()) {
+                    self.errors.push(CompileError::new(format!(
+                        "enum `{}`: @permissions(codes:) names `{code}`, which is not listed in \
+                         `{ERROR_CODE_ENUM}`",
+                        permissions.enum_name
+                    )));
+                }
+            }
+        }
 
         for s in &api.services {
             for op in &s.operations {

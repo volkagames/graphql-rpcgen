@@ -308,6 +308,22 @@ fn the_permission_codes_are_declared_once_each() -> TestResult {
     Ok(())
 }
 
+/// Each of the set's codes is a code of the registry, whether or not an
+/// operation names a permission yet: otherwise a misspelt code would surface
+/// only once the first operation lists it.
+#[test]
+fn the_permission_codes_are_registry_codes() -> TestResult {
+    let e =
+        expect_error("enum Permission @permissions(codes: [\"role_forbiden\"]) { users_read }\n")?;
+    assert!(
+        e.contains(
+            "enum `Permission`: @permissions(codes:) names `role_forbiden`, which is not listed in `ErrorCode`"
+        ),
+        "{e}"
+    );
+    Ok(())
+}
+
 /// A permission is a value of the set, written bare, and only on a session: a
 /// quoted one, one outside the set, one without a set, and one on a token or a
 /// public operation are each refused.
