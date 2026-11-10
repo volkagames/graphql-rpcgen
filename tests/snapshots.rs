@@ -288,7 +288,7 @@ fn rust_snapshot() -> TestResult {
     // The body is parsed by treat's extractor, which reports `invalid_body`
     // with a JSON Pointer instead of a bare 400.
     assert!(out.contains("use treat::extract_axum::ApiJson;"));
-    assert!(out.contains("ApiJson(input): ApiJson<CreateInput>"));
+    assert!(out.contains("<ApiJson<CreateInput> as axum::extract::FromRequest<()>>"));
     // The handler translates nothing: the envelope is a response, and so is
     // `ApiError`.
     assert!(out.contains("match service.get(input).await"));

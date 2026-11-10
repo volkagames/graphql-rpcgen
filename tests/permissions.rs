@@ -97,7 +97,7 @@ fn api_entry<'a>(out: &'a str, service: &str, op: &str) -> TestResult<&'a str> {
         .ok_or_else(|| format!("createApi must carry {service}.{op}").into())
 }
 
-/// The permission is checked before the input is validated and the method runs,
+/// The permission is checked before the body is read and the method runs,
 /// awaited since the implementation may read the assignment from its data; a
 /// service's permission reaches each operation that does not restate the rule,
 /// and one that does carries no check.
@@ -108,15 +108,16 @@ fn a_permission_is_checked_before_the_method_runs() -> TestResult {
     for (name, variant) in [("users_list", "UsersRead"), ("users_delete", "UsersWrite")] {
         let body = handler(&out, name)?;
         let guard = format!(
-            "    if let Err(response) = ctx.require_permission(Permission::{variant}).await {{\n        \
+            "    let access = ctx.require_permission(Permission::{variant}).await;\n    \
+             if let Err(response) = access {{\n        \
              return response;\n    }}\n"
         );
         let guard_at = body
             .find(&guard)
             .ok_or(format!("{name} must check: {body}"))?;
         let validate_at = body
-            .find("validator::Validate::validate")
-            .ok_or("no validation")?;
+            .find("FromRequest<()>>::from_request(request")
+            .ok_or("no body read")?;
         let call_at = body.find("service.").ok_or("no call")?;
         assert!(
             guard_at < validate_at && validate_at < call_at,

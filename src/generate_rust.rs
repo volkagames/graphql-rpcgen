@@ -1370,6 +1370,10 @@ fn context_extractor(op: &Operation) -> String {
 /// The access gate, emitted between the extractors and the call: the role or
 /// the permission `@auth` demands, handed to the context's check.
 ///
+/// It runs before the request's body is read, in every handler form: a caller
+/// without access hears that, never what its body got wrong, and no body of
+/// its is parsed.
+///
 /// The permission check is awaited and the role check is not: a role is read
 /// off the session, while which roles hold a permission is the
 /// implementation's data, which it may have to fetch.
@@ -1402,7 +1406,9 @@ fn access_guard(api: &Api, op: &Operation) -> String {
             )
         }
     };
-    format!("    if let Err(response) = {check} {{\n        return response;\n    }}\n")
+    format!(
+        "    let access = {check};\n    if let Err(response) = access {{\n        return response;\n    }}\n"
+    )
 }
 
 /// `FromRequestContext::require_role`, for an API with a `@roles` enum.

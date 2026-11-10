@@ -1,8 +1,13 @@
 async fn {{{handler}}}<S: {{{trait_name}}}>(
     State(service): State<S>,
-    {{{context_extractor}}}ApiJson(input): ApiJson<{{{input}}}>,
+    {{{context_extractor}}}request: axum::extract::Request,
 ) -> Response {
-{{{access_guard}}}    if let Err(violations) = validator::Validate::validate(&input) {
+{{{access_guard}}}    let body = <ApiJson<{{{input}}}> as axum::extract::FromRequest<()>>::from_request(request, &()).await;
+    let input = match body {
+        Ok(ApiJson(input)) => input,
+        Err(response) => return response,
+    };
+    if let Err(violations) = validator::Validate::validate(&input) {
         return invalid_input(&violations);
     }
     match service.{{{method}}}({{{context_arg}}}input).await {

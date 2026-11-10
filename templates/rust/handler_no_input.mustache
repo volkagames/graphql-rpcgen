@@ -1,9 +1,13 @@
 
 async fn {{{handler}}}<S: {{{trait_name}}}>(
     State(service): State<S>,
-    {{{context_extractor}}}ApiJson(_): ApiJson<serde::de::IgnoredAny>,
+    {{{context_extractor}}}request: axum::extract::Request,
 ) -> Response {
-{{{access_guard}}}    match service.{{{method}}}({{{context_arg}}}).await {
+{{{access_guard}}}    let body = <ApiJson<serde::de::IgnoredAny> as axum::extract::FromRequest<()>>::from_request(request, &()).await;
+    if let Err(response) = body {
+        return response;
+    }
+    match service.{{{method}}}({{{context_arg}}}).await {
         Ok(response) => response.into_response(),
         Err(error) => error.into_response(),
     }

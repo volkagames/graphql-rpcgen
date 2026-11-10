@@ -547,19 +547,21 @@ request included.
 async fn documents_revert<S: DocumentsService>(
     State(service): State<S>,
     Ctx(ctx): Ctx<RequestContext>,
-    ApiJson(input): ApiJson<RevertInput>,
+    request: axum::extract::Request,
 ) -> Response {
-    if let Err(response) = ctx.require_role(Role::ContentAdmin) {
+    let access = ctx.require_role(Role::ContentAdmin);
+    if let Err(response) = access {
         return response;
     }
+    let body = <ApiJson<RevertInput> as axum::extract::FromRequest<()>>::from_request(request, &()).await;
     ...
 ```
 
 A declaration the implementation could forget to apply would be a comment, so
-the check is not left to it. It runs once the body has been read and parsed and
-before the input's constraints are validated, so a caller without the role
-learns that rather than which constraint it also broke; a body that is not the
-input at all is still `invalid_body`. The compiler requires `role_required` in
+the check is not left to it. It runs before the request's body is read, in
+every handler form — a JSON body, a raw one, a query string: a caller without
+the role learns that rather than what its body also got wrong, and nothing it
+sent is parsed for it. The compiler requires `role_required` in
 `@throws`: the check answers with that code, and an operation's declared codes
 are what its clients are typed against — a refusal missing from them would be
 one no client expects.
@@ -568,7 +570,8 @@ one no client expects.
 [Permissions](#permissions-permissions) — and is enforced the same way, awaited:
 
 ```rust
-    if let Err(response) = ctx.require_permission(Permission::UsersWrite).await {
+    let access = ctx.require_permission(Permission::UsersWrite).await;
+    if let Err(response) = access {
         return response;
     }
 ```
@@ -824,7 +827,10 @@ and `permission:` on one operation; and an operation with a permission whose
 rather than ignored. In the library, `Operation::role` is `Operation::access`, an
 `Option<Access>` holding a role or a permission. A custom handler template names
 the gate `{{{access_guard}}}` instead of `{{{role_guard}}}`, and a custom context
-template carries `{{{require_permission}}}` beside `{{{require_role}}}`.
+template carries `{{{require_permission}}}` beside `{{{require_role}}}`. A JSON
+handler now takes `request: axum::extract::Request` and reads the body with
+`ApiJson` after `{{{access_guard}}}`, so a custom handler template that still
+extracts `ApiJson` in its parameters parses the body before the check.
 
 **Upgrading from 0.11.** Declare the role set as a `@roles` enum and write each
 `role:` bare (`role: content_admin`). `require_role` takes the role type.
@@ -1068,7 +1074,7 @@ just ci                    # fmt-check, lints as errors, tests
   requirement and every way it can fail, template variable validation,
   identifier casing
 - **auth** (27) — `@auth` on the trait signature, the handler's extractors, the
-  role guard ahead of the input's validation, the client's per-operation `role` field, the
+  role guard ahead of the body, the client's per-operation `role` field, the
   `@roles` set and its `@inherits` closure on both sides, and the rejections
   that keep a declaration from being decorative
 - **permissions** (11) — `@permissions` and `@auth(permission:)`: the awaited

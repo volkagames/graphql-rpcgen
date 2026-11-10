@@ -294,7 +294,7 @@ fn an_operation_without_input_emits_no_parameter() -> TestResult {
     // The body is still validated — a malformed one must be `invalid_body`
     // rather than reaching the handler — but nothing is bound from it.
     assert!(
-        server.contains("ApiJson(_): ApiJson<serde::de::IgnoredAny>"),
+        server.contains("<ApiJson<serde::de::IgnoredAny> as axum::extract::FromRequest<()>>"),
         "the body is validated and discarded: {server}"
     );
     assert!(

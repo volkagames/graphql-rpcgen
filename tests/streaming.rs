@@ -148,7 +148,7 @@ fn a_raw_response_returns_bytes() -> TestResult {
         "{out}"
     );
     assert!(
-        out.contains("ApiJson(input): ApiJson<ExportInput>,"),
+        out.contains("<ApiJson<ExportInput> as axum::extract::FromRequest<()>>"),
         "{out}"
     );
     Ok(())

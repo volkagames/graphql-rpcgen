@@ -445,6 +445,20 @@ mod wire {
         let json: serde_json::Value = missing.json().await?;
         assert_eq!(json["errors"][0]["code"], "permission_required", "{json}");
         assert_eq!(json["errors"][0]["message"], "files.wipe", "{json}");
+
+        // The body is read after the check: a caller without the permission
+        // hears that, never what its body got wrong; with it, the same body is
+        // the `invalid_body` it is.
+        for (path, code) in [("wipe", "permission_required"), ("purge", "invalid_body")] {
+            let response = client
+                .post(format!("{base}/{path}"))
+                .header("content-type", "application/json")
+                .body("{ not json")
+                .send()
+                .await?;
+            let json: serde_json::Value = response.json().await?;
+            assert_eq!(json["errors"][0]["code"], code, "{path}: {json}");
+        }
         Ok(())
     }
 

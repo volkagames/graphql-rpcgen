@@ -96,14 +96,15 @@ fn a_session_operation_receives_the_context() -> TestResult {
         ),
         "{out}"
     );
-    // Extracted after the state and before the body, which is the only order
-    // axum accepts: a body extractor has to be last.
+    // Extracted after the state and before the request, which is the only
+    // order axum accepts: the request has to be last. Its body is read in the
+    // handler, after any access check.
     assert!(
         out.contains(
             "async fn guarded_get<S: GuardedService>(\n    \
              State(service): State<S>,\n    \
              Ctx(ctx): Ctx<S::Ctx>,\n    \
-             ApiJson(input): ApiJson<GetInput>,\n"
+             request: axum::extract::Request,\n"
         ),
         "{out}"
     );
@@ -139,14 +140,15 @@ fn a_role_is_checked_before_the_method_runs() -> TestResult {
 
     assert!(
         out.contains(
-            "    if let Err(response) = ctx.require_role(Role::ContentManager) {\n        \
+            "    let access = ctx.require_role(Role::ContentManager);\n    \
+             if let Err(response) = access {\n        \
              return response;\n    }\n"
         ),
         "{out}"
     );
 
-    // Before the body is even validated, so a caller without the role learns
-    // that rather than which field it also got wrong.
+    // Before the body is even read, so a caller without the role learns that
+    // rather than what its body also got wrong.
     let handler = out
         .split("async fn guarded_start")
         .nth(1)
@@ -155,8 +157,8 @@ fn a_role_is_checked_before_the_method_runs() -> TestResult {
         .find("require_role")
         .ok_or("guard must be present")?;
     let validate = handler
-        .find("Validate::validate")
-        .ok_or("the validation call must be emitted")?;
+        .find("FromRequest<()>>::from_request(request")
+        .ok_or("the body must be read in the handler")?;
     assert!(
         guard < validate,
         "the role must be checked first: {handler}"
