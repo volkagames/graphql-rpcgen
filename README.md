@@ -451,7 +451,7 @@ type PaymentInput =
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
 | `@subscription` | FIELD | a stream of events over SSE; the field's type is one event |
 | `@raw(request:, response:, stream:)` | FIELD | a body that is bytes rather than the JSON envelope; `stream: true` hands the request body to the service unread |
-| `@auth(require:, role:, permission:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role; `permission` names the permission it needs |
+| `@auth(require:, role:, permission:, unguarded:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role; `permission` names the permission it needs; `unguarded: true` drops its service's check |
 | `@roles` | ENUM | the enum's values are the API's roles |
 | `@inherits(roles:)` | ENUM_VALUE | on a role: the roles it inherits the permissions of |
 | `@permissions(codes:)` | ENUM | the enum's values are the API's permissions; `codes` are what the permission check answers with |
@@ -518,12 +518,25 @@ type Documents @service @auth(require: session) {
 
 Declared on the service and inherited by each operation; an operation restates
 it to differ. A restatement replaces the rule whole rather than merging, so a
-narrower spelling cannot inherit a role or a permission it dropped. The
-converse holds too: an operation that restates `@auth(require: session)` in a
-service with a role or a permission needs neither, which is the way to say so —
-and the way to lose one by accident. An API whose every operation on some
-surface must carry a check holds it there with a test over `x-role` /
-`x-permission` in the OpenAPI document.
+narrower spelling cannot inherit a role or a permission it dropped.
+
+Dropping one is said in so many words. In a service whose `@auth` names a role
+or a permission, an operation restating `@auth(require: session)` without
+naming one of its own is refused: a copied rule would otherwise open the
+operation to every session, and nothing would tell it from a deliberate one.
+An operation any session may call says `unguarded: true`:
+
+```graphql
+type Users @service @auth(require: session, permission: users_read) {
+  "Any session reads its own account."
+  me: Me! @query @rpc(path: "/users/me") @auth(require: session, unguarded: true)
+}
+```
+
+`unguarded` is refused where it would say nothing: as `false`, beside a `role:`
+or a `permission:`, with `require: token` or `public` — those drop the check by
+being departures of their own — on a service, or in a service with no check to
+drop.
 
 `require:` is `session`, `token` or `public`. Only `session` produces a
 parameter, because the context carries the caller and only a session names one:
@@ -830,7 +843,10 @@ the gate `{{{access_guard}}}` instead of `{{{role_guard}}}`, and a custom contex
 template carries `{{{require_permission}}}` beside `{{{require_role}}}`. A JSON
 handler now takes `request: axum::extract::Request` and reads the body with
 `ApiJson` after `{{{access_guard}}}`, so a custom handler template that still
-extracts `ApiJson` in its parameters parses the body before the check.
+extracts `ApiJson` in its parameters parses the body before the check. In a
+service with `role:` or `permission:`, an operation restating
+`@auth(require: session)` without a check of its own is refused; add
+`unguarded: true` where any session may call it.
 
 **Upgrading from 0.11.** Declare the role set as a `@roles` enum and write each
 `role:` bare (`role: content_admin`). `require_role` takes the role type.

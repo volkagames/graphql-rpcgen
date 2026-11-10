@@ -461,8 +461,9 @@ type Releases @service @auth(require: session, role: content_release) {
     @rpc(path: "/releases/approve")
     @throws(codes: ["role_required"])
 
-  "Restates the rule without a role, so it needs none."
-  list(input: GetInput!): Thing! @query @rpc(path: "/releases/list") @auth(require: session)
+  "Restates the rule, saying it needs no role."
+  list(input: GetInput!): Thing! @query @rpc(path: "/releases/list")
+    @auth(require: session, unguarded: true)
 
   "Opens the operation, overriding the service's session and role alike."
   feed(input: GetInput!): Thing! @query @rpc(path: "/releases/feed") @auth(require: public)
@@ -485,7 +486,8 @@ fn handler<'a>(out: &'a str, name: &str) -> TestResult<&'a str> {
 
 /// A role set on the service is a requirement of each operation that does not
 /// restate the rule, so the server checks it there too; an operation that does
-/// restate it — with a session or opened to the public — carries no role.
+/// restate it — a session marked `unguarded`, or opened to the public —
+/// carries no role.
 #[test]
 fn a_service_role_is_checked_on_each_operation_that_inherits_it() -> TestResult {
     let out = generate_rust::generate(&releases_api()?, &Config::default())?;

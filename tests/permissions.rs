@@ -56,8 +56,9 @@ type Users @service @auth(require: session, permission: users_read) {
     @auth(require: session, permission: users_write)
     @throws(codes: ["role_forbidden", "scope_required"])
 
-  "Restates the rule without a permission, so it needs none."
-  me(input: GetInput!): Thing! @query @rpc(path: "/users/me") @auth(require: session)
+  "Restates the rule, saying it needs no permission."
+  me(input: GetInput!): Thing! @query @rpc(path: "/users/me")
+    @auth(require: session, unguarded: true)
 
   "Opens the operation, overriding the service's session and permission alike."
   ping(input: GetInput!): Thing! @query @rpc(path: "/users/ping") @auth(require: public)
@@ -258,7 +259,7 @@ type S @service {{
     ))?;
     assert!(
         e.contains(
-            "directive `@auth` has no argument `permisson`; it takes `require`, `role`, `permission`"
+            "directive `@auth` has no argument `permisson`; it takes `require`, `role`, `permission`, `unguarded`"
         ),
         "{e}"
     );
@@ -368,6 +369,93 @@ fn a_permission_outside_a_session_set_is_rejected() -> TestResult {
     ] {
         let e = expect_error(&format!("{set}{}", op(auth)))?;
         assert!(e.contains(expected), "{auth}: {e}");
+    }
+    Ok(())
+}
+
+/// A restatement that leaves out its service's check must say so: a copied
+/// `@auth(require: session)` would otherwise open the operation to every
+/// session without a word, and the compiler cannot tell it from a deliberate
+/// one.
+#[test]
+fn a_restatement_drops_a_check_only_by_saying_so() -> TestResult {
+    for (rule, expected) in [
+        (
+            "permission: users_read",
+            "`S.g`: @auth restates the rule without its service's `permission: users_read`; \
+             name a role or a permission, or write `unguarded: true` if any session may call it",
+        ),
+        (
+            "role: admin",
+            "`S.g`: @auth restates the rule without its service's `role: admin`",
+        ),
+    ] {
+        let e = expect_error(&format!(
+            r#"{PERMISSION_SET}
+enum Role @roles {{ admin }}
+type S @service @auth(require: session, {rule}) {{
+  g(input: GetInput!): Thing! @query @rpc(path: "/g") @auth(require: session)
+    @throws(codes: ["role_required", "role_forbidden", "scope_required"])
+}}
+"#
+        ))?;
+        assert!(e.contains(expected), "{rule}: {e}");
+    }
+    Ok(())
+}
+
+/// `unguarded` is written only to drop a check: as `true`, on a session
+/// operation naming no check, in a service that has one to drop.
+#[test]
+fn unguarded_is_refused_where_it_says_nothing() -> TestResult {
+    let service = |service_rule: &str, op_rule: &str| {
+        format!(
+            r#"{PERMISSION_SET}
+type S @service {service_rule} {{
+  g(input: GetInput!): Thing! @query @rpc(path: "/g") @auth({op_rule})
+    @throws(codes: ["role_forbidden", "scope_required"])
+}}
+"#
+        )
+    };
+    let guarded = "@auth(require: session, permission: users_read)";
+    for (sdl, expected) in [
+        (
+            service(guarded, "require: session, unguarded: false"),
+            "`S.g`: @auth(unguarded: false) is the default; drop the argument",
+        ),
+        (
+            service(guarded, r#"require: session, unguarded: "yes""#),
+            "`S.g`: @auth(unguarded:) must be `true`",
+        ),
+        (
+            service(
+                guarded,
+                "require: session, permission: users_write, unguarded: true",
+            ),
+            "`S.g`: @auth(unguarded: true) says a session operation needs no role or permission",
+        ),
+        (
+            service(guarded, "require: public, unguarded: true"),
+            "`S.g`: @auth(unguarded: true) says a session operation needs no role or permission",
+        ),
+        (
+            service(
+                "@auth(require: session)",
+                "require: session, unguarded: true",
+            ),
+            "`S.g`: @auth(unguarded: true) has nothing to drop",
+        ),
+        (
+            service(
+                "@auth(require: session, unguarded: true)",
+                "require: session, permission: users_read",
+            ),
+            "service `S`: @auth(unguarded:) applies to an operation",
+        ),
+    ] {
+        let e = expect_error(&sdl)?;
+        assert!(e.contains(expected), "{sdl}: {e}");
     }
     Ok(())
 }

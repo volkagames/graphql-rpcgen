@@ -30,7 +30,7 @@ const DIRECTIVES: &[(&str, &[&str])] = &[
     ("raw", &["request", "response", "stream"]),
     ("rpc", &["path"]),
     ("version", &["n"]),
-    ("auth", &["require", "role", "permission"]),
+    ("auth", &["require", "role", "permission", "unguarded"]),
     ("mcp", &["expose"]),
     ("throws", &["codes"]),
     ("length", &["min", "max"]),
@@ -121,6 +121,16 @@ struct RoleEnum {
     pos: Pos,
     name: String,
     inherits: Vec<(String, Vec<String>)>,
+}
+
+/// What `@auth` on a service or an operation declares.
+struct AuthRule {
+    require: AuthRequirement,
+    access: Option<Access>,
+    /// `unguarded: true`: an operation of a service that checks a role or a
+    /// permission needs neither. Said in so many words, because a restatement
+    /// that merely leaves the check out reads the same as one that forgot it.
+    unguarded: bool,
 }
 
 /// An enum marked `@permissions`, as declared: where, and the codes its check
@@ -671,9 +681,25 @@ impl<'a> Analyzer<'a> {
         // it. An unannotated service leaves every operation `public`, so a
         // schema that never mentions authentication generates what it did
         // before the directive existed.
-        let service_auth = self
-            .auth_rule(file, &t.name, &t.directives, t.position)
-            .unwrap_or_default();
+        let service_rule = self.auth_rule(file, &t.name, &t.directives, t.position);
+        let service_auth = match service_rule {
+            None => Default::default(),
+            Some(rule) => {
+                // There is nothing above a service for it to drop.
+                if rule.unguarded {
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "service `{}`: @auth(unguarded:) applies to an operation whose \
+                             service checks a role or a permission, not to a service",
+                            t.name
+                        ),
+                        file,
+                        t.position,
+                    ));
+                }
+                (rule.require, rule.access)
+            }
+        };
         // `@mcp` on the service exposes every operation; each may restate it.
         // An unannotated service exposes nothing, so a schema that never
         // mentions MCP generates what it did before the directive existed.
@@ -808,14 +834,15 @@ impl<'a> Analyzer<'a> {
         // restatement says what this operation requires, and inheriting a role
         // or a permission into a rule that dropped it would contradict the
         // narrower spelling.
-        let (auth, access) = self
-            .auth_rule(
-                file,
-                &format!("{service}.{}", field.name),
-                &field.directives,
-                field.position,
-            )
-            .unwrap_or_else(|| service_auth.clone());
+        let owner = format!("{service}.{}", field.name);
+        let own_rule = self.auth_rule(file, &owner, &field.directives, field.position);
+        let (auth, access) = match own_rule {
+            None => service_auth.clone(),
+            Some(rule) => {
+                self.check_dropped_access(file, &owner, field.position, &rule, service_auth);
+                (rule.require, rule.access)
+            }
+        };
 
         // The operation's own `@mcp` wins over its service's, so a service can
         // expose everything and carve out exceptions with `expose: false`.
@@ -1008,7 +1035,7 @@ impl<'a> Analyzer<'a> {
         owner: &str,
         directives: &[Directive<'static, String>],
         pos: Pos,
-    ) -> Option<(AuthRequirement, Option<Access>)> {
+    ) -> Option<AuthRule> {
         let d = find_directive(directives, "auth")?;
 
         // `require:` defaults to `session`, so the common case is `@auth` bare
@@ -1100,7 +1127,91 @@ impl<'a> Analyzer<'a> {
             return None;
         }
 
-        Some((require, access))
+        // Written only to say there is no check, so `false` — the default —
+        // and an argument beside a check are each refused.
+        let unguarded = match bool_arg(d, "unguarded") {
+            None if d.arguments.iter().all(|(n, _)| n != "unguarded") => false,
+            Some(true) => true,
+            Some(false) => {
+                self.errors.push(CompileError::at(
+                    format!("`{owner}`: @auth(unguarded: false) is the default; drop the argument"),
+                    file,
+                    pos,
+                ));
+                return None;
+            }
+            None => {
+                self.errors.push(CompileError::at(
+                    format!("`{owner}`: @auth(unguarded:) must be `true`"),
+                    file,
+                    pos,
+                ));
+                return None;
+            }
+        };
+        if unguarded && (access.is_some() || require != AuthRequirement::Session) {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{owner}`: @auth(unguarded: true) says a session operation needs no role or \
+                     permission; it names neither, and only `require: session` checks one"
+                ),
+                file,
+                pos,
+            ));
+            return None;
+        }
+
+        Some(AuthRule {
+            require,
+            access,
+            unguarded,
+        })
+    }
+
+    /// An operation restating `@auth` keeps its service's role or permission
+    /// only by naming one, so a restatement that leaves the check out must say
+    /// `unguarded: true` — otherwise a copied `@auth(require: session)` would
+    /// open the operation to every session without a word.
+    ///
+    /// `require: token` and `require: public` are departures of their own,
+    /// spelled out, and drop the check by saying so.
+    fn check_dropped_access(
+        &mut self,
+        file: &Path,
+        owner: &str,
+        pos: Pos,
+        rule: &AuthRule,
+        service_auth: &(AuthRequirement, Option<Access>),
+    ) {
+        let session = rule.require == AuthRequirement::Session;
+        match (&service_auth.1, &rule.access, rule.unguarded) {
+            (Some(inherited), None, false) if session => {
+                let (argument, value) = match inherited {
+                    Access::Role(role) => ("role", role),
+                    Access::Permission(permission) => ("permission", permission),
+                };
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{owner}`: @auth restates the rule without its service's \
+                         `{argument}: {value}`; name a role or a permission, or write \
+                         `unguarded: true` if any session may call it"
+                    ),
+                    file,
+                    pos,
+                ));
+            }
+            (None, _, true) => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{owner}`: @auth(unguarded: true) has nothing to drop; its service \
+                         checks no role or permission"
+                    ),
+                    file,
+                    pos,
+                ));
+            }
+            _ => {}
+        }
     }
 
     /// The media types `@raw` declares for each direction, and whether the
