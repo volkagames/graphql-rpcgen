@@ -672,6 +672,9 @@ Core RBAC together with General Hierarchical RBAC. Static and dynamic separation
 of duty (SSD, DSD) are not implemented. The terms below are the standard's, and
 an API documenting its own policy should use them in the same sense.
 
+An API states its policy with `@roles`, or with `@permissions` below — which
+one is [Roles or permissions](#roles-or-permissions).
+
 ```graphql
 "Who may do what."
 enum Role @roles {
@@ -794,6 +797,62 @@ and `@auth` sees no object: a permission here covers its operations on every
 object they take. A permission narrowed to some objects — one tenant's
 accounts, one drive, one folder — depends on the request, and is checked in the
 method, under either model.
+
+#### Roles or permissions
+
+The choice is who changes the permission assignment, and when. If which roles
+may run an operation changes with a release — a developer edits the SDL — use
+`@roles`. If it changes at run time — an administrator edits data — use
+`@permissions`.
+
+`@roles` fits when:
+
+- the role set is fixed and the same in every installation and tenant;
+- roles arrive from the identity provider ready-made, and the application only
+  reads them;
+- who may do what is a product decision that goes through code review;
+- the hierarchy is known in advance and can be written once in `@inherits`.
+
+It costs nothing to run: no storage or administration screen for the
+assignment, a synchronous `require_role`, one fixed refusal code, and a browser
+that decides what to show on its own with `roleAuthorizes`. Moving an operation
+to another role takes a release.
+
+`@permissions` fits when:
+
+- roles are data — administrators create them, each tenant has its own, custom
+  roles are built on system ones;
+- a role's permissions change without a release;
+- a credential narrows access by a list of its own, such as a token limited to
+  some permissions, so the check has more than one refusal to give;
+- one permission covers many operations, such as every read of one section of
+  an administration.
+
+The implementation keeps the assignment, writes an async `require_permission`,
+provides the screen where an administrator hands permissions out, and decides
+which permissions imply which (`write` covering `read`) — the SDL describes
+none of that. The browser cannot decide on its own: the server has to tell it
+which permissions the session holds.
+
+| Question | If yes |
+| --- | --- |
+| Can an administrator create a role, or change what it may do, without a release? | `@permissions` |
+| Do tenants have different role sets? | `@permissions` |
+| Do tokens or keys narrow access by a list of their own? | `@permissions` |
+| Do roles come from the identity provider, the same everywhere? | `@roles` |
+| Are there few roles, with who may do what settled in review? | `@roles` |
+| Does access depend on the object — this drive, this folder, one's own document? | neither: the method checks it |
+
+Two more rules:
+
+- **Mixed needs are one dynamic model.** An API declares one set, and one whose
+  operations seem to need both static and dynamic roles has a dynamic model in which some roles are system rows — a
+  super administrator, a default member — seeded with the data.
+- **`@roles` can become `@permissions` later.** Each role turns into a set of
+  permissions seeded into the assignment, and each `@auth(role: x)` into
+  `@auth(permission: …)`. The way back is harder: an assignment administrators
+  have edited has no single SDL spelling. If run-time roles are a question for
+  the coming year, start with `@permissions`.
 
 #### The names, and why
 
