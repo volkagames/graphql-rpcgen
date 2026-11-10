@@ -261,6 +261,13 @@ Responses carry a `{"data": …}` / `{"errors": […]}` envelope. Errors are
 `{code, message, source}` where `source.pointer` is an RFC 6901 pointer to the
 offending field. All errors in one response share one HTTP status.
 
+`code` is the `ErrorCode` value's wire name: its SDL spelling, or its
+`@variant(tag:)` when the wire carries something that is not a GraphQL
+identifier. `portal_db__clan_not_found @variant(tag: "portal_db::clan_not_found")`
+stays `portal_db__clan_not_found` in Rust and in `@throws`, and every target —
+the Rust server's envelope, the Rust and TypeScript clients, OpenAPI — writes and
+reads `portal_db::clan_not_found`.
+
 ## Architecture
 
 The pipeline has a deliberate seam in the middle:
@@ -1188,7 +1195,7 @@ both:
 ```bash
 just test                  # whole suite
 just test-one registry     # by test name
-just ci                    # fmt-check, lints as errors, tests
+just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
 237 tests, none of which need a network:
@@ -1232,11 +1239,13 @@ just ci                    # fmt-check, lints as errors, tests
   scratch cargo project, pinning the wire shape and the arm constraints at
   runtime rather than in emitted text
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
-  `@raw` form, a `@subscription` and a role reached through `@inherits`, and
-  for a second API a permission held and one refused in every handler form, which is the only thing that
+  `@raw` form, a `@subscription`, a role reached through `@inherits`, a
+  `@variant(tag:)` error code, and for a second API a permission held and one
+  refused in every handler form, which is the only thing that
   checks the emitted handlers, client methods and streaming runtime against
   rustc rather than against a `contains`; the router is then served on a local
-  port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it
+  port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it, and
+  the tagged code is checked to reach the envelope by its tag
 
 `oneof_wire` and `raw_wire` build generated code against the versions in this
 repo's `Cargo.lock`, offline. Those crates (`treat`, `axum`, `reqwest`,
