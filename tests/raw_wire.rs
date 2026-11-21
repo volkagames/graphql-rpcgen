@@ -65,6 +65,13 @@ enum Role @roles {
   files_write @inherits(roles: [files_read])
 }
 
+"What a token may do; one scope tagged, so its wire name is not its identifier."
+enum Scope @scopes(query: read) {
+  read
+  write
+  purge @variant(tag: "files.purge")
+}
+
 type Event { line: String! }
 
 input WatchInput { id: UUID! }
@@ -142,7 +149,7 @@ type Files @service {
 
   "Bytes in unread, bytes out, for a caller with a session: the one form with every extractor."
   echo(input: ConvertInput!): Binary!
-    @mutation
+    @mutation(scope: write)
     @rpc(path: "/echo")
     @raw(request: ["application/octet-stream"], response: ["application/octet-stream"], stream: true)
     @auth(require: session, role: files_read)
@@ -623,21 +630,28 @@ mod wire {
 
         // What a caller other than the router reads instead of the guard: each
         // operation's check by its id, and no row for an id the API lacks.
-        let check = |id: &str| {
-            crate::permissions::Permission::OPERATIONS
-                .iter()
-                .find(|(operation, _)| *operation == id)
-                .map(|(_, permission)| *permission)
-        };
+        let check = |id: &str| crate::permissions::operations::by_id(id).map(|op| op.permission);
         assert_eq!(check("admin_purge"), Some(Some(crate::permissions::Permission::FilesPurge)));
         assert_eq!(check("admin_wipe"), Some(Some(crate::permissions::Permission::FilesWipe)));
         assert_eq!(check("admin_wip"), None);
-        let role = crate::server::Role::OPERATIONS
-            .iter()
-            .find(|(operation, _)| *operation == "files_echo")
-            .map(|(_, role)| *role);
-        assert_eq!(role, Some(Some(crate::server::Role::FilesRead)));
-        assert!(crate::server::Role::OPERATIONS.contains(&("files_upload", None)));
+
+        // And by the route a gate in front of the router reads off the request:
+        // the method counts, and a route the router does not mount has no row.
+        use crate::server::operations::{by_route, Auth, Kind, ALL};
+        let echo = by_route("POST", "/echo").ok_or("the router mounts POST /echo")?;
+        assert_eq!(echo.id, "files_echo");
+        assert_eq!((echo.kind, echo.auth), (Kind::Mutation, Auth::Session));
+        assert_eq!(echo.role, Some(crate::server::Role::FilesRead));
+        assert_eq!(echo.scope, Some(crate::server::Scope::Write));
+        let watch = by_route("GET", "/watch").ok_or("the router mounts GET /watch")?;
+        assert_eq!((watch.kind, watch.auth, watch.scope), (Kind::Subscription, Auth::Public, None));
+        assert!(by_route("POST", "/watch").is_none());
+        assert!(by_route("POST", "/nowhere").is_none());
+        let upload = by_route("POST", "/upload").ok_or("the router mounts POST /upload")?;
+        assert_eq!((upload.role, upload.scope), (None, None));
+        assert!(ALL.windows(2).all(|pair| matches!(pair, [a, b] if a.path < b.path)));
+        assert_eq!(crate::server::Scope::from_name("files.purge"), Some(crate::server::Scope::Purge));
+        assert_eq!(crate::server::Scope::Purge.as_str(), "files.purge");
 
         // The body is read after the check: a caller without the permission
         // hears that, never what its body got wrong; with it, the same body is

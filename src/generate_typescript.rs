@@ -16,6 +16,7 @@ pub fn generate(api: &Api) -> String {
     emit_types(&mut out, api);
     emit_roles(&mut out, api);
     emit_permissions(&mut out, api);
+    emit_scopes(&mut out, api);
     emit_error_types(&mut out, api);
     emit_client(&mut out);
     emit_services(&mut out, api);
@@ -645,6 +646,27 @@ fn emit_permissions(out: &mut String, api: &Api) {
     );
 }
 
+/// The `@scopes` enum's runtime half: the list of scopes, for a client that
+/// mints credentials and offers what one may carry.
+///
+/// The type itself is the enum's literal union, emitted with the other types.
+fn emit_scopes(out: &mut String, api: &Api) {
+    let Some(e) = api.scope_enum() else {
+        return;
+    };
+    let ty = &e.name;
+    let list = e
+        .values
+        .iter()
+        .map(|v| quoted(v.wire_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "\n/** Every scope of `{ty}`, in declaration order. */\nexport const scopes: readonly {ty}[] = [{list}]"
+    );
+}
+
 /// The `api` factory: per operation, its call, the TanStack helpers layered
 /// over it, and the role or the permission `@auth` asks for.
 fn emit_api_object(out: &mut String, api: &Api) {
@@ -703,6 +725,13 @@ export interface MutationOptionsResult<Input, Output> {
                         quoted(api.access_wire_name(access))
                     );
                 }
+            }
+            if let Some(scope) = &op.scope {
+                let _ = writeln!(
+                    out,
+                    "        scope: {} as const,",
+                    quoted(api.scope_wire_name(scope))
+                );
             }
             let verb = if op.kind == OperationKind::Subscription {
                 "subscribe"

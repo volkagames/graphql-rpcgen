@@ -287,23 +287,27 @@ fn the_rust_permission_set_reads_and_spells_ids() -> TestResult {
 }
 
 /// A caller reaching a service other than through its router — an MCP tool
-/// calling the method — passes no generated guard, so the set lists what each
-/// operation needs by its `operationId`: every operation, `None` for one that
+/// calling the method — passes no generated guard, so the operation table
+/// carries what each operation needs: every operation, `None` for one that
 /// needs nothing, so a misspelt id is a missing row rather than an open one.
 #[test]
-fn the_permission_set_lists_each_operations_permission() -> TestResult {
+fn the_operation_table_carries_each_operations_permission() -> TestResult {
     let out = generate_rust::generate_types(&api()?, &Config::default())?;
     let table = out
-        .split("pub const OPERATIONS: &'static [(&'static str, Option<Self>)] = &[\n")
+        .split("pub const ALL: &[Operation] = &[\n")
         .nth(1)
         .and_then(|s| s.split("    ];\n").next())
-        .ok_or_else(|| format!("the permission set must list its operations: {out}"))?;
+        .ok_or_else(|| format!("the operation table must be emitted: {out}"))?;
     assert_eq!(
         table,
-        "        (\"users_delete\", Some(Self::UsersWrite)),\n        \
-         (\"users_list\", Some(Self::UsersRead)),\n        \
-         (\"users_me\", None),\n        \
-         (\"users_ping\", None),\n"
+        "        Operation { id: \"users_delete\", method: \"POST\", path: \"/users/delete\", \
+         kind: Kind::Mutation, auth: Auth::Session, permission: Some(super::Permission::UsersWrite) },\n        \
+         Operation { id: \"users_list\", method: \"POST\", path: \"/users/list\", \
+         kind: Kind::Query, auth: Auth::Session, permission: Some(super::Permission::UsersRead) },\n        \
+         Operation { id: \"users_me\", method: \"POST\", path: \"/users/me\", \
+         kind: Kind::Query, auth: Auth::Session, permission: None },\n        \
+         Operation { id: \"users_ping\", method: \"POST\", path: \"/users/ping\", \
+         kind: Kind::Query, auth: Auth::Public, permission: None },\n"
     );
     Ok(())
 }

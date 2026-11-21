@@ -328,6 +328,16 @@ pub struct Operation {
     /// over that document derives its tool list from the flag, so the SDL stays
     /// the one place deciding what an agent may call.
     pub mcp: bool,
+    /// The scope a delegated credential — an API token — must carry to call
+    /// the operation: the SDL name of a value of the `@scopes` enum (see
+    /// [`Scopes`]).
+    ///
+    /// Resolved: a query or a subscription that states none holds the set's
+    /// `query:` default here. `None` in an API without a scope set, and for an
+    /// operation no scope applies to — a public one, which takes no
+    /// credential, and one with a permission, whose check decides what a
+    /// credential reaches.
+    pub scope: Option<String>,
 }
 
 impl Operation {
@@ -353,6 +363,16 @@ impl Operation {
     /// cases leave the input's scalar fields nowhere else to go.
     pub fn input_in_query(&self) -> bool {
         self.kind == OperationKind::Subscription || self.raw_request.is_some()
+    }
+
+    /// The HTTP method the router mounts the operation under, upper-case as
+    /// HTTP spells it: `GET` for a subscription, which an `EventSource` opens
+    /// and can only GET, `POST` for everything else.
+    pub fn http_method(&self) -> &'static str {
+        match self.kind {
+            OperationKind::Subscription => "GET",
+            OperationKind::Query | OperationKind::Mutation => "POST",
+        }
     }
 }
 
@@ -415,6 +435,24 @@ pub struct Permissions {
     pub codes: Vec<String>,
 }
 
+/// The token scope set, from the enum marked `@scopes`.
+///
+/// A scope is what a delegated credential — an API token, a key minted for a
+/// program — may do on its owner's behalf, whatever the owner may do: the two
+/// narrow each other, and a token holding `read` reaches no write its owner
+/// could make. Who the owner is and what it holds is `@auth`'s; the scope is
+/// the second question, asked of the credential.
+#[derive(Debug, Clone)]
+pub struct Scopes {
+    /// Name of the `@scopes` enum. Its values are the scopes; their wire names
+    /// are the strings a credential carries.
+    pub enum_name: String,
+    /// The scope a query or a subscription needs when it states none, from
+    /// `@scopes(query:)`. A mutation has no default: whether it writes or
+    /// removes is a judgement each one makes.
+    pub query: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Api {
     pub types: Vec<ApiType>,
@@ -425,6 +463,9 @@ pub struct Api {
     /// `None` for an API without a `@permissions` enum, which then declares no
     /// `@auth(permission:)` either.
     pub permissions: Option<Permissions>,
+    /// `None` for an API without a `@scopes` enum, whose operations then name
+    /// no scope.
+    pub scopes: Option<Scopes>,
 }
 
 impl Api {
@@ -461,6 +502,23 @@ impl Api {
     /// as `admin.users.read` are not GraphQL identifiers.
     pub fn permission_wire_name<'a>(&'a self, name: &'a str) -> &'a str {
         self.permission_enum()
+            .and_then(|e| e.values.iter().find(|v| v.name == name))
+            .map_or(name, EnumValue::wire_name)
+    }
+
+    /// The `@scopes` enum, when the API declares one.
+    pub fn scope_enum(&self) -> Option<&EnumType> {
+        let scopes = self.scopes.as_ref()?;
+        match self.find_type(&scopes.enum_name) {
+            Some(ApiType::Enum(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The string a credential carries for the scope named `name` in the SDL:
+    /// its `@variant(tag:)` when it has one.
+    pub fn scope_wire_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.scope_enum()
             .and_then(|e| e.values.iter().find(|v| v.name == name))
             .map_or(name, EnumValue::wire_name)
     }

@@ -452,16 +452,17 @@ type PaymentInput =
 | Directive | Position | Meaning |
 | --- | --- | --- |
 | `@service` | OBJECT | the type is an RPC service; each field is an operation |
-| `@query` | FIELD | read-only; generates a TanStack query helper |
-| `@mutation` | FIELD | state-changing; generates a mutation helper |
+| `@query(scope:)` | FIELD | read-only; generates a TanStack query helper; `scope` overrides the `@scopes` default |
+| `@mutation(scope:)` | FIELD | state-changing; generates a mutation helper; `scope` names what a token needs, required under `@scopes` |
 | `@rpc(path:)` | FIELD | override the derived path |
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
-| `@subscription` | FIELD | a stream of events over SSE; the field's type is one event |
+| `@subscription(scope:)` | FIELD | a stream of events over SSE; the field's type is one event |
 | `@raw(request:, response:, stream:)` | FIELD | a body that is bytes rather than the JSON envelope; `stream: true` hands the request body to the service unread |
 | `@auth(require:, role:, permission:, unguarded:, explicit:)` | OBJECT/FIELD | what the caller must prove; `session` passes a context; `role` assigns the operation to a role; `permission` names the permission it needs; `unguarded: true` drops its service's check; `explicit: true` on a service has each operation state its own |
 | `@roles` | ENUM | the enum's values are the API's roles |
 | `@inherits(roles:)` | ENUM_VALUE | on a role: the roles it inherits the permissions of |
 | `@permissions(codes:)` | ENUM | the enum's values are the API's permissions; `codes` are what the permission check answers with |
+| `@scopes(query:)` | ENUM | the enum's values are the scopes a token carries; `query` is the one a query needs by default |
 | `@mcp(expose:)` | OBJECT/FIELD | the operation is an MCP tool; surfaces as `x-mcp` in OpenAPI |
 | `@throws(codes:)` | FIELD | error codes the operation may return |
 | `@length(min:, max:)` | FIELD/INPUT | `minLength` / `maxLength` |
@@ -728,7 +729,7 @@ Where each element of the model lives:
 | OPS, operations | an operation of a `@service` | its handler and client entry | — |
 | OBS, objects | — | — | whatever the operation acts on |
 | PRMS, permissions | an operation on every object it takes | — | a permission narrowed to some objects — a field, a protected branch — checked in the method, since `@auth` cannot see the request |
-| PA, permission assignment | `@auth(role:)` | the role guard; `Role::OPERATIONS`; `role` on the `createApi` entry | — |
+| PA, permission assignment | `@auth(role:)` | the role guard; `role` in [`operations`](#the-operation-table); `role` on the `createApi` entry | — |
 | UA, user assignment | — | — | whoever issues sessions |
 | SESSIONS | `require: session` | the `Ctx` extractor | which of the user's roles are active |
 | CheckAccess | — | the guard calling `require_role` | `require_role` |
@@ -918,32 +919,9 @@ Two more rules:
 - Rust: `impl Permission { from_name, as_str }` over the wire names — the
   `@variant(tag:)` when a value has one, since permission ids such as
   `admin.users.read` are seldom identifiers — and the awaited guard.
-- Rust: `Permission::OPERATIONS`, every operation of the API by its
-  `operationId` with the permission it needs (`Role::OPERATIONS` likewise for
-  roles). The guard sits in the handler, so a caller reaching a service other
-  than through its router — an MCP tool calling the method, a job runner —
-  passes none. This is where such a caller reads the check, rather than
-  restating which operation needs what:
-
-  ```rust
-  let required = Permission::OPERATIONS
-      .iter()
-      .find(|(id, _)| *id == tool.operation_id)
-      .map(|(_, permission)| *permission);
-  match required {
-      None => return Err(unknown_tool()),        // no such operation: refuse
-      Some(None) => {}                           // needs no permission
-      Some(Some(permission)) => ctx.require_permission(permission).await?,
-  }
-  ```
-
-  An id the API lacks has no row, so a misspelt one is refused rather than
-  read as an operation that needs nothing. `None` means no check beyond
-  `require:` — which for a `token` or `public` operation is no session at all.
-  The caller still maps its own names to operation ids: an MCP tool written by
-  hand, named otherwise or calling several methods, keeps that map; what the
-  table removes is the check column beside it. The table checks nothing by
-  itself: a caller that skips it runs the method unchecked.
+- Rust: the `permission` column of [`operations`](#the-operation-table), for a
+  caller that reaches a service other than through its router — an MCP tool
+  calling the method, a job runner — and so passes no generated guard.
 - TypeScript: `permissions`, the whole set in declaration order, and a
   `permission` field on each `createApi` entry that needs one. It says what the
   server asks for, not who passes: there is no client-side check to mirror.
@@ -956,6 +934,15 @@ list of strings, or naming a code `ErrorCode` lacks; `@inherits` on its values; 
 missing from the set, used without a set or outside `require: session`; `role:`
 and `permission:` on one operation; and an operation with a permission whose
 `@throws` misses one of the set's codes.
+
+**Upgrading from 0.13.** `Permission::OPERATIONS` and `Role::OPERATIONS` are
+gone: the same fact is the `permission` or `role` column of
+[`operations`](#the-operation-table), and two shapes for one fact leave every
+consumer to choose between them. `Permission::OPERATIONS.iter().find(|(id, _)|
+*id == x).map(|(_, p)| *p)` is `operations::by_id(x).map(|op| op.permission)`.
+`@query`, `@mutation` and `@subscription` now read a `scope:` argument; an API
+without a `@scopes` enum is unaffected by it. In the library, `Operation` gains
+`scope` and `Api` gains `scopes`.
 
 **Upgrading from 0.12.** An argument a directive does not read is now refused
 rather than ignored. In the library, `Operation::role` is `Operation::access`, an
@@ -976,6 +963,133 @@ is refused; add `unguarded: true` where it needs none. An API declaring both a
 `operationRoles` is gone: read the role from the `createApi` entry and the list
 from `roles`. An API with a session and no roles drops `require_role` from its
 `FromRequestContext` impl.
+
+### Scopes: `@scopes`
+
+A role or a permission says what the **user** may do. A credential that acts
+for a user without being one — an API token, a key minted for a sync client, an
+agent's connection — is usually narrowed further: a token that may read must
+not delete, whatever its owner may. That second question is the token's
+*scope*, and which operation needs which is as much a fact of the API as its
+path:
+
+```graphql
+"What an API token may do on its owner's behalf."
+enum TokenScope @scopes(query: read) {
+  read
+  write
+  delete
+}
+
+type Files @service @auth(require: session) {
+  list(input: ListInput!): Listing! @query @rpc(path: "/files/list")
+  rename(input: RenameInput!): Node! @mutation(scope: write) @rpc(path: "/files/rename")
+  purge(input: PurgeInput!): Purged! @mutation(scope: delete) @rpc(path: "/files/purge")
+}
+```
+
+The rules, and why:
+
+- **The vocabulary is the SDL's**, an enum marked `@scopes` as `@permissions`
+  marks the permission set, so no scope word is compiled into the generator and
+  the set reaches every target as a type: a credential's scope names are read
+  with `TokenScope::from_name`, and a screen minting tokens lists `scopes`. Not
+  `rpcgen.toml`: the scopes are part of the contract a client is written against,
+  and the config holds only what is not the API.
+- **A query reads.** `query:` names the scope a `@query` or a `@subscription`
+  needs when it states none; one that needs more says so, `@query(scope: …)`.
+  Restating the default is refused, so there is one way to write each
+  operation. Without `query:`, every operation states its own.
+- **A mutation always states its scope.** Whether it writes or permanently
+  removes — whether a token that may edit may also destroy — is a judgement each
+  mutation makes, and a default would make it for every mutation added later
+  without a word: the one that forgot would be reachable by every token that
+  writes. So a `@mutation` with no `scope:` fails the build, the way a missing
+  row of a hand-written scope table fails closed.
+- **On the kind directive, not on `@auth`.** Which of the three an operation is
+  decides whether it needs a scope and what it defaults to, so the scope sits
+  where the kind is declared. On `@auth` it would force restating the rule, and
+  a restated `@auth` replaces the service's whole — a scope would cost the
+  service's permission or require.
+- **No scope where none can apply.** A `public` operation takes no credential,
+  so nothing is narrowed. An operation with `@auth(permission:)` is narrowed by
+  its permission check, which is where `@permissions` already puts what a
+  credential reaches (its `codes:` may tell a token outside its list from a user
+  who lacks the permission); a scope beside it would be a second answer the
+  check never reads. A `scope:` on either is refused. A `role:` names the user,
+  not the credential, so a role-checked operation states its scope as any other.
+- **No hierarchy.** Whether `write` implies `read`, or what a token holding none
+  may do, is the implementation's policy over the credentials it issues.
+
+Nothing checks a scope for you: the generated handler cannot see which
+credential the request carried. The scope is read where the credential is —
+the context extractor, a middleware in front of the router — from
+[`operations`](#the-operation-table):
+
+```rust
+let required = operations::by_route(request.method().as_str(), request.uri().path());
+match required.map(|op| (op.scope, op.permission)) {
+    None => return Err(unmapped()),                    // not an operation: refuse
+    Some((Some(scope), _)) => token.require(scope)?,   // the token must carry it
+    Some((None, Some(permission))) => {}               // the permission check decides
+    Some((None, None)) => {}                           // public: no credential
+}
+```
+
+Each target carries the resolved scope — a query's default filled in:
+
+- Rust: the scope enum with `from_name` / `as_str` over its wire names, and the
+  `scope` column of `operations`.
+- OpenAPI: `x-scope` on the operation, its wire name.
+- TypeScript: `scopes`, the whole set in declaration order, and a `scope` field
+  on each `createApi` entry that needs one.
+
+The compiler refuses: a second `@scopes` enum; `@scopes` on `ErrorCode`, the
+`@roles` or the `@permissions` enum; a `query:` that is quoted or not one of
+its values; `@inherits` on its values; a `scope:` that is quoted, not a value
+of the set, or used without one; a `scope:` on a public operation or one with a
+permission; a query restating the default; and a mutation — or, without a
+default, any operation — that a credential can reach and that names no scope.
+
+### The operation table
+
+`operations`, in the types target, is every operation of the API as its router
+mounts it, with what the SDL says of each. It is for code that decides something
+per operation outside the generated handler — a gate reading `(method, path)`
+off the request, an MCP tool or a job runner calling a service past its router —
+so that none of it restates the SDL in a table of its own:
+
+```rust
+pub mod operations {
+    pub enum Kind { Query, Mutation, Subscription }
+    pub enum Auth { Session, Token, Public }
+
+    pub struct Operation {
+        pub id: &'static str,       // the operationId
+        pub method: &'static str,   // "GET" or "POST"
+        pub path: &'static str,     // as mounted, `@version` prefix included
+        pub kind: Kind,
+        pub auth: Auth,             // `@auth(require:)`, inherited or not
+        pub permission: Option<super::Permission>,  // with @permissions
+        pub scope: Option<super::TokenScope>,       // with @scopes
+    }
+
+    pub const ALL: &[Operation] = &[ /* sorted by path */ ];
+    pub fn by_route(method: &str, path: &str) -> Option<&'static Operation>;
+    pub fn by_id(id: &str) -> Option<&'static Operation>;
+}
+```
+
+A column exists only where the API declares its set — `role` with `@roles`,
+`permission` with `@permissions`, `scope` with `@scopes` — so a column is never
+a type the API does not have. A module of its own, so `Operation`, `Kind` and
+`Auth` cannot collide with the API's types, which it names through `super::`.
+
+Both lookups answer `None` for what the API lacks, so a caller refusing on
+`None` fails closed: a misspelt id or a route nothing mounts never reads as an
+operation that needs nothing. `by_route` is a binary search over `ALL`, which
+no two operations share a path of; `by_id` a scan. The table checks nothing by
+itself: a caller that skips it runs unchecked.
 
 ### `@mcp`
 
@@ -1198,7 +1312,7 @@ just test-one registry     # by test name
 just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
-237 tests, none of which need a network:
+250 tests, none of which need a network:
 
 - **semantic** (96) — every validation rule, the error-code registry, path
   versioning, union tags, which constraint may sit on which type, plus
@@ -1214,14 +1328,18 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
   identifier casing
 - **auth** (28) — `@auth` on the trait signature, the handler's extractors, the
   role guard ahead of the body, the client's per-operation `role` field, the
-  `@roles` set, its `@inherits` closure on both sides and its `OPERATIONS`
-  table, and the rejections
+  `@roles` set, its `@inherits` closure on both sides and its column of the
+  operation table, and the rejections
   that keep a declaration from being decorative
 - **permissions** (18) — `@permissions` and `@auth(permission:)`: the awaited
   guard ahead of the request in every handler form, its inheritance, the context trait's check, the set's Rust and
-  TypeScript halves and its `OPERATIONS` table, `x-permission` / `x-role` in
+  TypeScript halves and its column of the operation table, `x-permission` / `x-role` in
   OpenAPI, a misspelt `@auth` argument refused, `unguarded`, `explicit`, one set per API,
   and every other rejection
+- **scopes** (13) — `@scopes` and `scope:`: each operation's resolved scope,
+  the operation table's rows, columns and lookups, `x-scope`, the TypeScript
+  set and entries, a mutation that forgets its scope failing the build, and
+  every other rejection
 - **mcp** (6) — `@mcp` inheritance, the `x-mcp` flag in the OpenAPI document,
   and the rejections of shapes a tool call cannot honour
 - **streaming** (10) — `@subscription` and `@raw` on both sides: the signature,
@@ -1240,8 +1358,9 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
   runtime rather than in emitted text
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
   `@raw` form, a `@subscription`, a role reached through `@inherits`, a
-  `@variant(tag:)` error code, and for a second API a permission held and one
-  refused in every handler form, which is the only thing that
+  `@variant(tag:)` error code, a scope set and the operation table's lookups,
+  and for a second API a permission held and one refused in every handler
+  form, which is the only thing that
   checks the emitted handlers, client methods and streaming runtime against
   rustc rather than against a `contains`; the router is then served on a local
   port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it, and

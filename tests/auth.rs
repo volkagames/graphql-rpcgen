@@ -629,20 +629,33 @@ fn the_role_check_takes_the_role_type() -> TestResult {
     Ok(())
 }
 
-/// The role set lists each operation's role by its `operationId` — the
-/// permission assignment the SDL declares — for a caller that reaches a service
-/// other than through its router and so passes no generated guard.
+/// The operation table carries each operation's role — the permission
+/// assignment the SDL declares — for a caller that reaches a service other than
+/// through its router and so passes no generated guard; an operation assigned to
+/// none, a public one included, says `None`.
 #[test]
-fn the_role_set_lists_each_operations_role() -> TestResult {
+fn the_operation_table_carries_each_operations_role() -> TestResult {
     let out = generate_rust::generate(&releases_api()?, &Config::default())?;
-    for row in [
-        "        (\"releases_start\", Some(Self::ContentRelease)),\n",
-        "        (\"releases_approve\", Some(Self::ContentRelease)),\n",
-        "        (\"releases_list\", None),\n",
-        "        (\"releases_feed\", None),\n",
+    for (id, role) in [
+        ("releases_start", "Some(super::Role::ContentRelease)"),
+        ("releases_approve", "Some(super::Role::ContentRelease)"),
+        ("releases_list", "None"),
+        ("releases_feed", "None"),
     ] {
-        assert!(out.contains(row), "{row}: {out}");
+        let row = out
+            .lines()
+            .find(|line| line.contains(&format!("Operation {{ id: \"{id}\", ")))
+            .ok_or_else(|| format!("no row for {id}: {out}"))?;
+        assert!(row.ends_with(&format!(", role: {role} }},")), "{id}: {row}");
+        assert!(
+            !row.contains("permission:"),
+            "no permission set, no column: {row}"
+        );
     }
+    assert!(
+        !out.contains("pub const OPERATIONS"),
+        "one table, not two: {out}"
+    );
     Ok(())
 }
 

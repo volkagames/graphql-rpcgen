@@ -24,9 +24,9 @@ use crate::parser::SdlFile;
 /// open to every caller.
 const DIRECTIVES: &[(&str, &[&str])] = &[
     ("service", &[]),
-    ("query", &[]),
-    ("mutation", &[]),
-    ("subscription", &[]),
+    ("query", &["scope"]),
+    ("mutation", &["scope"]),
+    ("subscription", &["scope"]),
     ("raw", &["request", "response", "stream"]),
     ("rpc", &["path"]),
     ("version", &["n"]),
@@ -57,6 +57,7 @@ const DIRECTIVES: &[(&str, &[&str])] = &[
     ("roles", &[]),
     ("inherits", &["roles"]),
     ("permissions", &["codes"]),
+    ("scopes", &["query"]),
 ];
 
 const DEFAULT_DISCRIMINATOR: &str = "kind";
@@ -115,6 +116,9 @@ struct Analyzer<'a> {
     /// Every enum marked `@permissions`, with the codes it declares. Resolved
     /// into [`Permissions`] once every file is read, for the same reason.
     permission_enums: Vec<PermissionEnum>,
+    /// Every enum marked `@scopes`, with its `query:` default. Resolved into
+    /// [`Scopes`] once every file is read, for the same reason.
+    scope_enums: Vec<ScopeEnum>,
 }
 
 /// An enum marked `@roles`, as declared: where, and what each value inherits
@@ -169,6 +173,16 @@ struct PermissionEnum {
     codes: Vec<String>,
 }
 
+/// An enum marked `@scopes`, as declared: where, and the scope a query needs
+/// when it states none. Whether that default is one of the enum's values is
+/// checked once the enum is resolved.
+struct ScopeEnum {
+    file: PathBuf,
+    pos: Pos,
+    name: String,
+    query: Option<String>,
+}
+
 impl<'a> Analyzer<'a> {
     fn new(files: &'a [SdlFile]) -> Self {
         Self {
@@ -178,6 +192,7 @@ impl<'a> Analyzer<'a> {
             variant_tags: HashMap::new(),
             role_enums: Vec::new(),
             permission_enums: Vec::new(),
+            scope_enums: Vec::new(),
         }
     }
 
@@ -222,6 +237,8 @@ impl<'a> Analyzer<'a> {
         self.resolve_sibling_contents(&mut types);
         let roles = self.resolve_roles();
         let permissions = self.resolve_permissions();
+        let scopes = self.resolve_scopes(&types);
+        self.resolve_operation_scopes(&types, scopes.as_ref(), &mut services);
         // Under `@permissions` the roles are the implementation's data, so a
         // `@roles` enum beside it would describe a second, static set of roles
         // living next to the dynamic one. One enum marked both is reported
@@ -248,6 +265,7 @@ impl<'a> Analyzer<'a> {
             services,
             roles,
             permissions,
+            scopes,
         };
         self.check_references(&api);
         self.check_paths(&api);
@@ -474,14 +492,17 @@ impl<'a> Analyzer<'a> {
                 }));
             }
             TypeDefinition::Enum(t) => {
-                self.check_directives(file, &t.directives, &["roles", "permissions"]);
+                self.check_directives(file, &t.directives, &["roles", "permissions", "scopes"]);
                 let is_roles = find_directive(&t.directives, "roles").is_some();
                 let permissions = find_directive(&t.directives, "permissions");
+                let scopes = find_directive(&t.directives, "scopes");
                 // The registry names what can go wrong, not who may act, and
                 // its Rust form is not the one an access enum gets.
-                for (marked, directive) in
-                    [(is_roles, "roles"), (permissions.is_some(), "permissions")]
-                {
+                for (marked, directive) in [
+                    (is_roles, "roles"),
+                    (permissions.is_some(), "permissions"),
+                    (scopes.is_some(), "scopes"),
+                ] {
                     if marked && t.name == ERROR_CODE_ENUM {
                         self.errors.push(CompileError::at(
                             format!(
@@ -504,6 +525,29 @@ impl<'a> Analyzer<'a> {
                         file,
                         t.position,
                     ));
+                }
+                // A scope is what a credential may do for whoever holds it,
+                // not who acts or what a user may be granted: one value cannot
+                // answer two of those questions.
+                if scopes.is_some() && (is_roles || permissions.is_some()) {
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "enum `{}`: @scopes is the set a credential carries, apart from the \
+                             roles and the permissions; mark one",
+                            t.name
+                        ),
+                        file,
+                        t.position,
+                    ));
+                }
+                if let Some(d) = scopes {
+                    let query = self.scope_default(file, &t.name, d);
+                    self.scope_enums.push(ScopeEnum {
+                        file: file.to_path_buf(),
+                        pos: t.position,
+                        name: t.name.clone(),
+                        query,
+                    });
                 }
                 if let Some(d) = permissions {
                     let codes = self.permission_codes(file, &t.name, d);
@@ -835,7 +879,7 @@ impl<'a> Analyzer<'a> {
             ],
         );
 
-        let declared: Vec<(&str, OperationKind)> = [
+        let declared: Vec<(&'static str, OperationKind)> = [
             ("query", OperationKind::Query),
             ("mutation", OperationKind::Mutation),
             ("subscription", OperationKind::Subscription),
@@ -875,6 +919,18 @@ impl<'a> Analyzer<'a> {
         let (raw_request, raw_response, raw_request_stream) = self
             .raw_bodies(file, service, field, kind)
             .unwrap_or_default();
+
+        // The scope as written; defaults and the rules about where one applies
+        // are resolved once every file is read, since the `@scopes` enum may be
+        // declared after the service.
+        let kind_directive = declared.first().map_or("query", |(name, _)| *name);
+        let scope = self.declared_scope(
+            file,
+            &format!("{service}.{}", field.name),
+            &field.directives,
+            kind_directive,
+            field.position,
+        );
 
         // The operation's own rule wins whole rather than field by field: a
         // restatement says what this operation requires, and inheriting a role
@@ -1041,7 +1097,41 @@ impl<'a> Analyzer<'a> {
             auth,
             access,
             mcp,
+            scope,
         })
+    }
+
+    /// What `scope:` on the operation's kind directive — `@query`,
+    /// `@mutation` or `@subscription` — names, as written.
+    ///
+    /// On the kind directive rather than a directive of its own, because which
+    /// of the three an operation is decides whether it needs one: a query reads,
+    /// and a mutation's scope is the judgement of how far it reaches. Neither
+    /// restates `@auth`, whose rule replaces whole when restated.
+    fn declared_scope(
+        &mut self,
+        file: &Path,
+        owner: &str,
+        directives: &[Directive<'static, String>],
+        kind: &str,
+        pos: Pos,
+    ) -> Option<String> {
+        let d = find_directive(directives, kind)?;
+        match d.arguments.iter().find(|(n, _)| n == "scope") {
+            None => None,
+            Some((_, Value::Enum(value))) => Some(value.clone()),
+            Some(_) => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{owner}`: @{kind}(scope:) names a value of the @scopes enum, written \
+                         bare: `scope: write`"
+                    ),
+                    file,
+                    pos,
+                ));
+                None
+            }
+        }
     }
 
     /// What `@mcp` on this object declares, if anything.
@@ -1877,6 +1967,173 @@ impl<'a> Analyzer<'a> {
             enum_name: name,
             codes,
         })
+    }
+
+    /// What `@scopes(query:)` names: the scope a query or a subscription needs
+    /// when it states none, written bare like every other enum value.
+    fn scope_default(
+        &mut self,
+        file: &Path,
+        owner: &str,
+        d: &Directive<'static, String>,
+    ) -> Option<String> {
+        match d.arguments.iter().find(|(n, _)| n == "query") {
+            None => None,
+            Some((_, Value::Enum(value))) => Some(value.clone()),
+            Some(_) => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "enum `{owner}`: @scopes(query:) names one of its values, written bare: \
+                         `query: read`"
+                    ),
+                    file,
+                    d.position,
+                ));
+                None
+            }
+        }
+    }
+
+    /// The `@scopes` enum resolved into [`Scopes`]: one set per API, since
+    /// `scope:` names a bare value, and its `query:` default one of its values.
+    fn resolve_scopes(&mut self, types: &[ApiType]) -> Option<Scopes> {
+        let mut enums = std::mem::take(&mut self.scope_enums).into_iter();
+        let ScopeEnum {
+            file,
+            pos,
+            name,
+            query,
+        } = enums.next()?;
+        for other in enums {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{}`: @scopes is already on `{name}`; an API has one scope set",
+                    other.name
+                ),
+                &other.file,
+                other.pos,
+            ));
+        }
+        let values = enum_values(types, &name);
+        if let Some(default) = &query {
+            if !values.contains(default) {
+                self.errors.push(CompileError::at(
+                    format!("enum `{name}`: @scopes(query: {default}) is not one of its values"),
+                    &file,
+                    pos,
+                ));
+            }
+        }
+        Some(Scopes {
+            enum_name: name,
+            query,
+        })
+    }
+
+    /// Each operation's scope, resolved: the declared one checked against the
+    /// set and against where a scope means something, a query's default filled
+    /// in, and a missing one refused where it is a judgement.
+    ///
+    /// A mutation has no default. Whether it writes or removes — whether a
+    /// token that may edit may also destroy — is decided per operation, and a
+    /// default would decide it for every mutation added later without a word:
+    /// the one that forgot would be reachable by every token that writes.
+    ///
+    /// Two kinds of operation take no scope. A public one is called with no
+    /// credential, so there is nothing to narrow. One with a permission is
+    /// narrowed by its permission check, which is where `@permissions` puts
+    /// the question of what a credential reaches; a scope beside it would be a
+    /// second answer the check never reads.
+    fn resolve_operation_scopes(
+        &mut self,
+        types: &[ApiType],
+        scopes: Option<&Scopes>,
+        services: &mut [Service],
+    ) {
+        let values = scopes.map(|set| enum_values(types, &set.enum_name));
+        for s in services.iter_mut() {
+            for op in &mut s.operations {
+                let owner = format!("{}.{}", s.name, op.name);
+                let kind = match op.kind {
+                    OperationKind::Query => "query",
+                    OperationKind::Mutation => "mutation",
+                    OperationKind::Subscription => "subscription",
+                };
+                let (Some(set), Some(values)) = (scopes, &values) else {
+                    if let Some(scope) = &op.scope {
+                        self.errors.push(CompileError::new(format!(
+                            "`{owner}`: @{kind}(scope: {scope}) needs an enum marked @scopes \
+                             listing it"
+                        )));
+                    }
+                    op.scope = None;
+                    continue;
+                };
+                let exempt = match (&op.access, op.auth) {
+                    (_, AuthRequirement::Public) => Some(
+                        "a public operation is called with no credential, so there is nothing \
+                         for a scope to narrow",
+                    ),
+                    (Some(Access::Permission(_)), _) => Some(
+                        "its @auth(permission:) check decides what a credential reaches, so a \
+                         scope beside it is never read",
+                    ),
+                    _ => None,
+                };
+                let declared = op.scope.take();
+                op.scope = match (declared, exempt) {
+                    (Some(scope), Some(reason)) => {
+                        self.errors.push(CompileError::new(format!(
+                            "`{owner}`: @{kind}(scope: {scope}) applies to no credential: \
+                             {reason}; drop it"
+                        )));
+                        None
+                    }
+                    (None, Some(_)) => None,
+                    (Some(scope), None) if !values.contains(&scope) => {
+                        self.errors.push(CompileError::new(format!(
+                            "`{owner}`: @{kind}(scope: {scope}) is not a value of the @scopes \
+                             enum `{}`",
+                            set.enum_name
+                        )));
+                        None
+                    }
+                    (Some(scope), None)
+                        if op.kind != OperationKind::Mutation
+                            && set.query.as_ref() == Some(&scope) =>
+                    {
+                        self.errors.push(CompileError::new(format!(
+                            "`{owner}`: @{kind}(scope: {scope}) is the default @scopes(query:) \
+                             gives every {kind}; drop the argument"
+                        )));
+                        Some(scope)
+                    }
+                    (Some(scope), None) => Some(scope),
+                    (None, None) => match (op.kind, &set.query) {
+                        (OperationKind::Query | OperationKind::Subscription, Some(default)) => {
+                            Some(default.clone())
+                        }
+                        (OperationKind::Mutation, _) => {
+                            self.errors.push(CompileError::new(format!(
+                                "`{owner}`: a @mutation states the scope a credential needs to \
+                                 call it, one of {}: `@mutation(scope: …)`",
+                                values.join(", ")
+                            )));
+                            None
+                        }
+                        (_, None) => {
+                            self.errors.push(CompileError::new(format!(
+                                "`{owner}`: @{kind} needs `scope:` — one of {} — since the \
+                                 @scopes enum `{}` gives queries no `query:` default",
+                                values.join(", "),
+                                set.enum_name
+                            )));
+                            None
+                        }
+                    },
+                };
+            }
+        }
     }
 
     /// Reject two values of one enum that serialise to the same string.
@@ -2889,6 +3146,20 @@ fn builtin_names() -> Vec<String> {
         .iter()
         .map(|t| t.name().to_string())
         .collect()
+}
+
+/// The SDL names of the values of the enum `name`, in declaration order; none
+/// when no such enum exists, which is reported where the name is declared.
+fn enum_values(types: &[ApiType], name: &str) -> Vec<String> {
+    types
+        .iter()
+        .find_map(|t| match t {
+            ApiType::Enum(e) if e.name == name => {
+                Some(e.values.iter().map(|v| v.name.clone()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn find_directive<'d>(

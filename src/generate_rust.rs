@@ -386,7 +386,10 @@ fn emit_types(out: &mut String, api: &Api) {
                     .as_ref()
                     .is_some_and(|p| p.enum_name == e.name)
                 {
-                    emit_permission_impl(out, api, e);
+                    emit_permission_impl(out, e);
+                }
+                if api.scopes.as_ref().is_some_and(|p| p.enum_name == e.name) {
+                    emit_scope_impl(out, e);
                 }
             }
             ApiType::Object(o) => emit_object(out, api, o),
@@ -396,6 +399,7 @@ fn emit_types(out: &mut String, api: &Api) {
     }
 
     emit_error_sets(out, api);
+    emit_operations_module(out, api);
 }
 
 /// Rust path of the registry code a constraint violation reports.
@@ -604,18 +608,6 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
         );
     }
     out.push_str("        }\n    }\n");
-
-    emit_operations_table(
-        out,
-        api,
-        "/// Every operation of the API by its `operationId`, with the role\n    \
-         /// `@auth(role:)` assigns it to: the permission assignment.",
-        "assigned to no role",
-        |access| match access {
-            Access::Role(role) => Some(role),
-            Access::Permission(_) => None,
-        },
-    );
     out.push_str("}\n");
 }
 
@@ -624,13 +616,39 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
 ///
 /// No `authorizes`: unlike a role hierarchy, which permissions imply which is
 /// not declared in the SDL, so there is nothing to compile into a match.
-fn emit_permission_impl(out: &mut String, api: &Api, e: &EnumType) {
+fn emit_permission_impl(out: &mut String, e: &EnumType) {
+    emit_name_impl(
+        out,
+        e,
+        "/// The permission whose id is `name`, or `None` for an id outside this set.",
+        "/// The id the implementation checks for this permission.",
+    );
+}
+
+/// What the server needs of the `@scopes` enum beyond the wire type: reading a
+/// scope from what a credential carries, and spelling it.
+///
+/// No hierarchy either: whether `write` implies `read` is the implementation's
+/// policy over the credentials it issues, which the SDL does not declare.
+fn emit_scope_impl(out: &mut String, e: &EnumType) {
+    emit_name_impl(
+        out,
+        e,
+        "/// The scope a credential names `name`, or `None` for a name outside this set.",
+        "/// The name a credential carries for this scope.",
+    );
+}
+
+/// `from_name` and `as_str` over an enum's wire names: the `@variant(tag:)`
+/// when a value has one, since ids such as `admin.users.read` are seldom
+/// identifiers.
+fn emit_name_impl(out: &mut String, e: &EnumType, from_doc: &str, as_doc: &str) {
     let variant = |name: &str| format!("Self::{}", pascal_case(name));
 
     let _ = writeln!(out, "\nimpl {} {{", e.name);
-    out.push_str(
-        "    /// The permission whose id is `name`, or `None` for an id outside this set.\n    \
-         pub fn from_name(name: &str) -> Option<Self> {\n        match name {\n",
+    let _ = writeln!(
+        out,
+        "    {from_doc}\n    pub fn from_name(name: &str) -> Option<Self> {{\n        match name {{"
     );
     for v in &e.values {
         let _ = writeln!(
@@ -642,9 +660,9 @@ fn emit_permission_impl(out: &mut String, api: &Api, e: &EnumType) {
     }
     out.push_str("            _ => None,\n        }\n    }\n");
 
-    out.push_str(
-        "\n    /// The id the implementation checks for this permission.\n    \
-         pub fn as_str(self) -> &'static str {\n        match self {\n",
+    let _ = writeln!(
+        out,
+        "\n    {as_doc}\n    pub fn as_str(self) -> &'static str {{\n        match self {{"
     );
     for v in &e.values {
         let _ = writeln!(
@@ -654,55 +672,136 @@ fn emit_permission_impl(out: &mut String, api: &Api, e: &EnumType) {
             v.wire_name()
         );
     }
-    out.push_str("        }\n    }\n");
-
-    emit_operations_table(
-        out,
-        api,
-        "/// Every operation of the API by its `operationId`, with the permission\n    \
-         /// `@auth(permission:)` says it needs.",
-        "that needs none",
-        |access| match access {
-            Access::Permission(permission) => Some(permission),
-            Access::Role(_) => None,
-        },
-    );
-    out.push_str("}\n");
+    out.push_str("        }\n    }\n}\n");
 }
 
-/// `OPERATIONS` on the role or the permission enum: every operation of the API
-/// by its `operationId`, with the check `@auth` demands of it.
+/// `operations`: every operation of the API as the router mounts it, one const
+/// table sorted by path, with what the SDL says of each.
 ///
-/// The generated guard sits in the handler, so a caller reaching a service
-/// other than through its router — an MCP tool calling the method, a job
-/// runner — passes none. This is what it checks against instead of restating
-/// the SDL in a table of its own. An id missing from the table is no operation
-/// of the API and `None` one with no check, so a misspelt id never reads as an
-/// operation anyone may call.
-fn emit_operations_table(
-    out: &mut String,
-    api: &Api,
-    summary: &str,
-    unchecked: &str,
-    pick: impl Fn(&Access) -> Option<&String>,
-) {
-    let _ = write!(
-        out,
-        "\n    {summary}\n    \
-         ///\n    \
-         /// For a caller that reaches a service other than through its router,\n    \
-         /// and so passes no generated guard. An id missing here is no operation\n    \
-         /// of the API; `None` is one {unchecked}.\n    \
-         pub const OPERATIONS: &'static [(&'static str, Option<Self>)] = &[\n"
+/// For code that decides something per operation outside the generated
+/// handler: a gate in front of the router that reads `(method, path)` off the
+/// request — a token's scope, a rate limit — and a caller reaching a service
+/// other than through its router, an MCP tool or a job runner, which passes no
+/// generated guard and looks the check up by `operationId`. Either reads the
+/// SDL's answer here rather than restating it in a table of its own.
+///
+/// A module of its own so that its names — `Operation`, `Kind`, `Auth` — cannot
+/// collide with the API's types, which it names through `super::`. A column
+/// exists only where the API declares its set: `role` with `@roles`,
+/// `permission` with `@permissions`, `scope` with `@scopes`.
+fn emit_operations_module(out: &mut String, api: &Api) {
+    let role = api.role_enum().map(|e| e.name.as_str());
+    let permission = api.permission_enum().map(|e| e.name.as_str());
+    let scope = api.scope_enum().map(|e| e.name.as_str());
+
+    out.push_str(
+        "\n/// Every operation of the API as its router mounts it, with what the SDL says\n\
+         /// of it: for code that decides something per operation outside the generated\n\
+         /// handler, by `(method, path)` or by `operationId`.\n\
+         pub mod operations {\n    \
+         /// Which of `@query`, `@mutation` and `@subscription` the operation is.\n    \
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n    \
+         pub enum Kind {\n        Query,\n        Mutation,\n        Subscription,\n    }\n\n    \
+         /// What `@auth(require:)` asks of the caller.\n    \
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n    \
+         pub enum Auth {\n        Session,\n        Token,\n        Public,\n    }\n\n    \
+         /// One operation, as the router mounts it.\n    \
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n    \
+         pub struct Operation {\n        \
+         /// The OpenAPI `operationId`.\n        \
+         pub id: &'static str,\n        \
+         /// `GET` or `POST`, upper-case as HTTP spells it.\n        \
+         pub method: &'static str,\n        \
+         /// The path the router mounts, `@version` prefix included.\n        \
+         pub path: &'static str,\n        \
+         /// `@query`, `@mutation` or `@subscription`.\n        \
+         pub kind: Kind,\n        \
+         /// What `@auth(require:)` asks, the service's when the operation states none.\n        \
+         pub auth: Auth,\n",
     );
-    for op in api.services.iter().flat_map(|s| &s.operations) {
-        let check = match op.access.as_ref().and_then(&pick) {
-            Some(name) => format!("Some(Self::{})", pascal_case(name)),
-            None => "None".to_string(),
-        };
-        let _ = writeln!(out, "        ({:?}, {check}),", op.operation_id);
+    for (field, ty, doc) in [
+        (
+            "role",
+            role,
+            "The role `@auth(role:)` assigns the operation to; `None` for none.",
+        ),
+        (
+            "permission",
+            permission,
+            "The permission `@auth(permission:)` says it needs; `None` for none.",
+        ),
+        (
+            "scope",
+            scope,
+            "The scope a credential must carry, a query's default included; `None` for a\n        \
+             /// public operation and one with a permission, which no scope narrows.",
+        ),
+    ] {
+        if let Some(ty) = ty {
+            let _ = writeln!(
+                out,
+                "        /// {doc}\n        pub {field}: Option<super::{ty}>,"
+            );
+        }
     }
-    out.push_str("    ];\n");
+    out.push_str(
+        "    }\n\n    \
+         /// Every operation, sorted by `path`, which no two operations share.\n    \
+         pub const ALL: &[Operation] = &[\n",
+    );
+
+    let mut ops: Vec<&Operation> = api.services.iter().flat_map(|s| &s.operations).collect();
+    ops.sort_by(|a, b| a.path.cmp(&b.path));
+    let some = |ty: Option<&str>, name: Option<&String>| match (ty, name) {
+        (Some(ty), Some(name)) => format!("Some(super::{ty}::{})", pascal_case(name)),
+        _ => "None".to_string(),
+    };
+    for op in ops {
+        let kind = match op.kind {
+            OperationKind::Query => "Query",
+            OperationKind::Mutation => "Mutation",
+            OperationKind::Subscription => "Subscription",
+        };
+        let auth = match op.auth {
+            AuthRequirement::Session => "Session",
+            AuthRequirement::Token => "Token",
+            AuthRequirement::Public => "Public",
+        };
+        let _ = write!(
+            out,
+            "        Operation {{ id: {:?}, method: {:?}, path: {:?}, kind: Kind::{kind}, auth: Auth::{auth}",
+            op.operation_id,
+            op.http_method(),
+            op.path
+        );
+        let (op_role, op_permission) = match &op.access {
+            Some(Access::Role(r)) => (Some(r), None),
+            Some(Access::Permission(p)) => (None, Some(p)),
+            None => (None, None),
+        };
+        for (field, ty, name) in [
+            ("role", role, op_role),
+            ("permission", permission, op_permission),
+            ("scope", scope, op.scope.as_ref()),
+        ] {
+            if ty.is_some() {
+                let _ = write!(out, ", {field}: {}", some(ty, name));
+            }
+        }
+        out.push_str(" },\n");
+    }
+    out.push_str(
+        "    ];\n\n    \
+         /// The operation the router mounts at `method path`; `None` for a route it\n    \
+         /// does not, so a caller that refuses on `None` fails closed.\n    \
+         pub fn by_route(method: &str, path: &str) -> Option<&'static Operation> {\n        \
+         let found = ALL.binary_search_by(|op| op.path.cmp(path)).ok()?;\n        \
+         ALL.get(found).filter(|op| op.method == method)\n    }\n\n    \
+         /// The operation whose `operationId` is `id`; `None` for an id the API lacks,\n    \
+         /// so a misspelt one never reads as an operation that needs nothing.\n    \
+         pub fn by_id(id: &str) -> Option<&'static Operation> {\n        \
+         ALL.iter().find(|op| op.id == id)\n    }\n}\n",
+    );
 }
 
 /// The error registry, as a `treat` code enum.

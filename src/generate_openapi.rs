@@ -120,6 +120,12 @@ fn paths(api: &Api) -> Map<String, Value> {
                     operation.insert("x-permission".into(), json!(api.access_wire_name(access)));
                 }
             }
+            // The scope a credential must carry, by its wire name, resolved:
+            // a query that states none carries its set's default here, so a
+            // gate reading the document sees every operation's answer.
+            if let Some(scope) = &op.scope {
+                operation.insert("x-scope".into(), json!(api.scope_wire_name(scope)));
+            }
 
             // An input that cannot ride in the body rides in the URL: a
             // subscription is opened by `EventSource`, which only GETs, and a
