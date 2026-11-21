@@ -646,6 +646,8 @@ mod wire {
         let watch = by_route("GET", "/watch").ok_or("the router mounts GET /watch")?;
         assert_eq!((watch.kind, watch.auth, watch.scope), (Kind::Subscription, Auth::Public, None));
         assert!(by_route("POST", "/watch").is_none());
+        // axum answers HEAD on a GET route; the table does not, so a gate refuses it.
+        assert!(by_route("HEAD", "/watch").is_none());
         assert!(by_route("POST", "/nowhere").is_none());
         let upload = by_route("POST", "/upload").ok_or("the router mounts POST /upload")?;
         assert_eq!((upload.role, upload.scope), (None, None));

@@ -728,13 +728,16 @@ fn emit_operations_module(out: &mut String, api: &Api) {
         (
             "permission",
             permission,
-            "The permission `@auth(permission:)` says it needs; `None` for none.",
+            "The permission `@auth(permission:)` says it needs; `None` for none. With no\n        \
+             /// `scope`, the permission check is all that judges a delegated credential, so\n        \
+             /// `require_permission` must refuse a credential not allowed it, not only a user.",
         ),
         (
             "scope",
             scope,
-            "The scope a credential must carry, a query's default included; `None` for a\n        \
-             /// public operation and one with a permission, which no scope narrows.",
+            "The scope a delegated credential must carry, a query's default included.\n        \
+             /// `None` for a public operation, and for one with a permission that states\n        \
+             /// none, whose permission check must then judge the credential itself.",
         ),
     ] {
         if let Some(ty) = ty {
@@ -793,7 +796,9 @@ fn emit_operations_module(out: &mut String, api: &Api) {
     out.push_str(
         "    ];\n\n    \
          /// The operation the router mounts at `method path`; `None` for a route it\n    \
-         /// does not, so a caller that refuses on `None` fails closed.\n    \
+         /// does not, so a caller that refuses on `None` fails closed. `method` is\n    \
+         /// matched as spelled: `HEAD`, which a router may answer for a `GET` route,\n    \
+         /// is no row, and is refused rather than read as the `GET`.\n    \
          pub fn by_route(method: &str, path: &str) -> Option<&'static Operation> {\n        \
          let found = ALL.binary_search_by(|op| op.path.cmp(path)).ok()?;\n        \
          ALL.get(found).filter(|op| op.method == method)\n    }\n\n    \
@@ -1422,13 +1427,9 @@ fn emit_service(
     // string context has nothing for a mustache section to iterate.
     let mut routes = String::new();
     for op in &service.operations {
-        // Everything is POST except a subscription, which is opened by an
-        // `EventSource` and so can only be a GET.
-        let verb = if op.kind == OperationKind::Subscription {
-            "get"
-        } else {
-            "post"
-        };
+        // axum's routing function is the method's lower-case name, and the
+        // method is the one `operations` and OpenAPI also read.
+        let verb = op.http_method().to_ascii_lowercase();
         let _ = writeln!(
             routes,
             "        .route(\"{}\", {verb}({module}_{}::<S>))",

@@ -119,6 +119,9 @@ struct Analyzer<'a> {
     /// Every enum marked `@scopes`, with its `query:` default. Resolved into
     /// [`Scopes`] once every file is read, for the same reason.
     scope_enums: Vec<ScopeEnum>,
+    /// Where each operation is declared, by `Service.operation`, for a check
+    /// that runs once every file is read to report at the declaration.
+    operation_sites: HashMap<String, (PathBuf, Pos)>,
 }
 
 /// An enum marked `@roles`, as declared: where, and what each value inherits
@@ -193,6 +196,7 @@ impl<'a> Analyzer<'a> {
             role_enums: Vec::new(),
             permission_enums: Vec::new(),
             scope_enums: Vec::new(),
+            operation_sites: HashMap::new(),
         }
     }
 
@@ -924,6 +928,10 @@ impl<'a> Analyzer<'a> {
         // are resolved once every file is read, since the `@scopes` enum may be
         // declared after the service.
         let kind_directive = declared.first().map_or("query", |(name, _)| *name);
+        self.operation_sites.insert(
+            format!("{service}.{}", field.name),
+            (file.to_path_buf(), field.position),
+        );
         let scope = self.declared_scope(
             file,
             &format!("{service}.{}", field.name),
@@ -2037,13 +2045,15 @@ impl<'a> Analyzer<'a> {
     /// A mutation has no default. Whether it writes or removes — whether a
     /// token that may edit may also destroy — is decided per operation, and a
     /// default would decide it for every mutation added later without a word:
-    /// the one that forgot would be reachable by every token that writes.
+    /// the one that forgot would be reachable by every token that writes. A
+    /// query taking a raw request body has none either: it reads bytes in,
+    /// which is a write in all but name as often as not.
     ///
-    /// Two kinds of operation take no scope. A public one is called with no
-    /// credential, so there is nothing to narrow. One with a permission is
-    /// narrowed by its permission check, which is where `@permissions` puts
-    /// the question of what a credential reaches; a scope beside it would be a
-    /// second answer the check never reads.
+    /// A public operation takes no scope: it is called with no credential, so
+    /// there is nothing to narrow. One with a permission may state one but
+    /// need not, and gets no default: its permission check is where
+    /// `@permissions` puts the question of what a credential reaches, and an
+    /// implementation whose check judges only the user states the scope too.
     fn resolve_operation_scopes(
         &mut self,
         types: &[ApiType],
@@ -2059,81 +2069,107 @@ impl<'a> Analyzer<'a> {
                     OperationKind::Mutation => "mutation",
                     OperationKind::Subscription => "subscription",
                 };
+                let declared = op.scope.take();
                 let (Some(set), Some(values)) = (scopes, &values) else {
-                    if let Some(scope) = &op.scope {
-                        self.errors.push(CompileError::new(format!(
-                            "`{owner}`: @{kind}(scope: {scope}) needs an enum marked @scopes \
-                             listing it"
-                        )));
+                    if let Some(scope) = &declared {
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@{kind}(scope: {scope}) needs an enum marked @scopes listing it"
+                            ),
+                        );
                     }
-                    op.scope = None;
                     continue;
                 };
-                let exempt = match (&op.access, op.auth) {
-                    (_, AuthRequirement::Public) => Some(
-                        "a public operation is called with no credential, so there is nothing \
-                         for a scope to narrow",
-                    ),
-                    (Some(Access::Permission(_)), _) => Some(
-                        "its @auth(permission:) check decides what a credential reaches, so a \
-                         scope beside it is never read",
-                    ),
-                    _ => None,
-                };
-                let declared = op.scope.take();
-                op.scope = match (declared, exempt) {
-                    (Some(scope), Some(reason)) => {
-                        self.errors.push(CompileError::new(format!(
-                            "`{owner}`: @{kind}(scope: {scope}) applies to no credential: \
-                             {reason}; drop it"
-                        )));
+                let public = op.auth == AuthRequirement::Public;
+                let permission = matches!(op.access, Some(Access::Permission(_)));
+                let raw_request = op.raw_request.is_some();
+                let defaulted = op.kind != OperationKind::Mutation && !permission && !raw_request;
+                op.scope = match declared {
+                    Some(scope) if public => {
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@{kind}(scope: {scope}) applies to no credential: a public \
+                                 operation is called with none, so there is nothing for a scope \
+                                 to narrow; drop it"
+                            ),
+                        );
                         None
                     }
-                    (None, Some(_)) => None,
-                    (Some(scope), None) if !values.contains(&scope) => {
-                        self.errors.push(CompileError::new(format!(
-                            "`{owner}`: @{kind}(scope: {scope}) is not a value of the @scopes \
-                             enum `{}`",
-                            set.enum_name
-                        )));
+                    Some(scope) if !values.contains(&scope) => {
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@{kind}(scope: {scope}) is not a value of the @scopes enum `{}`",
+                                set.enum_name
+                            ),
+                        );
                         None
                     }
-                    (Some(scope), None)
-                        if op.kind != OperationKind::Mutation
-                            && set.query.as_ref() == Some(&scope) =>
-                    {
-                        self.errors.push(CompileError::new(format!(
-                            "`{owner}`: @{kind}(scope: {scope}) is the default @scopes(query:) \
-                             gives every {kind}; drop the argument"
-                        )));
+                    Some(scope) if defaulted && set.query.as_ref() == Some(&scope) => {
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@{kind}(scope: {scope}) is the default @scopes(query:) gives \
+                                 every {kind}; drop the argument"
+                            ),
+                        );
                         Some(scope)
                     }
-                    (Some(scope), None) => Some(scope),
-                    (None, None) => match (op.kind, &set.query) {
-                        (OperationKind::Query | OperationKind::Subscription, Some(default)) => {
-                            Some(default.clone())
-                        }
+                    Some(scope) => Some(scope),
+                    None if public || permission => None,
+                    None => match (op.kind, &set.query) {
                         (OperationKind::Mutation, _) => {
-                            self.errors.push(CompileError::new(format!(
-                                "`{owner}`: a @mutation states the scope a credential needs to \
-                                 call it, one of {}: `@mutation(scope: …)`",
-                                values.join(", ")
-                            )));
+                            self.operation_error(
+                                &owner,
+                                format!(
+                                    "a @mutation states the scope a credential needs to call it, \
+                                     one of {}: `@mutation(scope: …)`",
+                                    values.join(", ")
+                                ),
+                            );
                             None
                         }
+                        (_, Some(_)) if raw_request => {
+                            self.operation_error(
+                                &owner,
+                                format!(
+                                    "a @{kind} with @raw(request:) takes a body in, so it states \
+                                     its scope rather than taking the read default: one of {}",
+                                    values.join(", ")
+                                ),
+                            );
+                            None
+                        }
+                        (_, Some(default)) => Some(default.clone()),
                         (_, None) => {
-                            self.errors.push(CompileError::new(format!(
-                                "`{owner}`: @{kind} needs `scope:` — one of {} — since the \
-                                 @scopes enum `{}` gives queries no `query:` default",
-                                values.join(", "),
-                                set.enum_name
-                            )));
+                            self.operation_error(
+                                &owner,
+                                format!(
+                                    "@{kind} needs `scope:` — one of {} — since the @scopes enum \
+                                     `{}` gives queries no `query:` default",
+                                    values.join(", "),
+                                    set.enum_name
+                                ),
+                            );
                             None
                         }
                     },
                 };
             }
         }
+    }
+
+    /// An error about the operation `owner` (`Service.operation`), reported
+    /// where it is declared.
+    fn operation_error(&mut self, owner: &str, message: String) {
+        let message = format!("`{owner}`: {message}");
+        let error = match self.operation_sites.get(owner) {
+            Some((file, pos)) => CompileError::at(message, file, *pos),
+            None => CompileError::new(message),
+        };
+        self.errors.push(error);
     }
 
     /// Reject two values of one enum that serialise to the same string.

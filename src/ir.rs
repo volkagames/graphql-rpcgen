@@ -333,10 +333,10 @@ pub struct Operation {
     /// [`Scopes`]).
     ///
     /// Resolved: a query or a subscription that states none holds the set's
-    /// `query:` default here. `None` in an API without a scope set, and for an
-    /// operation no scope applies to — a public one, which takes no
-    /// credential, and one with a permission, whose check decides what a
-    /// credential reaches.
+    /// `query:` default here. `None` in an API without a scope set, for a
+    /// public operation, which takes no credential, and for one with a
+    /// permission that states none: its permission check is then what judges
+    /// the credential.
     pub scope: Option<String>,
 }
 

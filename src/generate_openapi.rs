@@ -189,11 +189,8 @@ fn paths(api: &Api) -> Map<String, Value> {
             }
             operation.insert("responses".into(), Value::Object(responses(api, op)));
 
-            let method = if op.kind == OperationKind::Subscription {
-                "get"
-            } else {
-                "post"
-            };
+            // OpenAPI keys an operation by the method's lower-case name.
+            let method = op.http_method().to_ascii_lowercase();
             paths.insert(op.path.clone(), json!({ method: Value::Object(operation) }));
         }
     }

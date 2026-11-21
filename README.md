@@ -940,9 +940,12 @@ gone: the same fact is the `permission` or `role` column of
 [`operations`](#the-operation-table), and two shapes for one fact leave every
 consumer to choose between them. `Permission::OPERATIONS.iter().find(|(id, _)|
 *id == x).map(|(_, p)| *p)` is `operations::by_id(x).map(|op| op.permission)`.
-`@query`, `@mutation` and `@subscription` now read a `scope:` argument; an API
-without a `@scopes` enum is unaffected by it. In the library, `Operation` gains
-`scope` and `Api` gains `scopes`.
+`@query`, `@mutation` and `@subscription` now read a `scope:` argument, which an
+API without a `@scopes` enum never needs. Every API gains two generated items
+whatever it declares: `pub mod operations` in the Rust types and
+`operationKeys` in TypeScript — a project with its own item of either name at
+the same level renames one. In the library, `Operation` gains `scope` and `Api`
+gains `scopes`.
 
 **Upgrading from 0.12.** An argument a directive does not read is now refused
 rather than ignored. In the library, `Operation::role` is `Operation::access`, an
@@ -999,7 +1002,9 @@ The rules, and why:
 - **A query reads.** `query:` names the scope a `@query` or a `@subscription`
   needs when it states none; one that needs more says so, `@query(scope: …)`.
   Restating the default is refused, so there is one way to write each
-  operation. Without `query:`, every operation states its own.
+  operation. Without `query:`, every operation states its own. A query taking a
+  `@raw(request:)` body gets no default either: it takes bytes in, and whether
+  that reads or writes is the same judgement a mutation makes.
 - **A mutation always states its scope.** Whether it writes or permanently
   removes — whether a token that may edit may also destroy — is a judgement each
   mutation makes, and a default would make it for every mutation added later
@@ -1011,13 +1016,19 @@ The rules, and why:
   where the kind is declared. On `@auth` it would force restating the rule, and
   a restated `@auth` replaces the service's whole — a scope would cost the
   service's permission or require.
-- **No scope where none can apply.** A `public` operation takes no credential,
-  so nothing is narrowed. An operation with `@auth(permission:)` is narrowed by
-  its permission check, which is where `@permissions` already puts what a
-  credential reaches (its `codes:` may tell a token outside its list from a user
-  who lacks the permission); a scope beside it would be a second answer the
-  check never reads. A `scope:` on either is refused. A `role:` names the user,
-  not the credential, so a role-checked operation states its scope as any other.
+- **No scope on a public operation.** It takes no credential, so nothing is
+  narrowed, and a `scope:` there is refused.
+- **Beside a permission, a scope is optional.** `@permissions` already lets the
+  permission check answer for the credential — its `codes:` may tell a token
+  outside its list from a user who lacks the permission — so an operation with
+  `@auth(permission:)` needs no scope, gets no default, and may still state one.
+  **Leaving it out is a duty on the implementation:** with no `scope`, the
+  permission check is all that stands between a delegated credential and the
+  operation, so `require_permission` must refuse a credential not allowed the
+  permission, not only a user who lacks it. An implementation whose check reads
+  only the user's roles states a `scope:` on every such operation instead.
+- **A role is the user's.** `role:` says nothing of the credential, so a
+  role-checked operation states its scope as any other.
 - **No hierarchy.** Whether `write` implies `read`, or what a token holding none
   may do, is the implementation's policy over the credentials it issues.
 
@@ -1027,14 +1038,19 @@ the context extractor, a middleware in front of the router — from
 [`operations`](#the-operation-table):
 
 ```rust
-let required = operations::by_route(request.method().as_str(), request.uri().path());
-match required.map(|op| (op.scope, op.permission)) {
-    None => return Err(unmapped()),                    // not an operation: refuse
-    Some((Some(scope), _)) => token.require(scope)?,   // the token must carry it
-    Some((None, Some(permission))) => {}               // the permission check decides
-    Some((None, None)) => {}                           // public: no credential
+let Some(op) = operations::by_route(request.method().as_str(), request.uri().path()) else {
+    return Err(unmapped());                            // not an operation: refuse
+};
+match (op.scope, op.permission) {
+    (Some(scope), _) => token.require(scope)?,         // the token must carry it
+    (None, Some(_)) => {}                              // `require_permission` judges the token
+    (None, None) if op.auth == Auth::Public => {}      // public: no credential
+    (None, None) => return Err(unmapped()),            // anything else: refuse
 }
 ```
+
+The last arm cannot be reached through a table the compiler accepted, and is
+there so the gate stays closed if the table and the gate ever disagree.
 
 Each target carries the resolved scope — a query's default filled in:
 
@@ -1047,9 +1063,10 @@ Each target carries the resolved scope — a query's default filled in:
 The compiler refuses: a second `@scopes` enum; `@scopes` on `ErrorCode`, the
 `@roles` or the `@permissions` enum; a `query:` that is quoted or not one of
 its values; `@inherits` on its values; a `scope:` that is quoted, not a value
-of the set, or used without one; a `scope:` on a public operation or one with a
-permission; a query restating the default; and a mutation — or, without a
-default, any operation — that a credential can reach and that names no scope.
+of the set, or used without one; a `scope:` on a public operation; a query
+restating the default; and a mutation, a query taking a raw request body, or —
+without a default — any operation, that a credential can reach, has no
+permission and names no scope. Each is reported at the operation's declaration.
 
 ### The operation table
 
@@ -1087,9 +1104,12 @@ a type the API does not have. A module of its own, so `Operation`, `Kind` and
 
 Both lookups answer `None` for what the API lacks, so a caller refusing on
 `None` fails closed: a misspelt id or a route nothing mounts never reads as an
-operation that needs nothing. `by_route` is a binary search over `ALL`, which
-no two operations share a path of; `by_id` a scan. The table checks nothing by
-itself: a caller that skips it runs unchecked.
+operation that needs nothing. `by_route` matches the method as spelled: a
+router may answer `HEAD` on a `GET` route — axum's `get()` does — but the table
+has no `HEAD` row, so a gate refusing on `None` refuses it rather than reading it
+as the `GET`. `by_route` is a binary search over `ALL`, which no two operations
+share a path of; `by_id` a scan. The table checks nothing by itself: a caller
+that skips it runs unchecked.
 
 ### `@mcp`
 
@@ -1329,7 +1349,7 @@ just test-one registry     # by test name
 just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
-250 tests, none of which need a network:
+252 tests, none of which need a network:
 
 - **semantic** (96) — every validation rule, the error-code registry, path
   versioning, union tags, which constraint may sit on which type, plus
@@ -1353,7 +1373,8 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
   TypeScript halves and its column of the operation table, `x-permission` / `x-role` in
   OpenAPI, a misspelt `@auth` argument refused, `unguarded`, `explicit`, one set per API,
   and every other rejection
-- **scopes** (13) — `@scopes` and `scope:`: each operation's resolved scope,
+- **scopes** (15) — `@scopes` and `scope:`: each operation's resolved scope, an
+  optional scope beside a permission, a raw-request query stating its own,
   the operation table's rows, columns and lookups, `x-scope`, the TypeScript
   set and entries, a mutation that forgets its scope failing the build, and
   every other rejection

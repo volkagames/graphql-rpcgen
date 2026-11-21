@@ -266,6 +266,12 @@ type Open @service @auth(require: session) {{
         table(&out)?.ends_with("auth: Auth::Session, permission: None },\n"),
         "{out}"
     );
+
+    let doc = generate_openapi::generate(&api, &Config::default())?;
+    assert!(!doc.contains("x-scope"), "{doc}");
+    let ts = generate_typescript::generate(&api);
+    assert!(!ts.contains("export const scopes"), "{ts}");
+    assert!(!ts.contains("scope:"), "{ts}");
     Ok(())
 }
 
@@ -346,6 +352,15 @@ type S @service @auth(require: session) {{
 #[test]
 fn a_mutation_without_a_scope_is_rejected() -> TestResult {
     let e = expect_error(&one_operation("@mutation", ""))?;
+    // Reported where the operation is declared, not as a bare message.
+    let line = e
+        .lines()
+        .find(|line| line.contains("a @mutation states the scope"))
+        .ok_or_else(|| format!("no such error: {e}"))?;
+    assert!(
+        line.trim_start().starts_with("- <memory>:26:3: `S.g`"),
+        "{line}"
+    );
     assert!(
         e.contains(
             "`S.g`: a @mutation states the scope a credential needs to call it, one of read, \
@@ -399,21 +414,93 @@ fn a_scope_where_none_applies_is_rejected() -> TestResult {
     assert!(
         e.contains(
             "`S.g`: @query(scope: secrets) applies to no credential: a public operation is called \
-             with no credential, so there is nothing for a scope to narrow; drop it"
+             with none, so there is nothing for a scope to narrow; drop it"
         ),
         "{e}"
     );
-    let e = expect_error(&one_operation(
-        "@mutation(scope: write)",
-        r#"@auth(require: session, permission: files_admin) @throws(codes: ["role_forbidden"])"#,
+    Ok(())
+}
+
+/// Beside a permission a scope is optional: an implementation whose permission
+/// check judges only the user states one, and one whose check judges the
+/// credential too need not. Neither kind gets the query default, since the
+/// permission stands in for it.
+#[test]
+fn a_scope_beside_a_permission_is_optional() -> TestResult {
+    let api = graphql_rpcgen::compile_str(&format!(
+        r#"{BASE}{SCOPE_SET}
+type Admin @service @auth(require: session, permission: files_admin) {{
+  wipe(input: GetInput!): Thing! @mutation(scope: purge) @rpc(path: "/wipe") @throws(codes: ["role_forbidden"])
+  audit(input: GetInput!): Thing! @query(scope: read) @rpc(path: "/audit") @throws(codes: ["role_forbidden"])
+  stats(input: GetInput!): Thing! @query @rpc(path: "/stats") @throws(codes: ["role_forbidden"])
+  reset(input: GetInput!): Thing! @mutation @rpc(path: "/reset") @throws(codes: ["role_forbidden"])
+}}
+"#
+    ))?;
+    let out = generate_rust::generate_types(&api, &Config::default())?;
+    let row = |id: &str| -> TestResult<String> {
+        Ok(out
+            .lines()
+            .find(|line| line.contains(&format!("Operation {{ id: \"{id}\", ")))
+            .ok_or_else(|| format!("no row for {id}"))?
+            .to_string())
+    };
+    let permission = "permission: Some(super::Permission::FilesAdmin)";
+    assert!(row("admin_wipe")?.ends_with(&format!(
+        "{permission}, scope: Some(super::TokenScope::Purge) }},"
+    )));
+    assert!(row("admin_audit")?.ends_with(&format!(
+        "{permission}, scope: Some(super::TokenScope::Read) }},"
+    )));
+    assert!(row("admin_stats")?.ends_with(&format!("{permission}, scope: None }},")));
+    assert!(row("admin_reset")?.ends_with(&format!("{permission}, scope: None }},")));
+    // The duty that comes with leaving it out is said where the column is.
+    assert!(
+        out.contains("`require_permission` must refuse a credential not allowed it"),
+        "{out}"
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&generate_openapi::generate(&api, &Config::default())?)?;
+    assert_eq!(doc["paths"]["/wipe"]["post"]["x-scope"], "files.purge");
+    assert!(doc["paths"]["/stats"]["post"].get("x-scope").is_none());
+    Ok(())
+}
+
+/// A query that takes a raw body in reads bytes from the caller, so it states
+/// its scope rather than taking the read default.
+#[test]
+fn a_query_with_a_raw_request_states_its_scope() -> TestResult {
+    let binary = r#"scalar Binary @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+input BodyInput { id: UUID!, body: Binary! }
+"#;
+    let e = expect_error(&format!(
+        r#"{binary}{SCOPE_SET}
+type S @service @auth(require: session) {{
+  probe(input: BodyInput!): Thing! @query @rpc(path: "/probe") @raw(request: ["text/csv"])
+}}
+"#
     ))?;
     assert!(
         e.contains(
-            "`S.g`: @mutation(scope: write) applies to no credential: its @auth(permission:) check \
-             decides what a credential reaches, so a scope beside it is never read; drop it"
+            "`S.probe`: a @query with @raw(request:) takes a body in, so it states its scope rather \
+             than taking the read default: one of read, write, purge, secrets"
         ),
         "{e}"
     );
+    let api = graphql_rpcgen::compile_str(&format!(
+        r#"{BASE}{binary}{SCOPE_SET}
+type S @service @auth(require: session) {{
+  probe(input: BodyInput!): Thing! @query(scope: read) @rpc(path: "/probe") @raw(request: ["text/csv"])
+}}
+"#
+    ))?;
+    let scope = api
+        .services
+        .iter()
+        .flat_map(|s| &s.operations)
+        .find_map(|op| op.scope.clone());
+    assert_eq!(scope.as_deref(), Some("read"));
     Ok(())
 }
 
