@@ -4,7 +4,7 @@ Each release says what changed and why. The README's "Upgrading from …" notes
 hold the exact migration steps; this file holds the motivation. Releases before
 0.10.1 are in the git history.
 
-## Unreleased
+## 0.14.0 — 2026-11-21
 
 ### Added
 - **The operation table.** `pub mod operations` in the Rust types target lists
