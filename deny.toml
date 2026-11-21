@@ -1,0 +1,11 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0543: `chrono` is unmaintained (an INFO notice, no known
+    # flaw). It is only a dev-dependency: the wire tests (`raw_wire`,
+    # `oneof_wire`) compile generated code whose `DateTime` scalar maps to
+    # `chrono::DateTime<Utc>`, the type consumers' SDLs name. The generator
+    # itself never links it. Removal plan: drop the entry once the tests'
+    # scalar moves off chrono (e.g. to `jiff`). Id-only: a vulnerability
+    # advisory against it still fails.
+    "RUSTSEC-2026-0543",
+]
