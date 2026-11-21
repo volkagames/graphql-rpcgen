@@ -21,6 +21,7 @@ pub fn generate(api: &Api) -> String {
     emit_client(&mut out);
     emit_services(&mut out, api);
     emit_api_object(&mut out, api);
+    emit_operation_keys(&mut out, api);
 
     out
 }
@@ -785,6 +786,33 @@ export interface MutationOptionsResult<Input, Output> {
 
     out.push_str("  }\n}\n");
     out.push_str("\nexport type Api = ReturnType<typeof createApi>\n");
+}
+
+/// `operationKeys`: each operation's TanStack key prefix, `[service, operation]`,
+/// which every `queryKey` and `mutationKey` the operation builds starts with.
+///
+/// A module-level constant rather than a field of `createApi`, because the
+/// place that invalidates every query of one operation — whatever its input —
+/// is often a module with no client in reach, and without it each such place
+/// spells the pair as an untyped literal that a rename silently stops matching.
+fn emit_operation_keys(out: &mut String, api: &Api) {
+    out.push_str(
+        "\n/** Each operation's TanStack key prefix, `[service, operation]`: what its `queryKey` and `mutationKey` start with, for invalidating every input's query at once. */\n\
+         export const operationKeys = {\n",
+    );
+    for service in &api.services {
+        let service_key = service.name.to_lowercase();
+        let _ = writeln!(out, "  {service_key}: {{");
+        for op in &service.operations {
+            let _ = writeln!(
+                out,
+                "    {}: ['{service_key}', '{}'] as const,",
+                op.name, op.name
+            );
+        }
+        out.push_str("  },\n");
+    }
+    out.push_str("} as const\n");
 }
 
 /// The lambda that performs one operation, whatever its transport.

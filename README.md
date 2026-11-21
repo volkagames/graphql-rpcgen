@@ -1260,6 +1260,23 @@ Bad input then throws a `ZodError` naming the field before the request is built.
 It cannot disagree with the server: both sides are generated from the same
 declarations.
 
+## TanStack keys
+
+Every key an operation builds starts with `[service, operation]`: its
+`queryKey(input)` appends the input, its `mutationKey` is the pair alone.
+Invalidating every query of one operation, whatever its input, matches on that
+prefix, and `operationKeys` holds it per operation as a module-level constant —
+the place that invalidates is often one with no client in reach:
+
+```ts
+import { operationKeys } from './api'
+
+await queries.invalidateQueries({ queryKey: operationKeys.tags.list })
+```
+
+Spelled by hand, `['tags', 'list']` is an untyped literal that a renamed
+operation silently stops matching; through `operationKeys` it is a compile error.
+
 ## Retargeting the Rust output
 
 The preamble, router and handler come from mustache templates. The built-ins
@@ -1344,7 +1361,7 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
   and the rejections of shapes a tool call cannot honour
 - **streaming** (10) — `@subscription` and `@raw` on both sides: the signature,
   the route verb, and where the input is read from
-- **snapshots** (7) — Rust, TypeScript, zod and OpenAPI output, determinism, and
+- **snapshots** (7) — Rust, TypeScript (its TanStack keys included), zod and OpenAPI output, determinism, and
   a pass over the whole OpenAPI document for the breaks a per-path assertion
   cannot see: a dangling `$ref`, a duplicated `operationId`, an operation with
   no response

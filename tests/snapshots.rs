@@ -417,6 +417,10 @@ fn typescript_snapshot() -> TestResult {
     assert!(out.contains("queryOptions: (input: CreateInput)"));
     assert!(out.contains("mutationOptions: ()"));
     assert!(out.contains("queryKey('things', 'get', input)"));
+    // The prefix every key of an operation starts with, without a client in
+    // reach, so invalidating all of its queries names it typed.
+    assert!(out.contains("export const operationKeys = {\n  things: {\n"));
+    assert!(out.contains("    get: ['things', 'get'] as const,\n"));
     // The client reads treat's envelope: payload under `meta`, locator under
     // `source`, and the outcome decided by `errors[]` rather than the status.
     assert!(out.contains("export type RpcErrorCode = ErrorCode"));
