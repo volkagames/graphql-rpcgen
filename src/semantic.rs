@@ -96,6 +96,11 @@ pub const ROLE_REQUIRED_CODE: &str = "role_required";
 
 pub const RUNTIME_ERROR_CODES: [&str; 2] = [CODE_INVALID_BODY, CODE_INTERNAL_ERROR];
 
+/// The items every Rust enum gets beside its variants. A registry variant keeps
+/// its SDL spelling, so a code spelt as one of these would shadow the item: rustc
+/// resolves `ErrorCode::ALL` to the variant and only warns.
+pub const ENUM_ITEMS: [&str; 3] = ["ALL", "from_name", "as_str"];
+
 pub fn build(files: &[SdlFile]) -> Result<Api, CompileError> {
     Analyzer::new(files).run()
 }
@@ -599,6 +604,23 @@ impl<'a> Analyzer<'a> {
                     });
                 }
                 self.check_enum_wire_names(file, &t.name, &values, t.position);
+                if t.name == ERROR_CODE_ENUM {
+                    for v in t
+                        .values
+                        .iter()
+                        .filter(|v| ENUM_ITEMS.contains(&v.name.as_str()))
+                    {
+                        self.errors.push(CompileError::at(
+                            format!(
+                                "`{ERROR_CODE_ENUM}` cannot list `{}`: the generated `{}::{}` \
+                                 would be shadowed by it",
+                                v.name, ERROR_CODE_ENUM, v.name
+                            ),
+                            file,
+                            v.position,
+                        ));
+                    }
+                }
                 types.push(ApiType::Enum(EnumType {
                     name: t.name.clone(),
                     description: t.description.clone(),

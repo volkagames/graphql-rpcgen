@@ -1300,6 +1300,32 @@ type Wrapper { kind: Kind! }
     Ok(())
 }
 
+/// Every Rust enum gets `ALL`, `from_name` and `as_str`. A registry code keeps
+/// its SDL spelling as its Rust variant, so a code spelt as one of them would
+/// shadow the generated item, which rustc only warns about.
+#[test]
+fn a_registry_code_may_not_shadow_a_generated_enum_item() -> TestResult {
+    for name in ["ALL", "from_name", "as_str"] {
+        let sdl = format!(
+            "scalar UUID\nenum ErrorCode {{ invalid_body internal_error {name} }}\n\
+             type T {{ id: UUID! }}\n"
+        );
+        let Err(e) = graphql_rpcgen::compile_str(&sdl).map_err(|e| e.to_string()) else {
+            return Err(format!("a registry listing `{name}` must fail").into());
+        };
+        assert!(e.contains(&format!("cannot list `{name}`")), "{e}");
+    }
+    Ok(())
+}
+
+/// An ordinary enum's variants are PascalCase, so the same SDL names are safe
+/// there: `ALL` becomes `All`.
+#[test]
+fn an_ordinary_enum_may_name_a_value_all() -> TestResult {
+    compile("enum Filter { ALL as_str from_name }\ntype T { f: Filter! }\n")?;
+    Ok(())
+}
+
 // --- Names that reach a target as an identifier -------------------------------
 
 /// Overriding a built-in is what `scalar` redeclaration is for, and the

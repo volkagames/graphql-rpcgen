@@ -379,6 +379,48 @@ explicitly, and a snapshot test asserts `Deref` never comes back.
 `@range`; a newtype a `@range` reaches without `rustRange: true` is a compile
 error in the SDL rather than an rustc error in the generated file.
 
+### Enums
+
+Every enum, the `ErrorCode` registry included, reaches Rust with its whole set
+and its wire names in both directions:
+
+```graphql
+enum Visibility { private public_link @variant(tag: "public-link") }
+```
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Visibility {
+    #[serde(rename = "private")]
+    Private,
+    #[serde(rename = "public-link")]
+    PublicLink,
+}
+
+impl Visibility {
+    pub const ALL: &[Self] = &[Self::Private, Self::PublicLink]; // one per line, in SDL order
+    pub fn from_name(name: &str) -> Option<Self> { /* "public-link" => Some(Self::PublicLink), … */ }
+    pub fn as_str(self) -> &'static str { /* Self::PublicLink => "public-link", … */ }
+}
+```
+
+`as_str` is exactly what serde writes — the `@variant(tag:)` when a value has
+one — and `from_name` reads only that, so the GraphQL identifier
+`public_link` is `None`. A project storing a value as text, filtering a query
+by it or listing the choices on a screen reads them here instead of keeping an
+array of variants and a `match` of spellings beside the generated type, which
+drift from the SDL without a word: a new value missing from the array, an
+edited tag leaving the old string behind. `Hash` lets a value key a set or a
+map.
+
+The registry's variants keep their SDL spelling, so a code named `ALL`,
+`from_name` or `as_str` would shadow the generated item and is refused.
+
+**Upgrading from 0.14.** A project's own inherent `as_str`, `from_name` or
+`ALL` on a generated enum, or its own `impl Hash`, now collides with the
+generated one: delete it. An inherent method of the same name that spells a
+value differently from the wire was a second vocabulary; keep it under another
+name if the difference is intended.
+
 ### Unions and `@oneOf`
 
 An output union becomes a discriminated object on the wire:
@@ -724,7 +766,7 @@ Where each element of the model lives:
 | Standard | In the SDL | Generated | Left to the implementation |
 | --- | --- | --- | --- |
 | USERS | — | — | who a session names |
-| ROLES | the values of the `@roles` enum | the enum, `from_name`, `as_str`; TS: the literal union and `roles` | — |
+| ROLES | the values of the `@roles` enum | the enum, with [what every enum gets](#enums); TS: the literal union and `roles` | — |
 | RH, role hierarchy | `@inherits(roles:)` on a value | `Role::authorizes`; TS: `roleAuthorizes` | — |
 | OPS, operations | an operation of a `@service` | its handler and client entry | — |
 | OBS, objects | — | — | whatever the operation acts on |
@@ -916,9 +958,10 @@ Two more rules:
 
 #### What is generated
 
-- Rust: `impl Permission { from_name, as_str }` over the wire names — the
-  `@variant(tag:)` when a value has one, since permission ids such as
-  `admin.users.read` are seldom identifiers — and the awaited guard.
+- Rust: the awaited guard. The enum's `from_name` and `as_str` read and spell
+  the wire names, as [every enum's](#enums) do — the `@variant(tag:)` when a
+  value has one, since permission ids such as `admin.users.read` are seldom
+  identifiers.
 - Rust: the `permission` column of [`operations`](#the-operation-table), for a
   caller that reaches a service other than through its router — an MCP tool
   calling the method, a job runner — and so passes no generated guard.
@@ -1054,8 +1097,8 @@ there so the gate stays closed if the table and the gate ever disagree.
 
 Each target carries the resolved scope — a query's default filled in:
 
-- Rust: the scope enum with `from_name` / `as_str` over its wire names, and the
-  `scope` column of `operations`.
+- Rust: the `scope` column of `operations`; the scope enum reads and spells its
+  wire names with `from_name` / `as_str`, as [every enum](#enums) does.
 - OpenAPI: `x-scope` on the operation, its wire name.
 - TypeScript: `scopes`, the whole set in declaration order, and a `scope` field
   on each `createApi` entry that needs one.
@@ -1349,9 +1392,9 @@ just test-one registry     # by test name
 just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
-252 tests, none of which need a network:
+254 tests, none of which need a network:
 
-- **semantic** (96) — every validation rule, the error-code registry, path
+- **semantic** (98) — every validation rule, the error-code registry, path
   versioning, union tags, which constraint may sit on which type, plus
   nullability/list conversion
 - **reuse** (21) — the generator is project-agnostic: a default config
@@ -1393,7 +1436,8 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
   `--config` that does not exist fails instead of falling back
 - **oneof_wire** (1) — the generated `@oneOf` types compiled and run in a
   scratch cargo project, pinning the wire shape and the arm constraints at
-  runtime rather than in emitted text
+  runtime rather than in emitted text, and every enum's `ALL`, `from_name` and
+  `as_str` against what serde writes
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
   `@raw` form, a `@subscription`, a role reached through `@inherits`, a
   `@variant(tag:)` error code, a scope set and the operation table's lookups,

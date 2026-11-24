@@ -4,6 +4,50 @@ Each release says what changed and why. The README's "Upgrading from …" notes
 hold the exact migration steps; this file holds the motivation. Releases before
 0.10.1 are in the git history.
 
+## Unreleased
+
+### Added
+- **Every Rust enum lists and spells itself.** Each SDL enum, the `ErrorCode`
+  registry included, gets `pub const ALL: &[Self]` (every value, in SDL
+  order), `from_name` and `as_str` over its wire names, and derives `Hash`.
+
+### Changed
+- **Breaking:** a consumer's own inherent `ALL`, `from_name` or `as_str` on a
+  generated enum, or its own `impl Hash` for one, now collides with the
+  generated item and must be deleted.
+- The `@roles`, `@permissions` and `@scopes` enums get `from_name` and
+  `as_str` from the general rule; only `Role::authorizes` is still emitted
+  for one kind of enum alone.
+- An `ErrorCode` value named `ALL`, `from_name` or `as_str` is refused.
+
+### Why
+A project that stores an enum as text, filters a query by it or lists its
+choices on a screen needs the set and the spellings. Only the access enums
+had `as_str`, and no enum had its set, so consumers wrote both by hand beside
+the generated type. In the first consumer that meant arrays of variants for
+filters and validation, string constants repeating an enum's wire names, and
+hand-written `as_str` and `parse` impls for the enums it stores. Each of
+these drifts from the SDL silently: a new value is missing from the array,
+and an edited `@variant(tag:)` leaves the old string in the constant.
+
+- **One rule for every enum.** `from_name` and `as_str` already existed for
+  the access enums, emitted per kind with the same body. Every other enum
+  needed the same two methods for the same reason, so the per-kind impls
+  became one rule over all of them.
+- **`as_str` is the serde spelling.** It is the one string the wire, a
+  stored row and a log line can agree on, the tag included. A second
+  vocabulary is the consumer's to name.
+- **The registry is an enum like the others.** Its codes are what a client
+  branches on and a log records, so the same reasons hold. `as_str` equals
+  its `Display`.
+- **A colliding registry code is refused.** Registry variants keep their SDL
+  spelling, so a code named `ALL` would shadow the constant; rustc only
+  warns about that, and the code would silently mean the variant.
+- **`Hash`** because a set of values is the natural way to check membership
+  against `ALL`; every enum is a fieldless `Copy` type, so it costs nothing.
+- **No `Display` or `FromStr`.** The generator has no pattern for either on
+  an ordinary enum, and a consumer may already implement them.
+
 ## 0.14.0 — 2026-11-21
 
 ### Added

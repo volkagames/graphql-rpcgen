@@ -252,6 +252,21 @@ fn rust_snapshot() -> TestResult {
     // Enum variants keep their wire spelling.
     assert!(out.contains(r#"#[serde(rename = "ACTIVE")]"#));
     assert!(out.contains("    Active,"));
+    // Every enum lists its values in SDL order and spells them both ways, so a
+    // consumer storing one as text writes no array or `match` of its own; and
+    // it is `Hash`, so it keys a set or a map.
+    assert!(out.contains(
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]\npub enum Status {"
+    ));
+    assert!(out.contains(
+        "impl Status {\n    /// Every value, in the order the SDL declares them.\n    \
+         pub const ALL: &[Self] = &[\n        Self::Active,\n        Self::Disabled,\n    ];\n"
+    ));
+    assert!(out.contains("            \"DISABLED\" => Some(Self::Disabled),\n"));
+    assert!(out.contains("            Self::Disabled => \"DISABLED\",\n"));
+    assert!(out.contains(
+        "pub const ALL: &[Self] = &[\n        Self::Flag,\n        Self::Number,\n    ];"
+    ));
 
     // Service trait and Axum bindings.
     assert!(out.contains("pub trait ThingsService: Clone + Send + Sync + 'static {"));
@@ -285,6 +300,16 @@ fn rust_snapshot() -> TestResult {
     ));
     assert!(out.contains(r#"        #[display("things::gone")] ThingsGone,"#));
     assert!(!out.contains(r#"#[display("things__gone")]"#));
+    // The registry gets what every enum gets, over its own variant names, and
+    // spells a tagged code by its tag there too.
+    assert!(out.contains("Hash, Serialize, Deserialize, ApiErrorCode)]"));
+    assert!(out.contains(
+        "impl ErrorCode {\n    /// Every value, in the order the SDL declares them.\n    \
+         pub const ALL: &[Self] = &[\n        Self::invalid_body,\n        Self::internal_error,\n        \
+         Self::not_found,\n        Self::things__gone,\n    ];\n"
+    ));
+    assert!(out.contains("            \"things::gone\" => Some(Self::things__gone),\n"));
+    assert!(out.contains("            Self::things__gone => \"things::gone\",\n"));
 
     // A set names what the operation declared, then what the runtime can emit
     // on its own. Anything else fails to compile at the handler, which is what

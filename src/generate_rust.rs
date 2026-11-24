@@ -376,20 +376,13 @@ fn emit_types(out: &mut String, api: &Api) {
         match ty {
             ApiType::Scalar(s) if s.rust_newtype => emit_scalar_newtype(out, s),
             ApiType::Scalar(_) => {}
+            // The `@permissions` and `@scopes` enums need nothing beyond what
+            // every enum gets: neither declares a hierarchy to compile into an
+            // `authorizes`, so which implies which stays the implementation's.
             ApiType::Enum(e) => {
                 emit_enum(out, e);
                 if api.roles.as_ref().is_some_and(|r| r.enum_name == e.name) {
                     emit_role_impl(out, api, e);
-                }
-                if api
-                    .permissions
-                    .as_ref()
-                    .is_some_and(|p| p.enum_name == e.name)
-                {
-                    emit_permission_impl(out, e);
-                }
-                if api.scopes.as_ref().is_some_and(|p| p.enum_name == e.name) {
-                    emit_scope_impl(out, e);
                 }
             }
             ApiType::Object(o) => emit_object(out, api, o),
@@ -532,12 +525,13 @@ fn emit_scalar_newtype(out: &mut String, s: &ScalarType) {
 fn emit_enum(out: &mut String, e: &EnumType) {
     if e.name == crate::semantic::ERROR_CODE_ENUM {
         emit_error_code_enum(out, e);
+        emit_wire_name_impl(out, e, |v| v.name.clone());
         return;
     }
 
     out.push('\n');
     emit_doc(out, "", &e.description);
-    out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n");
+    out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]\n");
     let _ = writeln!(out, "pub enum {} {{", e.name);
     for v in &e.values {
         emit_doc(out, "    ", &v.description);
@@ -548,10 +542,62 @@ fn emit_enum(out: &mut String, e: &EnumType) {
         let _ = writeln!(out, "    {},", pascal_case(&v.name));
     }
     out.push_str("}\n");
+    emit_wire_name_impl(out, e, |v| pascal_case(&v.name));
 }
 
-/// What the server needs of the `@roles` enum beyond the wire type: reading a
-/// role from the name a session carries, and the role hierarchy.
+/// What every enum, the error code registry included, carries beyond the wire
+/// type: the whole set, and its wire names in both directions.
+///
+/// A consumer that stores a value as text, filters a query by it, or lists the
+/// choices on a screen otherwise restates the variants in an array and their
+/// spellings in a `match` of its own, which drift from the SDL silently: a new
+/// value is missing from the array and a `@variant(tag:)` edit leaves the old
+/// string behind. `as_str` is exactly what serde writes, the `@variant(tag:)`
+/// when a value has one, since names such as `admin.users.read` are seldom
+/// identifiers.
+///
+/// `variant` names the Rust variant of a value: PascalCase for an ordinary
+/// enum, the SDL name verbatim for the registry.
+fn emit_wire_name_impl(out: &mut String, e: &EnumType, variant: impl Fn(&EnumValue) -> String) {
+    let _ = writeln!(out, "\nimpl {} {{", e.name);
+    // One value per line, so adding a value to the SDL is a one-line diff here.
+    out.push_str("    /// Every value, in the order the SDL declares them.\n    pub const ALL: &[Self] = &[\n");
+    for v in &e.values {
+        let _ = writeln!(out, "        Self::{},", variant(v));
+    }
+    out.push_str("    ];\n");
+
+    out.push_str(
+        "\n    /// The value whose wire name is `name`, or `None` for a name outside this set.\n    \
+         pub fn from_name(name: &str) -> Option<Self> {\n        match name {\n",
+    );
+    for v in &e.values {
+        let _ = writeln!(
+            out,
+            "            {:?} => Some(Self::{}),",
+            v.wire_name(),
+            variant(v)
+        );
+    }
+    out.push_str("            _ => None,\n        }\n    }\n");
+
+    out.push_str(
+        "\n    /// The wire name of this value, exactly what serde writes for it.\n    \
+         pub fn as_str(self) -> &'static str {\n        match self {\n",
+    );
+    for v in &e.values {
+        let _ = writeln!(
+            out,
+            "            Self::{} => {:?},",
+            variant(v),
+            v.wire_name()
+        );
+    }
+    out.push_str("        }\n    }\n}\n");
+}
+
+/// What the server needs of the `@roles` enum beyond what every enum gets: the
+/// role hierarchy.
 ///
 /// The hierarchy is matched out per role rather than walked at runtime, since
 /// the compiler has already closed over it: a role's arm lists itself and every
@@ -562,36 +608,7 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
 
     let _ = writeln!(out, "\nimpl {} {{", e.name);
     out.push_str(
-        "    /// The role a session names `name`, or `None` for a name outside this set,\n    \
-         /// such as a role of another application.\n    \
-         pub fn from_name(name: &str) -> Option<Self> {\n        match name {\n",
-    );
-    for v in &e.values {
-        let _ = writeln!(
-            out,
-            "            {:?} => Some({}),",
-            v.wire_name(),
-            variant(&v.name)
-        );
-    }
-    out.push_str("            _ => None,\n        }\n    }\n");
-
-    out.push_str(
-        "\n    /// The name a session carries for this role.\n    \
-         pub fn as_str(self) -> &'static str {\n        match self {\n",
-    );
-    for v in &e.values {
-        let _ = writeln!(
-            out,
-            "            {} => {:?},",
-            variant(&v.name),
-            v.wire_name()
-        );
-    }
-    out.push_str("        }\n    }\n");
-
-    out.push_str(
-        "\n    /// Whether a user assigned `self` is authorized for `required`: the same\n    \
+        "    /// Whether a user assigned `self` is authorized for `required`: the same\n    \
          /// role, or one `self` inherits through `@inherits`, directly or not.\n    \
          pub fn authorizes(self, required: Self) -> bool {\n        match self {\n",
     );
@@ -609,70 +626,6 @@ fn emit_role_impl(out: &mut String, api: &Api, e: &EnumType) {
     }
     out.push_str("        }\n    }\n");
     out.push_str("}\n");
-}
-
-/// What the server needs of the `@permissions` enum beyond the wire type:
-/// reading a permission from the id the implementation stores, and spelling it.
-///
-/// No `authorizes`: unlike a role hierarchy, which permissions imply which is
-/// not declared in the SDL, so there is nothing to compile into a match.
-fn emit_permission_impl(out: &mut String, e: &EnumType) {
-    emit_name_impl(
-        out,
-        e,
-        "/// The permission whose id is `name`, or `None` for an id outside this set.",
-        "/// The id the implementation checks for this permission.",
-    );
-}
-
-/// What the server needs of the `@scopes` enum beyond the wire type: reading a
-/// scope from what a credential carries, and spelling it.
-///
-/// No hierarchy either: whether `write` implies `read` is the implementation's
-/// policy over the credentials it issues, which the SDL does not declare.
-fn emit_scope_impl(out: &mut String, e: &EnumType) {
-    emit_name_impl(
-        out,
-        e,
-        "/// The scope a credential names `name`, or `None` for a name outside this set.",
-        "/// The name a credential carries for this scope.",
-    );
-}
-
-/// `from_name` and `as_str` over an enum's wire names: the `@variant(tag:)`
-/// when a value has one, since ids such as `admin.users.read` are seldom
-/// identifiers.
-fn emit_name_impl(out: &mut String, e: &EnumType, from_doc: &str, as_doc: &str) {
-    let variant = |name: &str| format!("Self::{}", pascal_case(name));
-
-    let _ = writeln!(out, "\nimpl {} {{", e.name);
-    let _ = writeln!(
-        out,
-        "    {from_doc}\n    pub fn from_name(name: &str) -> Option<Self> {{\n        match name {{"
-    );
-    for v in &e.values {
-        let _ = writeln!(
-            out,
-            "            {:?} => Some({}),",
-            v.wire_name(),
-            variant(&v.name)
-        );
-    }
-    out.push_str("            _ => None,\n        }\n    }\n");
-
-    let _ = writeln!(
-        out,
-        "\n    {as_doc}\n    pub fn as_str(self) -> &'static str {{\n        match self {{"
-    );
-    for v in &e.values {
-        let _ = writeln!(
-            out,
-            "            {} => {:?},",
-            variant(&v.name),
-            v.wire_name()
-        );
-    }
-    out.push_str("        }\n    }\n}\n");
 }
 
 /// `operations`: every operation of the API as the router mounts it, one const
@@ -826,7 +779,7 @@ fn emit_error_code_enum(out: &mut String, e: &EnumType) {
     emit_doc(out, "", &e.description);
     out.push_str("#[allow(non_camel_case_types)]\n");
     out.push_str(
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ApiErrorCode)]\n",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ApiErrorCode)]\n",
     );
     let _ = writeln!(out, "pub enum {} {{", e.name);
     for v in &e.values {

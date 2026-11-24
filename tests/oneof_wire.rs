@@ -18,6 +18,10 @@
 //! that matches the emitted text says nothing about whether `error_set`
 //! accepts it.
 //!
+//! Every enum's `ALL`, `from_name` and `as_str` are run too: that `as_str` is
+//! exactly what serde writes, a `@variant(tag:)` included, can only be shown
+//! by serialising.
+//!
 //! The generated types get their own scratch cargo project: the project's
 //! target directory is stable under this crate's `target/`, so the
 //! dependencies compile once and later runs reuse them. The scratch project's
@@ -69,6 +73,8 @@ type CryptoPayment { network: String! }
 union PaymentMethod = CardPayment | CryptoPayment
 
 enum SettingKind { flag number }
+"One value whose wire name is not its identifier."
+enum Visibility { private public_link @variant(tag: "public-link") }
 type FlagSetting @variant(tag: "flag") { tribool: Boolean }
 type NumberSetting @variant(tag: "number") { min: Int }
 union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
@@ -253,6 +259,38 @@ fn a_holder_with_an_unknown_or_missing_tag_is_rejected() -> TestResult {
     ] {
         assert!(serde_json::from_str::<Param>(body).is_err(), "{body}");
     }
+    Ok(())
+}
+
+#[test]
+fn every_enum_lists_its_values_and_spells_them_as_serde_does() -> TestResult {
+    assert_eq!(Visibility::ALL, &[Visibility::Private, Visibility::PublicLink]);
+    for v in Visibility::ALL.iter().copied() {
+        assert_eq!(serde_json::to_value(v)?, serde_json::json!(v.as_str()));
+        assert_eq!(Visibility::from_name(v.as_str()), Some(v));
+    }
+    assert_eq!(Visibility::PublicLink.as_str(), "public-link");
+    // The identifier is not a wire name.
+    assert_eq!(Visibility::from_name("public_link"), None);
+
+    assert_eq!(SettingKind::ALL, &[SettingKind::Flag, SettingKind::Number]);
+    for v in SettingKind::ALL.iter().copied() {
+        assert_eq!(serde_json::to_value(v)?, serde_json::json!(v.as_str()));
+    }
+
+    // The registry is an enum like any other: listed in SDL order, spelt as
+    // the envelope carries it.
+    assert_eq!(ErrorCode::ALL.first(), Some(&ErrorCode::invalid_body));
+    assert_eq!(ErrorCode::ALL.len(), 4);
+    for code in ErrorCode::ALL.iter().copied() {
+        assert_eq!(serde_json::to_value(code)?, serde_json::json!(code.as_str()));
+        assert_eq!(code.to_string(), code.as_str());
+        assert_eq!(ErrorCode::from_name(code.as_str()), Some(code));
+    }
+
+    // `Hash`, so a value keys a set.
+    let set: std::collections::HashSet<Visibility> = Visibility::ALL.iter().copied().collect();
+    assert_eq!(set.len(), Visibility::ALL.len());
     Ok(())
 }
 
