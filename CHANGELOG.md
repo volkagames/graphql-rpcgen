@@ -4,7 +4,7 @@ Each release says what changed and why. The README's "Upgrading from …" notes
 hold the exact migration steps; this file holds the motivation. Releases before
 0.10.1 are in the git history.
 
-## Unreleased
+## 0.16.0 — 2026-11-25
 
 Written for a project upgrading from 0.15.0. When you regenerate with this
 release, raise `rpcgen_version` in `rpcgen.toml` to it, so a teammate or a CI

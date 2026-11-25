@@ -37,7 +37,7 @@ As a build-time or dev dependency:
 
 ```toml
 [dependencies]
-graphql-rpcgen = "0.15"
+graphql-rpcgen = "0.16"
 ```
 
 ## CLI
