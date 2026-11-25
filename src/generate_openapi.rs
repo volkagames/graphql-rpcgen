@@ -127,6 +127,20 @@ fn paths(api: &Api) -> Map<String, Value> {
                 operation.insert("x-scope".into(), json!(api.scope_wire_name(scope)));
             }
 
+            if let Some(http) = &op.http {
+                http_request(api, op, http, &mut operation);
+                if http.method == HttpMethod::Any {
+                    // OpenAPI has no "any method": the operation is described
+                    // under the method a client sends, and this says the route
+                    // takes every other one too.
+                    operation.insert("x-rpc-any-method".into(), json!(true));
+                }
+                operation.insert("responses".into(), Value::Object(responses(api, op)));
+                let method = op.client_method().to_ascii_lowercase();
+                insert_operation(&mut paths, &op.path, &method, operation);
+                continue;
+            }
+
             // An input that cannot ride in the body rides in the URL: a
             // subscription is opened by `EventSource`, which only GETs, and a
             // raw request has already spent its body on the payload.
@@ -191,10 +205,79 @@ fn paths(api: &Api) -> Map<String, Value> {
 
             // OpenAPI keys an operation by the method's lower-case name.
             let method = op.http_method().to_ascii_lowercase();
-            paths.insert(op.path.clone(), json!({ method: Value::Object(operation) }));
+            insert_operation(&mut paths, &op.path, &method, operation);
         }
     }
     paths
+}
+
+/// Add one operation under `path`, beside any other method already there.
+fn insert_operation(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    method: &str,
+    operation: Map<String, Value>,
+) {
+    let entry = paths.entry(path.to_string()).or_insert_with(|| json!({}));
+    if let Value::Object(methods) = entry {
+        methods.insert(method.to_string(), Value::Object(operation));
+    }
+}
+
+/// The parameters and the body of an `@http` operation: its path parameters,
+/// then the other fields in the query string or in a JSON or form body.
+fn http_request(api: &Api, op: &Operation, http: &HttpBinding, operation: &mut Map<String, Value>) {
+    let fields = api.query_fields(op);
+    let parameter = |f: &Field, location: &str| {
+        let mut param = json!({
+            "name": f.name,
+            "in": location,
+            "required": location == "path" || !f.ty.is_nullable(),
+            "schema": type_ref_schema(api, &f.ty),
+        });
+        if let Some(d) = &f.description {
+            param["description"] = json!(d);
+        }
+        param
+    };
+    let (path_fields, other_fields): (Vec<&Field>, Vec<&Field>) = fields
+        .into_iter()
+        .partition(|f| http.path_params.contains(&f.name));
+
+    let mut params: Vec<Value> = path_fields.iter().map(|f| parameter(f, "path")).collect();
+    if http.body == HttpBody::None {
+        params.extend(other_fields.iter().map(|f| parameter(f, "query")));
+    }
+    if !params.is_empty() {
+        operation.insert("parameters".into(), json!(params));
+    }
+
+    let body_fields: Vec<Field> = other_fields.iter().map(|f| (*f).clone()).collect();
+    match http.body {
+        HttpBody::None => {}
+        HttpBody::Json => {
+            let schema = match &op.input {
+                Some(input) => type_ref_schema(api, input),
+                None => json!({ "type": "object" }),
+            };
+            operation.insert(
+                "requestBody".into(),
+                json!({ "required": true, "content": { "application/json": { "schema": schema } } }),
+            );
+        }
+        HttpBody::Form => {
+            // The same fields are read from the query string too, the body
+            // winning; the form is what a client sends, so it is what is shown.
+            let schema = object_schema(api, &None, &body_fields);
+            operation.insert(
+                "requestBody".into(),
+                json!({
+                    "required": false,
+                    "content": { "application/x-www-form-urlencoded": { "schema": schema } },
+                }),
+            );
+        }
+    }
 }
 
 /// The out-of-band outcome signal `treat` sets, named once because both the
@@ -261,6 +344,26 @@ fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
         return responses;
     }
 
+    if !op.enveloped() {
+        responses.insert(
+            "200".into(),
+            json!({
+                "description": "The value itself, not the `data` envelope.",
+                "content": { "application/json": { "schema": type_ref_schema(api, &op.output) } },
+            }),
+        );
+        responses.insert(
+            "default".into(),
+            json!({
+                "description":
+                    "A failure: the envelope with `errors[]`, under the status the error \
+                     carries.",
+                "content": { "application/json": { "schema": failure_schema(api, op) } },
+            }),
+        );
+        return responses;
+    }
+
     // Success: the payload under `data`. Failure: `errors[]`, one entry per
     // problem, each pinned to one of the codes this operation declares.
     let mut alternatives = vec![json!({
@@ -283,28 +386,7 @@ fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
         "required": ["data"],
     })];
 
-    // A failure is the shared envelope with `code` narrowed to what this
-    // operation declares, plus the codes the runtime can always emit.
-    let codes: Vec<&str> = op
-        .error_codes()
-        .into_iter()
-        .map(|code| api.error_code_wire_name(code))
-        .collect();
-    alternatives.push(json!({
-        "title": "Failure",
-        "type": "object",
-        "properties": {
-            "errors": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "allOf": [{ "$ref": "#/components/schemas/RpcErrorItem" }],
-                    "properties": { "code": { "enum": codes } },
-                },
-            },
-        },
-        "required": ["errors"],
-    }));
+    alternatives.push(failure_schema(api, op));
 
     responses.insert(
         "200".into(),
@@ -320,6 +402,31 @@ fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
     );
 
     responses
+}
+
+/// The failure envelope with `code` narrowed to what this operation declares,
+/// plus the codes the runtime can always emit.
+fn failure_schema(api: &Api, op: &Operation) -> Value {
+    let codes: Vec<&str> = op
+        .error_codes()
+        .into_iter()
+        .map(|code| api.error_code_wire_name(code))
+        .collect();
+    json!({
+        "title": "Failure",
+        "type": "object",
+        "properties": {
+            "errors": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "allOf": [{ "$ref": "#/components/schemas/RpcErrorItem" }],
+                    "properties": { "code": { "enum": codes } },
+                },
+            },
+        },
+        "required": ["errors"],
+    })
 }
 
 fn schemas(api: &Api) -> Map<String, Value> {

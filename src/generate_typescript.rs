@@ -457,6 +457,65 @@ export class RpcClient {
   }
 
   /**
+   * An operation bound to HTTP by `@http`: its own method and path, its path
+   * parameters filled from the input, the other fields in the query string or
+   * in a JSON or form body, and a success that is the envelope or, with
+   * `envelope` false, the value itself. A failure is the envelope either way.
+   */
+  async http<Output>(
+    path: string,
+    input: object | undefined,
+    spec: RpcHttpSpec,
+    options: RpcCallOptions = {},
+  ): Promise<Output> {
+    this.validate?.(path, input ?? {})
+    const fields: Record<string, unknown> = { ...((input ?? {}) as Record<string, unknown>) }
+    let route = path
+    for (const name of spec.pathFields) {
+      route = route.replace(`{${name}}`, encodeURIComponent(String(fields[name])))
+      delete fields[name]
+    }
+    let url = `${this.baseUrl}${route}`
+    const headers: Record<string, string> = { ...this.headers }
+    let body: string | undefined
+    if (spec.body === 'json') {
+      headers['Content-Type'] = 'application/json'
+      body = JSON.stringify(fields)
+    } else if (spec.body === 'form') {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded'
+      body = toQuery(fields).replace(/^\?/, '')
+    } else {
+      url += toQuery(fields)
+    }
+    const response = await this.fetchImpl(url, {
+      method: spec.method,
+      headers,
+      body,
+      signal: options.signal,
+    })
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      // Non-JSON body; handled below.
+    }
+    const envelope = parsed as RpcResponse<Output> | undefined
+    if (!response.ok) {
+      throw new RpcError(
+        response.status,
+        envelope?.errors?.length ? envelope.errors : [syntheticError(response.status)],
+      )
+    }
+    if (!spec.envelope) {
+      if (parsed === undefined) throw new RpcError(response.status, [syntheticError(response.status)])
+      return parsed as Output
+    }
+    if (envelope?.errors?.length) throw new RpcError(response.status, envelope.errors)
+    if (envelope === undefined) throw new RpcError(response.status, [syntheticError(response.status)])
+    return envelope.data as Output
+  }
+
+  /**
    * Open a subscription over Server-Sent Events.
    *
    * `EventSource` can only GET, so the input travels in the query string. Each
@@ -483,6 +542,17 @@ export class RpcClient {
     if (handlers.onError) source.onerror = (event) => handlers.onError?.(event)
     return { close: () => source.close() }
   }
+}
+
+/** How an `@http` operation sits on HTTP. */
+export interface RpcHttpSpec {
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  /** Input fields filling the path's `{name}` segments. */
+  pathFields: readonly string[]
+  /** Where the other fields travel: the query string, a JSON body or a form body. */
+  body: 'none' | 'json' | 'form'
+  /** Whether a success is the `{ data }` envelope rather than the value itself. */
+  envelope: boolean
 }
 
 /** How an operation's non-JSON bodies are carried. */
@@ -754,9 +824,12 @@ export interface MutationOptionsResult<Input, Output> {
                 continue;
             }
 
-            let call = match raw_spec(api, op) {
-                Some(spec) => format!("client.rawJson<{output}>('{}', {body}, {spec}", op.path),
-                None => format!("client.call<{output}>('{}', {body}", op.path),
+            let call = match (http_spec(op), raw_spec(api, op)) {
+                (Some(spec), _) => format!("client.http<{output}>('{}', {body}, {spec}", op.path),
+                (None, Some(spec)) => {
+                    format!("client.rawJson<{output}>('{}', {body}, {spec}", op.path)
+                }
+                (None, None) => format!("client.call<{output}>('{}', {body}", op.path),
             };
 
             match op.kind {
@@ -837,6 +910,13 @@ fn call_expr(api: &Api, op: &Operation, indent: &str) -> String {
         );
     }
 
+    if let Some(spec) = http_spec(op) {
+        return format!(
+            "({leading}options?: RpcCallOptions): Promise<{output}> =>\n{indent}\
+             client.http<{output}>('{}', {body}, {spec}, options)",
+            op.path
+        );
+    }
     let Some(spec) = raw_spec(api, op) else {
         return format!(
             "({leading}options?: RpcCallOptions): Promise<{output}> =>\n{indent}\
@@ -863,6 +943,23 @@ fn call_expr(api: &Api, op: &Operation, indent: &str) -> String {
 }
 
 /// The `RpcRawSpec` literal for an operation, or `None` when it is plain JSON.
+/// The `RpcHttpSpec` literal of an `@http` operation.
+fn http_spec(op: &Operation) -> Option<String> {
+    let http = op.http.as_ref()?;
+    let fields: Vec<String> = http.path_params.iter().map(|p| quoted(p)).collect();
+    let body = match http.body {
+        HttpBody::None => "none",
+        HttpBody::Json => "json",
+        HttpBody::Form => "form",
+    };
+    Some(format!(
+        "{{ method: '{}', pathFields: [{}], body: '{body}', envelope: {} }}",
+        op.client_method(),
+        fields.join(", "),
+        http.envelope
+    ))
+}
+
 fn raw_spec(api: &Api, op: &Operation) -> Option<String> {
     if op.raw_request.is_none() && op.raw_response.is_none() {
         return None;

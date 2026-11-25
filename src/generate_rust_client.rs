@@ -50,6 +50,14 @@ const DEFAULT_METHOD_RAW_BOTH: &str =
     include_str!("../templates/rust/client_method_raw_both.mustache");
 
 /// Default name of the generated client struct.
+/// Sending an input in a URL or a form, and reading a failure envelope off a
+/// response that is not one: shared by every form that does it.
+const DEFAULT_URL_RUNTIME: &str = include_str!("../templates/rust/client_url_runtime.mustache");
+/// Calling an `@http` operation.
+const DEFAULT_HTTP_RUNTIME: &str = include_str!("../templates/rust/client_http_runtime.mustache");
+const DEFAULT_METHOD_HTTP: &str = include_str!("../templates/rust/client_method_http.mustache");
+const DEFAULT_METHOD_HTTP_NO_INPUT: &str =
+    include_str!("../templates/rust/client_method_http_no_input.mustache");
 const DEFAULT_CLIENT_NAME: &str = "ApiClient";
 
 /// Variables the client preamble may reference, besides `template_vars`.
@@ -59,7 +67,7 @@ const PREAMBLE_VARS: [&str; 3] = ["error_code_enum", "types_import", "client_nam
 /// `error` names the operation's own code enum, which is what the call fails
 /// with — the flat registry would let a caller match on codes this operation
 /// never returns.
-const METHOD_VARS: [&str; 7] = [
+const METHOD_VARS: [&str; 11] = [
     "method",
     "input",
     "output",
@@ -69,6 +77,13 @@ const METHOD_VARS: [&str; 7] = [
     // The input field a raw request sends as its body; empty for every other
     // form, which never mentions it.
     "body_field",
+    // An `@http` operation's `reqwest::Method` constant, its path parameters
+    // as a `[&str; N]` literal, its `HttpBodyKind` variant, and whether a
+    // success is enveloped. Empty for every other form.
+    "http_method",
+    "path_fields",
+    "http_body",
+    "envelope",
 ];
 
 pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
@@ -151,7 +166,31 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
             &None,
             &METHOD_VARS,
         )?,
+        http: compile(
+            DEFAULT_METHOD_HTTP,
+            "<builtin http client method>",
+            &None,
+            &METHOD_VARS,
+        )?,
+        http_no_input: compile(
+            DEFAULT_METHOD_HTTP_NO_INPUT,
+            "<builtin no-input http client method>",
+            &None,
+            &METHOD_VARS,
+        )?,
     };
+    let url_runtime = compile(
+        DEFAULT_URL_RUNTIME,
+        "<builtin client url runtime>",
+        &None,
+        &PREAMBLE_VARS,
+    )?;
+    let http_runtime = compile(
+        DEFAULT_HTTP_RUNTIME,
+        "<builtin client http runtime>",
+        &None,
+        &PREAMBLE_VARS,
+    )?;
 
     let vars = |pairs: &[(&str, &str)]| -> Vars {
         let mut vars = client.template_vars.clone();
@@ -173,6 +212,19 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
         ("types_import", &types_import),
         ("client_name", DEFAULT_CLIENT_NAME),
     ]))?);
+
+    let operations = || api.services.iter().flat_map(|service| &service.operations);
+    let runtime_vars = vars(&[
+        ("error_code_enum", crate::semantic::ERROR_CODE_ENUM),
+        ("types_import", ""),
+        ("client_name", DEFAULT_CLIENT_NAME),
+    ]);
+    if operations().any(|op| needs_runtime(op) || op.http.is_some()) {
+        out.push_str(&url_runtime.render(&runtime_vars)?);
+    }
+    if operations().any(|op| op.http.is_some()) {
+        out.push_str(&http_runtime.render(&runtime_vars)?);
+    }
 
     if api
         .services
@@ -211,6 +263,8 @@ struct RawMethods {
     raw_request: Template,
     /// Bytes in and bytes out: an operation declaring both `@raw` directions.
     raw_both: Template,
+    http: Template,
+    http_no_input: Template,
 }
 
 /// Whether an operation needs the streaming and raw-body runtime.
@@ -275,6 +329,17 @@ fn emit_service(
             ("operation_id", &op.operation_id),
             ("error", &codes_type_name(&service.name, &op.name)),
             ("body_field", &body_field),
+            ("http_method", op.client_method()),
+            ("path_fields", &path_fields_literal(op)),
+            (
+                "http_body",
+                match op.http.as_ref().map(|http| http.body) {
+                    Some(HttpBody::Json) => "Json",
+                    Some(HttpBody::Form) => "Form",
+                    Some(HttpBody::None) | None => "None",
+                },
+            ),
+            ("envelope", if op.enveloped() { "true" } else { "false" }),
         ]))?);
     }
     out.push_str("}\n");
@@ -297,6 +362,12 @@ fn method_template<'a>(
     op: &Operation,
 ) -> &'a Template {
     let has_input = op.input.is_some();
+    if op.http.is_some() {
+        return match has_input {
+            true => &methods.http,
+            false => &methods.http_no_input,
+        };
+    }
     match (
         op.kind,
         has_input,
@@ -313,6 +384,17 @@ fn method_template<'a>(
         (_, true, false, false) => method,
         (_, false, false, false) => method_no_input,
     }
+}
+
+/// An `@http` operation's path parameters as a `[&str; N]` literal.
+fn path_fields_literal(op: &Operation) -> String {
+    let params = op
+        .http
+        .as_ref()
+        .map(|http| http.path_params.as_slice())
+        .unwrap_or_default();
+    let quoted: Vec<String> = params.iter().map(|p| format!("{p:?}")).collect();
+    format!("[{}]", quoted.join(", "))
 }
 
 /// What a `@raw` operation accepts or answers with.

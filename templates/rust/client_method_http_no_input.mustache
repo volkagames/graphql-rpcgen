@@ -1,0 +1,5 @@
+    pub async fn {{{method}}}(&self) -> ClientResult<{{{output}}}, {{{error}}}> {
+        self.client
+            .http(reqwest::Method::{{{http_method}}}, "{{{path}}}", &[], &serde_json::json!({}), HttpBodyKind::{{{http_body}}}, {{{envelope}}})
+            .await
+    }

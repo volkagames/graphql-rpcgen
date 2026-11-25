@@ -1,0 +1,110 @@
+// --- @http operations --------------------------------------------------------
+//
+// Emitted only for an API with an `@http` operation.
+
+/// Where an `@http` operation sends the fields its path does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpBodyKind {
+    /// The query string.
+    None,
+    /// The input object as a JSON body.
+    Json,
+    /// An `application/x-www-form-urlencoded` body.
+    Form,
+}
+
+impl {{{client_name}}} {
+    /// Call an `@http` operation.
+    ///
+    /// The path's `{name}` segments are filled from the input, the remaining
+    /// fields travel as `body` says, and a success is read as the envelope or,
+    /// with `envelope` false, as the value itself. A failure is the envelope
+    /// either way.
+    pub async fn http<I: Serialize, O: DeserializeOwned + Serialize, C>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        path_fields: &[&str],
+        input: &I,
+        body: HttpBodyKind,
+        envelope: bool,
+    ) -> ClientResult<O, C> {
+        let value = serde_json::to_value(input).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let mut fields = match value {
+            serde_json::Value::Object(fields) => fields,
+            _ => serde_json::Map::new(),
+        };
+
+        let mut url_path = path.to_string();
+        for name in path_fields {
+            let segment = match fields.remove(*name) {
+                Some(value) => urlencode(&scalar_param(value)).replace('+', "%20"),
+                None => return Err(ClientError::Decode(format!("path parameter `{name}` is missing"))),
+            };
+            let placeholder = ["{", name, "}"].concat();
+            url_path = url_path.replace(&placeholder, &segment);
+        }
+        let url = format!("{}{url_path}", self.base_url);
+
+        let request = match body {
+            HttpBodyKind::None => {
+                let query = to_query(&fields).map_err(ClientError::Decode)?;
+                self.http.request(method, format!("{url}{query}"))
+            }
+            HttpBodyKind::Json => self.http.request(method, url).json(&fields),
+            HttpBodyKind::Form => {
+                let query = to_query(&fields).map_err(ClientError::Decode)?;
+                self.http
+                    .request(method, url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(query.trim_start_matches('?').to_string())
+            }
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+        let status = response.status();
+        if envelope || !status.is_success() {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| ClientError::Transport(e.to_string()))?;
+            return read_envelope(status, &body);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        serde_json::from_slice(&body).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+}
+
+/// The value or the failure an envelope carries.
+fn read_envelope<O: DeserializeOwned + Serialize, C>(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> ClientResult<O, C> {
+    let envelope: ApiResponse<O> = match serde_json::from_slice(body) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            return Err(if status.is_success() {
+                ClientError::Decode(e.to_string())
+            } else {
+                ClientError::Status(status.as_u16())
+            })
+        }
+    };
+    if !envelope.errors.is_empty() {
+        return Err(ClientError::Api(ApiErrors::new(envelope.errors)));
+    }
+    match envelope.data {
+        Some(data) => Ok(data),
+        None => Err(if status.is_success() {
+            ClientError::Decode("response carried neither `data` nor `errors`".to_string())
+        } else {
+            ClientError::Status(status.as_u16())
+        }),
+    }
+}
