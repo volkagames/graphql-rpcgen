@@ -20,7 +20,7 @@ impl {{{client_name}}} {
     /// fields travel as `body` says, and a success is read as the envelope or,
     /// with `envelope` false, as the value itself. A failure is the envelope
     /// either way.
-    pub async fn http<I: Serialize, O: DeserializeOwned + Serialize, C>(
+    pub async fn call_http<I: Serialize, O: DeserializeOwned + Serialize, C>(
         &self,
         method: reqwest::Method,
         path: &str,

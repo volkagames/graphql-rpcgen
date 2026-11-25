@@ -251,11 +251,53 @@ for file in graphql_rpcgen::generate_all(&api, &config)? { /* write file.path */
 ## Wire protocol
 
 Every operation is `POST /rpc/{service}/{operation}` with a JSON body, except a
-`@subscription` (a `GET` returning SSE) and a `@raw` body. `@query` and
-`@mutation` describe TanStack semantics only; they do not change the verb.
+`@subscription` (a `GET` returning SSE), a `@raw` body and an `@http` binding.
+`@query` and `@mutation` describe TanStack semantics only; they do not change
+the verb.
 
 `@rpc(path:)` overrides the derived path; `@version(n:)` mounts it under a
 `/v{n}` prefix.
+
+### `@http`
+
+For an endpoint whose wire format was fixed before its schema was written — a
+service being replaced behind clients that cannot change at the same time —
+`@http` replaces the derived route with the one the clients already call:
+
+```graphql
+type Users @service @auth(require: token) {
+  user(input: UserInput!): User!
+    @query
+    @http(method: GET, path: "/api/user/{user_id}", envelope: false)
+    @throws(codes: ["not_found"])
+
+  info(input: InfoInput!): Info!
+    @query
+    @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
+}
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `method:` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, or `ANY` for an endpoint that never checked its method |
+| `path:` | the route; a `{name}` segment is filled by the required scalar or enum input field of that name |
+| `body:` | where the other fields travel: `NONE` (the query string; the default for `GET`, `DELETE` and `ANY`), `JSON` (the input object; the default for `POST`, `PUT`, `PATCH`) or `FORM` (an `application/x-www-form-urlencoded` body read over the query string, the body winning per field) |
+| `envelope:` | `false` answers a success with the output value itself rather than `{"data": …}`; default `true` |
+
+A path parameter always wins over a field of the same name in the query string
+or the body: it is what the route matched. A failure is the envelope whatever
+`envelope:` says, under the status the error carries (`ApiError::with_status`),
+so a caller reads failures one way. `ANY` reads the same input for every method
+— a `GET` simply has no body — and clients send it as `GET`, or as `POST` with
+`body: FORM`; OpenAPI describes it under that method with `x-rpc-any-method`.
+Two operations may share a path under different methods; `ANY` shares it with
+none.
+
+`@http` does not combine with `@rpc` (both name the route), `@raw` or
+`@subscription` (both already decide how the operation sits on HTTP), or `@mcp`
+(a tool call is the JSON envelope). Fields in a query string or a form body are
+scalars, enums and lists of them; an object travels there as JSON text, as it
+does for a subscription.
 
 Responses carry a `{"data": …}` / `{"errors": […]}` envelope. Errors are
 `{code, message, source}` where `source.pointer` is an RFC 6901 pointer to the
@@ -497,6 +539,7 @@ type PaymentInput =
 | `@query(scope:)` | FIELD | read-only; generates a TanStack query helper; `scope` overrides the `@scopes` default |
 | `@mutation(scope:)` | FIELD | state-changing; generates a mutation helper; `scope` names what a token needs, required under `@scopes` |
 | `@rpc(path:)` | FIELD | override the derived path |
+| `@http(method:, path:, body:, envelope:)` | FIELD | bind the operation to a method, a path with `{parameters}`, a query-string, JSON or form input, and an enveloped or bare success — see [`@http`](#http) |
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
 | `@subscription(scope:)` | FIELD | a stream of events over SSE; the field's type is one event |
 | `@raw(request:, response:, stream:)` | FIELD | a body that is bytes rather than the JSON envelope; `stream: true` hands the request body to the service unread |
@@ -1466,8 +1509,9 @@ seen.
 No GraphQL runtime or resolvers. No `utoipa` or Rust-to-OpenAPI inference —
 OpenAPI comes from the IR. No hand-written OpenAPI. No Node in the compile path.
 No executable decorators or plugin system. No websockets, no schema registry, no
-compatibility checker, no binary protocols, no generic REST/GET mappings, no SDL
-imports.
+compatibility checker, no binary protocols, no SDL imports. `@http` binds one
+operation to a route fixed elsewhere; it is not a REST resource model — no
+content negotiation, no response headers or cookies, no status per success.
 
 ## License
 

@@ -7,11 +7,28 @@ hold the exact migration steps; this file holds the motivation. Releases before
 ## Unreleased
 
 ### Added
+- **`@http`: an operation on the method and path its clients already call.**
+  `@http(method:, path:, body:, envelope:)` mounts an operation on `GET`,
+  `POST`, `PUT`, `PATCH`, `DELETE` or `ANY`, fills `{name}` path segments from
+  input fields, reads the other fields from the query string, a JSON body or a
+  form body over the query string, and answers a success with the bare value
+  when `envelope: false`. Failures keep the envelope. Every target follows: the
+  Rust server and client, the TypeScript client (`RpcClient.http`,
+  `RpcHttpSpec`), and OpenAPI (path and query parameters, form bodies,
+  `x-rpc-any-method`). `tests/http_wire.rs` serves the generated router and
+  calls it with the generated client and by hand.
 - **Every Rust enum lists and spells itself.** Each SDL enum, the `ErrorCode`
   registry included, gets `pub const ALL: &[Self]` (every value, in SDL
   order), `from_name` and `as_str` over its wire names, and derives `Hash`.
 
 ### Changed
+- Decoding an input from a URL moved out of the streaming runtime into its own
+  section, emitted for any API that reads one (a subscription, a raw request or
+  an `@http` operation), so an `@http` API compiles no SSE support and needs no
+  `futures-*` crates. The Rust client's URL helpers moved the same way.
+- `operations::ALL` is sorted by path and then method, and `by_route` finds the
+  row of the method asked for among several on one path; an `ANY` row answers
+  every method.
 - **Breaking:** a consumer's own inherent `ALL`, `from_name` or `as_str` on a
   generated enum, or its own `impl Hash` for one, now collides with the
   generated item and must be deleted.
@@ -21,6 +38,12 @@ hold the exact migration steps; this file holds the motivation. Releases before
 - An `ErrorCode` value named `ALL`, `from_name` or `as_str` is refused.
 
 ### Why
+`@http` exists for replacing a service behind clients that cannot move with it:
+the first consumer is a single sign-on service whose hosts switch one at a time
+by configuration, so the new service must answer the old URLs, methods, form
+bodies and bare JSON byte for byte while its API is still generated from the
+schema.
+
 A project that stores an enum as text, filters a query by it or lists its
 choices on a screen needs the set and the spellings. Only the access enums
 had `as_str`, and no enum had its set, so consumers wrote both by hand beside

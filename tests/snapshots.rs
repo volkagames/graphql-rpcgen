@@ -840,3 +840,97 @@ fn zod_snapshot() -> TestResult {
     assert!(out.contains("inputSchemas[path]?.parse(input)"));
     Ok(())
 }
+
+/// An `@http` operation in the targets nothing compiles: the TypeScript client
+/// and the OpenAPI document. `http_wire` covers the Rust ones on a socket.
+const HTTP_SDL: &str = r#"
+enum ErrorCode { invalid_body internal_error not_found }
+input UserInput { user_id: String! }
+input InfoInput { session_id: String verbose: Boolean }
+type User { id: String! }
+type Info { session_id: String }
+type Users @service {
+  user(input: UserInput!): User!
+    @query @http(method: GET, path: "/api/user/{user_id}", envelope: false) @throws(codes: ["not_found"])
+  info(input: InfoInput!): Info!
+    @query @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
+  drop(input: UserInput!): User!
+    @mutation @http(method: DELETE, path: "/api/user/{user_id}")
+}
+"#;
+
+#[test]
+fn http_typescript_snapshot() -> TestResult {
+    let api = graphql_rpcgen::compile_str(HTTP_SDL)?;
+    let ts = generate_typescript::generate(&api);
+    for expected in [
+        "async http<Output>(",
+        "export interface RpcHttpSpec {",
+        "client.http<User>('/api/user/{user_id}', input, { method: 'GET', pathFields: ['user_id'], body: 'none', envelope: false }, options)",
+        "client.http<Info>('/api/info', input, { method: 'POST', pathFields: [], body: 'form', envelope: false }, options)",
+        "client.http<User>('/api/user/{user_id}', input, { method: 'DELETE', pathFields: ['user_id'], body: 'none', envelope: true }, options)",
+    ] {
+        assert!(ts.contains(expected), "missing `{expected}` in:\n{ts}");
+    }
+    Ok(())
+}
+
+#[test]
+fn http_openapi_snapshot() -> TestResult {
+    let api = graphql_rpcgen::compile_str(HTTP_SDL)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&generate_openapi::generate(&api, &config())?)?;
+
+    let user = doc
+        .pointer("/paths/~1api~1user~1{user_id}/get")
+        .ok_or("GET /api/user/{user_id}")?;
+    assert_eq!(
+        user.pointer("/parameters/0/in"),
+        Some(&serde_json::json!("path")),
+        "{user}"
+    );
+    assert_eq!(
+        user.pointer("/parameters/0/required"),
+        Some(&serde_json::json!(true)),
+        "{user}"
+    );
+    assert!(
+        user.get("requestBody").is_none(),
+        "a GET has no body: {user}"
+    );
+    assert_eq!(
+        user.pointer("/responses/200/content/application~1json/schema"),
+        Some(&serde_json::json!({ "$ref": "#/components/schemas/User" })),
+        "a bare success is the value: {user}"
+    );
+    assert!(
+        user.pointer("/responses/default").is_some(),
+        "the failure envelope: {user}"
+    );
+
+    let drop = doc
+        .pointer("/paths/~1api~1user~1{user_id}/delete")
+        .ok_or("DELETE beside GET on one path")?;
+    assert!(
+        drop.pointer("/responses/200/content/application~1json/schema/oneOf")
+            .is_some(),
+        "an enveloped success keeps the envelope: {drop}"
+    );
+
+    let info = doc
+        .pointer("/paths/~1api~1info/post")
+        .ok_or("ANY described under POST")?;
+    assert_eq!(
+        info.get("x-rpc-any-method"),
+        Some(&serde_json::json!(true)),
+        "{info}"
+    );
+    assert!(
+        info.pointer(
+            "/requestBody/content/application~1x-www-form-urlencoded/schema/properties/session_id"
+        )
+        .is_some(),
+        "{info}"
+    );
+    Ok(())
+}

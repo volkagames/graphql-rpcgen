@@ -1565,3 +1565,212 @@ fn portable_group_forms_compile() -> TestResult {
     compile(r#"input I { s: String! @pattern(value: "^(?:ab)+(?<tail>c)$") }"#)?;
     Ok(())
 }
+
+// --- @http ---------------------------------------------------------------------
+
+/// Each `@http` mistake, by what the message must say about it.
+#[test]
+fn malformed_http_bindings_are_rejected() -> TestResult {
+    let types = r#"
+input I { id: String! name: String note: String }
+input N { id: String }
+type R { id: String! }
+"#;
+    let cases: &[(&str, &str)] = &[
+        (r#"@http(path: "/r")"#, "needs `method:`"),
+        (r#"@http(method: FETCH, path: "/r")"#, "must be one of GET"),
+        (r#"@http(method: GET)"#, "needs `path:`"),
+        (r#"@http(method: GET, path: "r")"#, "must start with `/`"),
+        (
+            r#"@http(method: GET, path: "/r/{Id}")"#,
+            "must start with `/`",
+        ),
+        (
+            r#"@http(method: GET, path: "/r/x{id}")"#,
+            "must start with `/`",
+        ),
+        (
+            r#"@http(method: GET, path: "/r/{id}/{id}")"#,
+            "names `{id}` twice",
+        ),
+        (
+            r#"@http(method: GET, path: "/r", body: FORM)"#,
+            "carries no body",
+        ),
+        (
+            r#"@http(method: DELETE, path: "/r", body: JSON)"#,
+            "carries no body",
+        ),
+        (
+            r#"@http(method: POST, path: "/r", body: NONE)"#,
+            "carries its input in the body",
+        ),
+        (
+            r#"@http(method: ANY, path: "/r", body: JSON)"#,
+            "JSON cannot be one of them",
+        ),
+        (
+            r#"@http(method: GET, path: "/r", body: XML)"#,
+            "must be NONE, JSON or FORM",
+        ),
+        (
+            r#"@http(method: GET, path: "/r", envelope: "no")"#,
+            "must be a boolean",
+        ),
+        (
+            r#"@http(method: GET, path: "/r") @rpc(path: "/r2")"#,
+            "both name the route",
+        ),
+        (
+            r#"@http(method: GET, path: "/r/{missing}")"#,
+            "is not a field of the input",
+        ),
+        (
+            r#"@http(method: GET, path: "/r/{name}")"#,
+            "must be a required scalar or enum",
+        ),
+        (r#"@http(method: GET, path: "/r", verb: GET)"#, "verb"),
+    ];
+    for (directive, expected) in cases {
+        let body =
+            format!("{types}type S @service {{\n  op(input: I!): R! @query {directive}\n}}\n");
+        let e = expect_error(&body)?;
+        assert!(
+            e.contains(expected),
+            "{directive}: expected `{expected}` in: {e}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn http_does_not_combine_with_subscription_raw_or_mcp() -> TestResult {
+    let e = expect_error(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  op(input: I!): R! @subscription @http(method: GET, path: "/r")
+}
+"#,
+    )?;
+    assert!(e.contains("cannot be combined with @subscription"), "{e}");
+
+    let e = expect_error(
+        r#"
+scalar Binary @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+input I { id: String! }
+type S @service {
+  op(input: I!): Binary! @query @raw(response: ["text/csv"]) @http(method: GET, path: "/r")
+}
+"#,
+    )?;
+    assert!(e.contains("cannot be combined with @raw"), "{e}");
+
+    let e = expect_error(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service @mcp {
+  op(input: I!): R! @query @http(method: GET, path: "/r")
+}
+"#,
+    )?;
+    assert!(e.contains("cannot be an MCP tool"), "{e}");
+    Ok(())
+}
+
+#[test]
+fn http_path_parameters_need_an_input() -> TestResult {
+    let e = expect_error(
+        r#"
+type R { id: String! }
+type S @service {
+  op: R! @query @http(method: GET, path: "/r/{id}")
+}
+"#,
+    )?;
+    assert!(e.contains("takes no input"), "{e}");
+    Ok(())
+}
+
+/// A path is shared by operations of different methods; `ANY` shares it with
+/// nothing, and two of one method are the duplicate they always were.
+#[test]
+fn http_paths_are_unique_per_method() -> TestResult {
+    let api = compile(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/r/{id}")
+  drop(input: I!): R! @mutation @http(method: DELETE, path: "/r/{id}")
+}
+"#,
+    )?;
+    let ops = &api.services.first().ok_or("one service")?.operations;
+    assert_eq!(ops.len(), 2);
+
+    for second in [
+        r#"@http(method: GET, path: "/r/{id}")"#,
+        r#"@http(method: ANY, path: "/r/{id}")"#,
+    ] {
+        let e = expect_error(&format!(
+            r#"
+input I {{ id: String! }}
+type R {{ id: String! }}
+type S @service {{
+  get(input: I!): R! @query @http(method: GET, path: "/r/{{id}}")
+  other(input: I!): R! @query {second}
+}}
+"#
+        ))?;
+        assert!(e.contains("duplicate RPC path"), "{second}: {e}");
+    }
+    Ok(())
+}
+
+/// What a well-formed binding compiles to, defaults included.
+#[test]
+fn http_binding_reaches_the_ir() -> TestResult {
+    use graphql_rpcgen::ir::{HttpBody, HttpMethod};
+    let api = compile(
+        r#"
+input I { user_id: String! note: String }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/api/user/{user_id}", envelope: false)
+  put(input: I!): R! @mutation @http(method: PUT, path: "/api/user/{user_id}")
+  any(input: I!): R! @query @http(method: ANY, path: "/api/any", body: FORM)
+}
+"#,
+    )?;
+    let ops = &api.services.first().ok_or("one service")?.operations;
+    let find = |name: &str| {
+        ops.iter()
+            .find(|op| op.name == name)
+            .and_then(|op| op.http.clone())
+    };
+
+    let get = find("get").ok_or("get is @http")?;
+    assert_eq!(
+        (get.method, get.body, get.envelope),
+        (HttpMethod::Get, HttpBody::None, false)
+    );
+    assert_eq!(get.path_params, vec!["user_id".to_string()]);
+
+    let put = find("put").ok_or("put is @http")?;
+    assert_eq!(
+        (put.method, put.body, put.envelope),
+        (HttpMethod::Put, HttpBody::Json, true)
+    );
+
+    let any = find("any").ok_or("any is @http")?;
+    assert_eq!((any.method, any.body), (HttpMethod::Any, HttpBody::Form));
+    let any_op = ops.iter().find(|op| op.name == "any").ok_or("any")?;
+    assert_eq!(
+        (any_op.http_method(), any_op.client_method()),
+        ("ANY", "POST")
+    );
+    Ok(())
+}
