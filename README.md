@@ -287,7 +287,10 @@ type Users @service @auth(require: token) {
 A path parameter always wins over a field of the same name in the query string
 or the body: it is what the route matched. A failure is the envelope whatever
 `envelope:` says, under the status the error carries (`ApiError::with_status`),
-so a caller reads failures one way. `ANY` reads the same input for every method
+so a caller reads failures one way. An input the generated runtime cannot read
+answers `400` — and a body it cannot read at all the status of that refusal,
+`413` for one past the body limit — rather than the `200` the envelope uses
+elsewhere: a caller of a route fixed elsewhere reads the status line. `ANY` reads the same input for every method
 — a `GET` simply has no body — and clients send it as `GET`, or as `POST` with
 `body: FORM`; OpenAPI describes it under that method with `x-rpc-any-method`.
 Two operations may share a path under different methods; `ANY` shares it with

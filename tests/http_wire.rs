@@ -212,6 +212,7 @@ mod wire {
         assert_eq!(json, serde_json::json!({ "id": "u1", "email": "a@b.c", "limit": 3 }));
 
         let response = reqwest::get(format!("{base}/api/user_by_email?email=a%40b.c&limit=lots")).await?;
+        assert_eq!(response.status(), 400, "an input that does not parse says so in the status line");
         let json: serde_json::Value = response.json().await?;
         assert_eq!(json.pointer("/errors/0/code"), Some(&serde_json::json!("invalid_body")), "{json}");
 
@@ -255,6 +256,18 @@ mod wire {
 
         let patched = http.patch(format!("{base}/api/info?session_cookie=c")).send().await?;
         assert_eq!(patched.status(), 200);
+
+        // A form body too large to read is refused with the status of the refusal.
+        let large = format!("session_id={}", "x".repeat(3 * 1024 * 1024));
+        let refused = http
+            .post(format!("{base}/api/info"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(large)
+            .send()
+            .await?;
+        assert_eq!(refused.status(), 413);
+        let json: serde_json::Value = refused.json().await?;
+        assert_eq!(json.pointer("/errors/0/code"), Some(&serde_json::json!("invalid_body")), "{json}");
 
         let info = client(&base)
             .users()

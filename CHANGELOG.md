@@ -12,7 +12,10 @@ hold the exact migration steps; this file holds the motivation. Releases before
   `POST`, `PUT`, `PATCH`, `DELETE` or `ANY`, fills `{name}` path segments from
   input fields, reads the other fields from the query string, a JSON body or a
   form body over the query string, and answers a success with the bare value
-  when `envelope: false`. Failures keep the envelope. Every target follows: the
+  when `envelope: false`. Failures keep the envelope; one the runtime builds
+  (an input that does not parse, a body that cannot be read) answers `400` or
+  the refusal's status, `413` past the body limit, since such a caller reads
+  the status line. Every target follows: the
   Rust server and client, the TypeScript client (`RpcClient.http`,
   `RpcHttpSpec`), and OpenAPI (path and query parameters, form bodies,
   `x-rpc-any-method`). `tests/http_wire.rs` serves the generated router and
