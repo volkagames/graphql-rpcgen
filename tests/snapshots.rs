@@ -934,3 +934,46 @@ fn http_openapi_snapshot() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn explicit_nulls_snapshot() -> TestResult {
+    let api = graphql_rpcgen::compile_str(
+        r#"
+enum ErrorCode { invalid_body internal_error }
+type User @explicitNulls { id: String! nick: String }
+type Plain { id: String! nick: String }
+type Users @service { me: User! @query  plain: Plain! @query }
+"#,
+    )?;
+    let rust = generate_rust::generate(&api, &config())?;
+    let user = rust
+        .split("pub struct User {")
+        .nth(1)
+        .ok_or("struct User")?;
+    let user = user.split('}').next().ok_or("User body")?;
+    assert!(
+        user.contains("#[serde(default)]\n    pub nick: Option<String>"),
+        "{user}"
+    );
+    assert!(!user.contains("skip_serializing_if"), "{user}");
+
+    let ts = generate_typescript::generate(&api);
+    assert!(ts.contains("  nick: string | null\n"), "{ts}");
+    assert!(
+        ts.contains("  nick?: string | null\n"),
+        "Plain keeps the optional key: {ts}"
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&generate_openapi::generate(&api, &config())?)?;
+    assert_eq!(
+        doc.pointer("/components/schemas/User/required"),
+        Some(&serde_json::json!(["id", "nick"])),
+        "{doc}"
+    );
+    assert_eq!(
+        doc.pointer("/components/schemas/Plain/required"),
+        Some(&serde_json::json!(["id"]))
+    );
+    Ok(())
+}

@@ -17,6 +17,9 @@ hold the exact migration steps; this file holds the motivation. Releases before
   `RpcHttpSpec`), and OpenAPI (path and query parameters, form bodies,
   `x-rpc-any-method`). `tests/http_wire.rs` serves the generated router and
   calls it with the generated client and by hand.
+- **`@explicitNulls` on an output type** writes an absent optional value as
+  `null` instead of leaving the key out, for readers of an existing format
+  that expect every key.
 - **Every Rust enum lists and spells itself.** Each SDL enum, the `ErrorCode`
   registry included, gets `pub const ALL: &[Self]` (every value, in SDL
   order), `from_name` and `as_str` over its wire names, and derives `Hash`.

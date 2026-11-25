@@ -82,7 +82,7 @@ fn emit_types(out: &mut String, api: &Api) {
                 emit_doc(out, "", &o.description);
                 let _ = writeln!(out, "export interface {} {{", o.name);
                 for f in &o.fields {
-                    emit_interface_field(out, api, f);
+                    emit_interface_field(out, api, f, o.explicit_nulls);
                 }
                 out.push_str("}\n");
             }
@@ -92,7 +92,7 @@ fn emit_types(out: &mut String, api: &Api) {
                 emit_doc(out, "", &i.description);
                 let _ = writeln!(out, "export interface {} {{", i.name);
                 for f in &i.fields {
-                    emit_interface_field(out, api, f);
+                    emit_interface_field(out, api, f, false);
                 }
                 out.push_str("}\n");
             }
@@ -144,7 +144,7 @@ fn emit_sibling_holder(out: &mut String, api: &Api, o: &ObjectType) {
     } else {
         let _ = writeln!(out, "export type {} = {{", o.name);
         for f in &rest {
-            emit_interface_field(out, api, f);
+            emit_interface_field(out, api, f, o.explicit_nulls);
         }
         out.push_str("} & (\n");
     }
@@ -166,9 +166,15 @@ fn emit_sibling_holder(out: &mut String, api: &Api, o: &ObjectType) {
     }
 }
 
-fn emit_interface_field(out: &mut String, api: &Api, f: &Field) {
+/// One field of an interface. With `explicit_nulls` an absent value arrives as
+/// `null`, so the key is always there and only its value may be null.
+fn emit_interface_field(out: &mut String, api: &Api, f: &Field, explicit_nulls: bool) {
     emit_doc(out, "  ", &f.description);
-    let optional = if f.ty.is_nullable() { "?" } else { "" };
+    let optional = if f.ty.is_nullable() && !explicit_nulls {
+        "?"
+    } else {
+        ""
+    };
     let _ = writeln!(out, "  {}{optional}: {}", f.name, ts_type(api, &f.ty));
 }
 

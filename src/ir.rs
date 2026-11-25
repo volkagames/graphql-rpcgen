@@ -69,6 +69,9 @@ pub struct ObjectType {
     pub name: String,
     pub description: Option<String>,
     pub fields: Vec<Field>,
+    /// From `@explicitNulls`: an absent optional value is written as `null`
+    /// rather than left out, for a format whose readers expect every key.
+    pub explicit_nulls: bool,
 }
 
 #[derive(Debug, Clone)]

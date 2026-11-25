@@ -36,6 +36,7 @@ const DIRECTIVES: &[(&str, &[&str])] = &[
         &["require", "role", "permission", "unguarded", "explicit"],
     ),
     ("mcp", &["expose"]),
+    ("explicitNulls", &[]),
     ("throws", &["codes"]),
     ("length", &["min", "max"]),
     ("range", &["min", "max"]),
@@ -379,9 +380,28 @@ impl<'a> Analyzer<'a> {
                 self.check_directives(
                     file,
                     &t.directives,
-                    &["service", "version", "variant", "auth", "mcp"],
+                    &[
+                        "service",
+                        "version",
+                        "variant",
+                        "auth",
+                        "mcp",
+                        "explicitNulls",
+                    ],
                 );
                 let is_service = find_directive(&t.directives, "service").is_some();
+                let explicit_nulls = find_directive(&t.directives, "explicitNulls").is_some();
+                if is_service && explicit_nulls {
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "type `{}`: @explicitNulls describes how an output type is written; \
+                             a @service has no fields to write",
+                            t.name
+                        ),
+                        file,
+                        t.position,
+                    ));
+                }
 
                 if let Some(d) = find_directive(&t.directives, "variant") {
                     match string_arg(d, "tag") {
@@ -470,6 +490,7 @@ impl<'a> Analyzer<'a> {
                         name: t.name.clone(),
                         description: t.description.clone(),
                         fields,
+                        explicit_nulls,
                     }));
                 }
             }

@@ -35,7 +35,8 @@ input FindInput { email: String! limit: Int }
 input InfoInput { session_id: String session_cookie: String verbose: Boolean }
 input RenameInput { id: UUID! name: String! }
 
-type User { id: String! email: String! limit: Int }
+"Every key present, an absent value as null: the format the clients already read."
+type User @explicitNulls { id: String! email: String! limit: Int }
 type Info { session_id: String verbose: Boolean! }
 type Renamed { id: UUID! name: String! }
 type Me { user_id: String! }
@@ -169,7 +170,7 @@ mod wire {
         let response = reqwest::get(format!("{base}/api/user/u1")).await?;
         assert_eq!(response.status(), 200);
         let json: serde_json::Value = response.json().await?;
-        assert_eq!(json, serde_json::json!({ "id": "u1", "email": "u1@example.com" }), "an absent optional is left out");
+        assert_eq!(json, serde_json::json!({ "id": "u1", "email": "u1@example.com", "limit": null }), "@explicitNulls writes the null");
 
         // A segment needing escapes survives the client's encoding and the router's decoding.
         let user = client(&base)
@@ -311,6 +312,8 @@ mod wire {
         let response = reqwest::Client::new().delete(format!("{base}/api/user/u9")).send().await?;
         let json: serde_json::Value = response.json().await?;
         assert_eq!(json, serde_json::json!({ "user_id": "u9" }));
+        let info: serde_json::Value = reqwest::get(format!("{base}/api/info")).await?.json().await?;
+        assert_eq!(info, serde_json::json!({ "verbose": false }), "without @explicitNulls an absent value is left out");
         let dropped = client(&base)
             .users()
             .drop(&crate::types::UserInput { user_id: "u8".to_string() })

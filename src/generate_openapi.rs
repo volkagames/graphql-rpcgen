@@ -268,7 +268,7 @@ fn http_request(api: &Api, op: &Operation, http: &HttpBinding, operation: &mut M
         HttpBody::Form => {
             // The same fields are read from the query string too, the body
             // winning; the form is what a client sends, so it is what is shown.
-            let schema = object_schema(api, &None, &body_fields);
+            let schema = object_schema(api, &None, &body_fields, false);
             operation.insert(
                 "requestBody".into(),
                 json!({
@@ -456,7 +456,7 @@ fn schemas(api: &Api) -> Map<String, Value> {
             ApiType::Object(o) => {
                 let schema = match api.sibling_tagged(o) {
                     Some(sibling) => sibling_holder_schema(api, o, sibling),
-                    None => object_schema(api, &o.description, &o.fields),
+                    None => object_schema(api, &o.description, &o.fields, o.explicit_nulls),
                 };
                 schemas.insert(o.name.clone(), schema);
             }
@@ -489,7 +489,7 @@ fn schemas(api: &Api) -> Map<String, Value> {
             ApiType::InputObject(i) => {
                 schemas.insert(
                     i.name.clone(),
-                    object_schema(api, &i.description, &i.fields),
+                    object_schema(api, &i.description, &i.fields, false),
                 );
             }
             ApiType::Union(u) => {
@@ -617,13 +617,20 @@ fn non_null(ty: &TypeRef) -> TypeRef {
     }
 }
 
-fn object_schema(api: &Api, description: &Option<String>, fields: &[Field]) -> Value {
+/// An object's schema. With `explicit_nulls` every key is present — an absent
+/// value is written as `null` — so every field is required, nullable or not.
+fn object_schema(
+    api: &Api,
+    description: &Option<String>,
+    fields: &[Field],
+    explicit_nulls: bool,
+) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
 
     for f in fields {
         properties.insert(f.name.clone(), field_schema(api, f));
-        if !f.ty.is_nullable() {
+        if explicit_nulls || !f.ty.is_nullable() {
             required.push(f.name.clone());
         }
     }
@@ -701,7 +708,7 @@ fn sibling_holder_schema(
         true => schema.insert("oneOf".into(), Value::Array(branches)),
         false => schema.insert(
             "allOf".into(),
-            json!([object_schema(api, &None, &rest), { "oneOf": branches }]),
+            json!([object_schema(api, &None, &rest, o.explicit_nulls), { "oneOf": branches }]),
         ),
     };
     Value::Object(schema)

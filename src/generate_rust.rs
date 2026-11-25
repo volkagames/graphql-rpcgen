@@ -1146,7 +1146,13 @@ fn emit_field_body(out: &mut String, api: &Api, owner: &str, f: &Field) {
     if rust_name != f.name {
         let _ = writeln!(out, "    #[serde(rename = {:?})]", f.name);
     }
-    if f.ty.is_nullable() {
+    let explicit_nulls =
+        matches!(api.find_type(owner), Some(ApiType::Object(o)) if o.explicit_nulls);
+    if f.ty.is_nullable() && explicit_nulls {
+        // `@explicitNulls`: None is written as `null`, and read from `null` or
+        // from an absent key alike.
+        out.push_str("    #[serde(default)]\n");
+    } else if f.ty.is_nullable() {
         // Absent and null are treated alike, and None is omitted on the wire
         // so optional fields do not appear as explicit nulls.
         out.push_str("    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n");

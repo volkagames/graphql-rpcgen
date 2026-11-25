@@ -293,6 +293,11 @@ so a caller reads failures one way. `ANY` reads the same input for every method
 Two operations may share a path under different methods; `ANY` shares it with
 none.
 
+An existing format often writes every key, an absent value as `null`, where
+this generator leaves the key out; `@explicitNulls` on an output type keeps
+that: Rust drops `skip_serializing_if`, TypeScript makes the key required with
+a `| null` value, and OpenAPI lists every field as required.
+
 `@http` does not combine with `@rpc` (both name the route), `@raw` or
 `@subscription` (both already decide how the operation sits on HTTP), or `@mcp`
 (a tool call is the JSON envelope). Fields in a query string or a form body are
@@ -539,6 +544,7 @@ type PaymentInput =
 | `@query(scope:)` | FIELD | read-only; generates a TanStack query helper; `scope` overrides the `@scopes` default |
 | `@mutation(scope:)` | FIELD | state-changing; generates a mutation helper; `scope` names what a token needs, required under `@scopes` |
 | `@rpc(path:)` | FIELD | override the derived path |
+| `@explicitNulls` | OBJECT | an absent optional value of this output type is written as `null` instead of being left out |
 | `@http(method:, path:, body:, envelope:)` | FIELD | bind the operation to a method, a path with `{parameters}`, a query-string, JSON or form input, and an enveloped or bare success — see [`@http`](#http) |
 | `@version(n:)` | OBJECT/FIELD | mount under a `/v{n}` prefix |
 | `@subscription(scope:)` | FIELD | a stream of events over SSE; the field's type is one event |

@@ -1774,3 +1774,23 @@ type S @service {
     );
     Ok(())
 }
+
+#[test]
+fn explicit_nulls_is_for_output_types() -> TestResult {
+    let e = expect_error(
+        r#"
+type R { id: String! }
+type S @service @explicitNulls { op: R! @query }
+"#,
+    )?;
+    assert!(e.contains("a @service has no fields to write"), "{e}");
+    let e = expect_error(
+        r#"
+input I @explicitNulls { id: String }
+type R { id: String! }
+type S @service { op(input: I!): R! @query }
+"#,
+    )?;
+    assert!(e.contains("explicitNulls"), "{e}");
+    Ok(())
+}
