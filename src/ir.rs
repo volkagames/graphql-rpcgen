@@ -262,6 +262,93 @@ impl AuthRequirement {
     }
 }
 
+/// The HTTP method an `@http` operation answers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    /// Every method, as an existing endpoint that never checked its method
+    /// does. The request is read the same way whatever it is: the query string
+    /// always, and the body as `body:` says when the request carries one.
+    Any,
+}
+
+impl HttpMethod {
+    /// The SDL spelling, which is also HTTP's.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Any => "ANY",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "GET" => Some(Self::Get),
+            "POST" => Some(Self::Post),
+            "PUT" => Some(Self::Put),
+            "PATCH" => Some(Self::Patch),
+            "DELETE" => Some(Self::Delete),
+            "ANY" => Some(Self::Any),
+            _ => None,
+        }
+    }
+
+    /// Whether a request of this method carries a body by convention. `ANY`
+    /// may or may not, so it does not count: its body is optional.
+    pub fn sends_body(self) -> bool {
+        matches!(self, Self::Post | Self::Put | Self::Patch)
+    }
+}
+
+/// Where an `@http` operation's input fields, other than its path parameters,
+/// are read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpBody {
+    /// No body: every field is a query-string parameter.
+    None,
+    /// The input object as a JSON body, the way every other operation sends it.
+    Json,
+    /// An `application/x-www-form-urlencoded` body, read together with the
+    /// query string; a field present in both takes the body's value.
+    Form,
+}
+
+impl HttpBody {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Json => "JSON",
+            Self::Form => "FORM",
+        }
+    }
+}
+
+/// How an `@http` operation sits on HTTP, replacing the derived `POST` route
+/// with the JSON envelope.
+///
+/// For an endpoint whose wire format was fixed before its schema was written:
+/// a method other than `POST`, parameters in the path, a form body, a bare
+/// JSON answer. Errors keep the envelope, so a caller reads failures the same
+/// way from every operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpBinding {
+    pub method: HttpMethod,
+    /// Input fields named by `{name}` segments of the path, in path order.
+    pub path_params: Vec<String>,
+    pub body: HttpBody,
+    /// Whether a success is the `{"data": ...}` envelope (`true`) or the output
+    /// value itself as the JSON body (`false`).
+    pub envelope: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
     Query,
@@ -338,6 +425,9 @@ pub struct Operation {
     /// permission that states none: its permission check is then what judges
     /// the credential.
     pub scope: Option<String>,
+    /// The HTTP binding from `@http`; `None` for the derived `POST` route with
+    /// the JSON envelope.
+    pub http: Option<HttpBinding>,
 }
 
 impl Operation {
@@ -365,13 +455,43 @@ impl Operation {
         self.kind == OperationKind::Subscription || self.raw_request.is_some()
     }
 
+    /// Whether a success is answered with the `{"data": ...}` envelope.
+    ///
+    /// Every operation but an `@http(envelope: false)` one; a raw response is
+    /// not JSON at all and a subscription is a stream, so neither asks.
+    pub fn enveloped(&self) -> bool {
+        self.http.as_ref().is_none_or(|http| http.envelope)
+    }
+
     /// The HTTP method the router mounts the operation under, upper-case as
     /// HTTP spells it: `GET` for a subscription, which an `EventSource` opens
     /// and can only GET, `POST` for everything else.
+    ///
+    /// An `@http` operation answers to the method it names; `ANY` is spelled
+    /// that way here, and each target decides what it makes of it.
     pub fn http_method(&self) -> &'static str {
+        if let Some(http) = &self.http {
+            return http.method.as_str();
+        }
         match self.kind {
             OperationKind::Subscription => "GET",
             OperationKind::Query | OperationKind::Mutation => "POST",
+        }
+    }
+
+    /// The method a client sends an `ANY` operation with, and the one OpenAPI
+    /// describes it under: `POST` when it reads a body, `GET` otherwise.
+    pub fn client_method(&self) -> &'static str {
+        match &self.http {
+            Some(HttpBinding {
+                method: HttpMethod::Any,
+                body,
+                ..
+            }) => match body {
+                HttpBody::None => "GET",
+                HttpBody::Json | HttpBody::Form => "POST",
+            },
+            _ => self.http_method(),
         }
     }
 }

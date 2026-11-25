@@ -29,6 +29,7 @@ const DIRECTIVES: &[(&str, &[&str])] = &[
     ("subscription", &["scope"]),
     ("raw", &["request", "response", "stream"]),
     ("rpc", &["path"]),
+    ("http", &["method", "path", "body", "envelope"]),
     ("version", &["n"]),
     (
         "auth",
@@ -284,6 +285,7 @@ impl<'a> Analyzer<'a> {
         self.check_input_output_separation(&api);
         self.check_constraints(&api);
         self.check_raw_bodies(&api);
+        self.check_http_bindings(&api);
         self.check_union_discriminators(&api);
         self.check_operation_access(&api);
 
@@ -898,6 +900,7 @@ impl<'a> Analyzer<'a> {
                 "subscription",
                 "raw",
                 "rpc",
+                "http",
                 "version",
                 "throws",
                 "auth",
@@ -945,6 +948,28 @@ impl<'a> Analyzer<'a> {
         let (raw_request, raw_response, raw_request_stream) = self
             .raw_bodies(file, service, field, kind)
             .unwrap_or_default();
+
+        let http = match find_directive(&field.directives, "http") {
+            Some(d) => {
+                let binding = self.http_binding(file, service, field, d, kind);
+                // A malformed binding is reported; the operation is dropped
+                // rather than mounted on a route nobody declared.
+                Some(binding?)
+            }
+            None => None,
+        };
+        if http.is_some() && (raw_request.is_some() || raw_response.is_some()) {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: @http cannot be combined with @raw; a raw body already \
+                     decides how the operation sits on HTTP",
+                    field.name
+                ),
+                file,
+                field.position,
+            ));
+            return None;
+        }
 
         // The scope as written; defaults and the rules about where one applies
         // are resolved once every file is read, since the `@scopes` enum may be
@@ -1006,6 +1031,18 @@ impl<'a> Analyzer<'a> {
             ));
             return None;
         }
+        if mcp && http.is_some() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: an @http operation cannot be an MCP tool, whose call is \
+                     the JSON envelope; exclude it with @mcp(expose: false)",
+                    field.name
+                ),
+                file,
+                field.position,
+            ));
+            return None;
+        }
         if mcp && (raw_request.is_some() || raw_response.is_some()) {
             self.errors.push(CompileError::at(
                 format!(
@@ -1043,8 +1080,28 @@ impl<'a> Analyzer<'a> {
             .map(|arg| self.convert_type(&arg.value_type));
         let output = self.convert_type(&field.field_type);
 
-        let path = match find_directive(&field.directives, "rpc") {
-            Some(d) => match string_arg(d, "path") {
+        let rpc = find_directive(&field.directives, "rpc");
+        let http_path = match (&http, rpc) {
+            (Some(_), Some(_)) => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{service}.{}`: @http(path:) and @rpc(path:) both name the route; \
+                         keep @http",
+                        field.name
+                    ),
+                    file,
+                    field.position,
+                ));
+                return None;
+            }
+            (Some(_), None) => {
+                find_directive(&field.directives, "http").and_then(|d| string_arg(d, "path"))
+            }
+            (None, _) => None,
+        };
+        let path = match (http_path, rpc) {
+            (Some(path), _) => path,
+            (None, Some(d)) => match string_arg(d, "path") {
                 Some(p) if is_route(&p) => p,
                 Some(p) => {
                     self.errors.push(CompileError::at(
@@ -1070,7 +1127,7 @@ impl<'a> Analyzer<'a> {
                     return None;
                 }
             },
-            None => format!(
+            (None, None) => format!(
                 "/rpc/{}/{}",
                 service.to_lowercase(),
                 field.name.to_lowercase()
@@ -1128,6 +1185,143 @@ impl<'a> Analyzer<'a> {
             access,
             mcp,
             scope,
+            http,
+        })
+    }
+
+    /// Read `@http`: the method, the path and its `{parameters}`, where the
+    /// other fields come from, and whether a success keeps the envelope.
+    ///
+    /// Only what the directive says on its own is checked here; whether the
+    /// parameters name input fields that can travel that way needs the input
+    /// type, which may be declared in a later file — see
+    /// [`Self::check_http_bindings`].
+    fn http_binding(
+        &mut self,
+        file: &Path,
+        service: &str,
+        field: &GqlField<'static, String>,
+        d: &Directive<'static, String>,
+        kind: OperationKind,
+    ) -> Option<HttpBinding> {
+        let op = format!("`{service}.{}`", field.name);
+        let fail = |this: &mut Self, message: String| {
+            this.errors.push(CompileError::at(
+                format!("{op}: {message}"),
+                file,
+                field.position,
+            ));
+            None
+        };
+
+        if kind == OperationKind::Subscription {
+            return fail(
+                self,
+                "@http cannot be combined with @subscription, which is always \
+                               a GET answered with Server-Sent Events"
+                    .to_string(),
+            );
+        }
+
+        let method = match enum_arg(d, "method") {
+            Some(name) => match HttpMethod::from_name(&name) {
+                Some(method) => method,
+                None => {
+                    return fail(
+                        self,
+                        format!("@http(method:) must be one of GET, POST, PUT, PATCH, DELETE or ANY, got `{name}`"),
+                    );
+                }
+            },
+            None => {
+                return fail(
+                    self,
+                    "@http needs `method:`, one of GET, POST, PUT, PATCH, DELETE or ANY"
+                        .to_string(),
+                )
+            }
+        };
+
+        let Some(path) = string_arg(d, "path") else {
+            return fail(
+                self,
+                "@http needs `path:`, a string starting with `/`".to_string(),
+            );
+        };
+        let Some(path_params) = path_parameters(&path) else {
+            return fail(
+                self,
+                format!(
+                    "@http(path:) must start with `/` and use only unreserved URL characters, \
+                     with `{{name}}` filling a whole segment, got `{path}`"
+                ),
+            );
+        };
+        let mut seen = BTreeSet::new();
+        if let Some(twice) = path_params.iter().find(|p| !seen.insert(p.as_str())) {
+            return fail(self, format!("@http(path:) names `{{{twice}}}` twice"));
+        }
+
+        let declared_body = d.arguments.iter().any(|(n, _)| n == "body");
+        let body = match enum_arg(d, "body").as_deref() {
+            Some("NONE") => HttpBody::None,
+            Some("JSON") => HttpBody::Json,
+            Some("FORM") => HttpBody::Form,
+            Some(other) => {
+                return fail(
+                    self,
+                    format!("@http(body:) must be NONE, JSON or FORM, got `{other}`"),
+                )
+            }
+            None if declared_body => {
+                return fail(self, "@http(body:) must be NONE, JSON or FORM".to_string())
+            }
+            None if method.sends_body() => HttpBody::Json,
+            None => HttpBody::None,
+        };
+        match (method, body) {
+            (HttpMethod::Get | HttpMethod::Delete, HttpBody::Json | HttpBody::Form) => {
+                return fail(
+                    self,
+                    format!(
+                        "a {} carries no body, so @http(body:) can only be NONE",
+                        method.as_str()
+                    ),
+                );
+            }
+            (HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch, HttpBody::None) => {
+                return fail(
+                    self,
+                    format!(
+                        "a {} carries its input in the body: @http(body:) is JSON or FORM",
+                        method.as_str()
+                    ),
+                );
+            }
+            // A GET reaching an `ANY` operation has no body, so its input must
+            // fit the query string; a JSON body could not be read back from one.
+            (HttpMethod::Any, HttpBody::Json) => {
+                return fail(
+                    self,
+                    "@http(method: ANY) also answers GET, which has no body: its input comes from \
+                     the query string and, with body: FORM, a form body; JSON cannot be one of them"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        let envelope = match bool_arg(d, "envelope") {
+            Some(envelope) => envelope,
+            None if d.arguments.iter().all(|(n, _)| n != "envelope") => true,
+            None => return fail(self, "@http(envelope:) must be a boolean".to_string()),
+        };
+
+        Some(HttpBinding {
+            method,
+            path_params,
+            body,
+            envelope,
         })
     }
 
@@ -1605,6 +1799,67 @@ impl<'a> Analyzer<'a> {
                          binary field `{}`",
                         bodies[0]
                     )));
+                }
+            }
+        }
+    }
+
+    /// Keep an `@http` binding's parameters in step with the input type.
+    ///
+    /// A path parameter fills one segment, so it names a required scalar or
+    /// enum field of the input. Fields read from a query string or a form body
+    /// have no nesting, so an object travels as JSON text there, the way a
+    /// subscription's input already does; a binary value has no place at all,
+    /// since `@raw` is what describes a body of bytes.
+    fn check_http_bindings(&mut self, api: &Api) {
+        for service in &api.services {
+            for op in &service.operations {
+                let Some(http) = &op.http else { continue };
+                let name = format!("`{}.{}`", service.name, op.name);
+                let fields = api.input_fields(op);
+
+                if op.input.is_none() && !http.path_params.is_empty() {
+                    self.errors.push(CompileError::new(format!(
+                        "{name}: @http(path:) names `{{{}}}`, but the operation takes no input",
+                        http.path_params.join("}`, `{")
+                    )));
+                    continue;
+                }
+
+                for param in &http.path_params {
+                    let Some(field) = fields.iter().find(|f| &f.name == param) else {
+                        self.errors.push(CompileError::new(format!(
+                            "{name}: @http(path:) names `{{{param}}}`, which is not a field of the input"
+                        )));
+                        continue;
+                    };
+                    let scalar_or_enum = matches!(
+                        api.find_type(field.ty.base_name()),
+                        Some(ApiType::Scalar(_) | ApiType::Enum(_))
+                    );
+                    let one_value = matches!(
+                        field.ty,
+                        TypeRef::Named {
+                            nullable: false,
+                            ..
+                        }
+                    );
+                    if !scalar_or_enum || !one_value {
+                        self.errors.push(CompileError::new(format!(
+                            "{name}: path parameter `{param}` must be a required scalar or enum \
+                             field, since it fills one path segment"
+                        )));
+                    }
+                }
+
+                for field in fields {
+                    if api.is_binary(field.ty.base_name()) {
+                        self.errors.push(CompileError::new(format!(
+                            "{name}: input field `{}` is a binary scalar, which only a @raw \
+                             operation carries",
+                            field.name
+                        )));
+                    }
                 }
             }
         }
@@ -2762,16 +3017,25 @@ impl<'a> Analyzer<'a> {
     }
 
     fn check_paths(&mut self, api: &Api) {
-        let mut seen: BTreeMap<&str, String> = BTreeMap::new();
+        // One path may carry several operations as long as their methods differ:
+        // `GET /items/{id}` beside `DELETE /items/{id}`. `ANY` takes every
+        // method, so it shares its path with nothing.
+        let mut seen: BTreeMap<&str, Vec<(&'static str, String)>> = BTreeMap::new();
         for s in &api.services {
             for op in &s.operations {
                 let owner = format!("{}.{}", s.name, op.name);
-                if let Some(prev) = seen.insert(&op.path, owner.clone()) {
+                let method = op.http_method();
+                let taken = seen.entry(&op.path).or_default();
+                let clash = taken
+                    .iter()
+                    .find(|(other, _)| *other == method || *other == "ANY" || method == "ANY");
+                if let Some((_, prev)) = clash {
                     self.errors.push(CompileError::new(format!(
                         "duplicate RPC path `{}`: used by `{prev}` and `{owner}`",
                         op.path
                     )));
                 }
+                taken.push((method, owner));
             }
         }
     }
@@ -3188,6 +3452,35 @@ fn is_route(path: &str) -> bool {
         && path
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_' | '~'))
+}
+
+/// The `{name}` parameters of an `@http` path, in order, or `None` when the
+/// path is not one: it must start with `/`, a parameter must fill a whole
+/// segment and be a snake_case name, and the rest is held to [`is_route`].
+fn path_parameters(path: &str) -> Option<Vec<String>> {
+    let rest = path.strip_prefix('/')?;
+    let mut params = Vec::new();
+    for segment in rest.split('/') {
+        let name = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
+        match name {
+            Some(name) => {
+                let valid = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if !valid {
+                    return None;
+                }
+                params.push(name.to_string());
+            }
+            None => {
+                if !is_route(&format!("/{segment}")) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(params)
 }
 
 fn describe_args(args: &[InputValue<'static, String>]) -> String {

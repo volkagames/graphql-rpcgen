@@ -1,0 +1,96 @@
+// --- @http operations --------------------------------------------------------
+//
+// Emitted only for an API with an `@http` operation.
+
+/// Where an `@http` operation reads the fields its path does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpBodyKind {
+    /// The query string only.
+    None,
+    /// The input object as a JSON body.
+    Json,
+    /// The query string and an `application/x-www-form-urlencoded` body over
+    /// it: a field present in both takes the body's value.
+    Form,
+}
+
+/// Read an `@http` operation's input from its request.
+///
+/// The path parameters win over everything else: they are what the route
+/// matched, so a body or a query string naming the same field cannot point the
+/// operation somewhere else. A form body that is not declared as one is not
+/// read, which is how a form extractor behaves too: an endpoint answering
+/// several methods gets a GET's empty body as often as a POST's form.
+async fn http_input<T: serde::de::DeserializeOwned>(
+    request: axum::extract::Request,
+    fields: &[QueryField],
+    path_fields: &[&str],
+    body: HttpBodyKind,
+) -> Result<T, Response> {
+    let (mut parts, request_body) = request.into_parts();
+    let params = <axum::extract::RawPathParams as axum::extract::FromRequestParts<()>>::from_request_parts(
+        &mut parts,
+        &(),
+    )
+    .await;
+    let params = match params {
+        Ok(params) => params,
+        Err(rejection) => return Err(invalid_query(&rejection.body_text(), None)),
+    };
+    let path_pairs: Vec<(String, String)> = params
+        .iter()
+        .filter(|(key, _)| path_fields.contains(key))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+    if body == HttpBodyKind::Json {
+        let request = axum::extract::Request::from_parts(parts, request_body);
+        let read = <ApiJson<serde_json::Map<String, serde_json::Value>> as axum::extract::FromRequest<()>>::from_request(
+            request,
+            &(),
+        )
+        .await;
+        let mut object = match read {
+            Ok(ApiJson(object)) => object,
+            Err(response) => return Err(response),
+        };
+        for (key, raw) in &path_pairs {
+            let field = fields.iter().find(|field| field.name == key.as_str());
+            let value = match field {
+                Some(field) => query_value(field, raw)?,
+                None => serde_json::Value::String(raw.clone()),
+            };
+            object.insert(key.clone(), value);
+        }
+        return serde_json::from_value(serde_json::Value::Object(object))
+            .map_err(|e| invalid_query(&e.to_string(), None));
+    }
+
+    let mut pairs = url_pairs(parts.uri.query());
+    let is_form = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
+    if body == HttpBodyKind::Form && is_form {
+        let request = axum::extract::Request::from_parts(parts, request_body);
+        let read = <axum::body::Bytes as axum::extract::FromRequest<()>>::from_request(request, &()).await;
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(rejection) => return Err(invalid_query(&rejection.body_text(), None)),
+        };
+        let form = url_pairs(std::str::from_utf8(&bytes).ok());
+        override_pairs(&mut pairs, form);
+    }
+    override_pairs(&mut pairs, path_pairs);
+    input_from_pairs(&pairs, fields)
+}
+
+/// Replace every pair whose key `newer` names with `newer`'s pairs for it.
+///
+/// Per key rather than per pair, so a list field repeated in the body replaces
+/// the query string's list as a whole instead of being merged into it.
+fn override_pairs(pairs: &mut Vec<(String, String)>, newer: Vec<(String, String)>) {
+    pairs.retain(|(key, _)| !newer.iter().any(|(new_key, _)| new_key == key));
+    pairs.extend(newer);
+}

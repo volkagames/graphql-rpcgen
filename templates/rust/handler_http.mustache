@@ -1,0 +1,17 @@
+
+async fn {{{handler}}}<S: {{{trait_name}}}>(
+    State(service): State<S>,
+    {{{context_extractor}}}request: axum::extract::Request,
+) -> Response {
+{{{access_guard}}}    let input: {{{input}}} = match http_input(request, &{{{query_fields}}}, &{{{path_fields}}}, HttpBodyKind::{{{http_body}}}).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    if let Err(violations) = validator::Validate::validate(&input) {
+        return invalid_input(&violations);
+    }
+    match service.{{{method}}}({{{context_arg}}}input).await {
+        Ok(response) => {{{respond}}},
+        Err(error) => error.into_response(),
+    }
+}

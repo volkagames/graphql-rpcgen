@@ -80,6 +80,19 @@ const DEFAULT_HANDLER_RAW_REQUEST_STREAM: &str =
 /// `RawRequest`, emitted only for an API with a streamed request: it is the one
 /// piece of the runtime that needs `futures-util`'s `io` feature.
 const DEFAULT_STREAM_RUNTIME: &str = include_str!("../templates/rust/stream_runtime.mustache");
+/// Decoding an input out of a query string, a form body or a path: shared by
+/// subscriptions, raw requests and `@http` operations, which is why it is not
+/// part of the streaming runtime.
+const DEFAULT_QUERY_RUNTIME: &str = include_str!("../templates/rust/query_runtime.mustache");
+/// Reading an `@http` operation's input from its request.
+const DEFAULT_HTTP_RUNTIME: &str = include_str!("../templates/rust/http_runtime.mustache");
+/// An `@http` operation: its input from the path, the query string and the body
+/// its binding names, its success enveloped or bare.
+const DEFAULT_HANDLER_HTTP: &str = include_str!("../templates/rust/handler_http.mustache");
+/// An `@http` operation with no input reads nothing from the request at all,
+/// since a GET reaching it has no body to check.
+const DEFAULT_HANDLER_HTTP_NO_INPUT: &str =
+    include_str!("../templates/rust/handler_http_no_input.mustache");
 
 /// Variables the preamble template may reference, besides `template_vars`.
 ///
@@ -90,7 +103,7 @@ const PREAMBLE_VARS: [&str; 3] = ["error_code_enum", "invalid_body_code", "types
 ///
 /// The no-input form sees the same set; `input` is simply empty there, so a
 /// project overriding one template can use the same variable names in both.
-const HANDLER_VARS: [&str; 11] = [
+const HANDLER_VARS: [&str; 14] = [
     "handler",
     "trait_name",
     "input",
@@ -106,6 +119,13 @@ const HANDLER_VARS: [&str; 11] = [
     // set of variables serves every form rather than doubling the templates.
     "context_extractor",
     "context_arg",
+    // An `@http` operation's path parameters as a `[&str; N]` literal, the
+    // `HttpBodyKind` variant its other fields are read with, and the
+    // expression turning the service's success into the response. Empty for
+    // every other form.
+    "path_fields",
+    "http_body",
+    "respond",
     // The access gate — a role or a permission — run before the service is
     // called so a denial never reaches the method.
     "access_guard",
@@ -120,6 +140,10 @@ const RUNTIME_VARS: [&str; 2] = ["invalid_body_code", "internal_error_code"];
 const CONTEXT_RUNTIME_VARS: [&str; 2] = ["require_role", "require_permission"];
 /// Nor does the stream runtime.
 const STREAM_RUNTIME_VARS: [&str; 0] = [];
+/// The query runtime answers a bad parameter with the registry's body code.
+const QUERY_RUNTIME_VARS: [&str; 1] = ["invalid_body_code"];
+/// Nor does the `@http` runtime.
+const HTTP_RUNTIME_VARS: [&str; 0] = [];
 /// Variables the router template may reference, besides `template_vars`.
 const ROUTER_VARS: [&str; 4] = ["service", "module", "trait_name", "routes"];
 
@@ -133,6 +157,12 @@ struct Templates {
     context_runtime: Template,
     /// `RawRequest`, rendered only for an API with a streamed request body.
     stream_runtime: Template,
+    /// Inputs read from a URL or a form, rendered only when something needs it.
+    query_runtime: Template,
+    /// `@http` input reading, rendered only for an API with an `@http` operation.
+    http_runtime: Template,
+    handler_http: Template,
+    handler_http_no_input: Template,
     handler: Template,
     /// Handler form for an operation declaring no `input` argument.
     handler_no_input: Template,
@@ -208,6 +238,30 @@ impl Templates {
                 "<builtin stream runtime>",
                 &None,
                 &STREAM_RUNTIME_VARS,
+            )?,
+            query_runtime: compile(
+                DEFAULT_QUERY_RUNTIME,
+                "<builtin query runtime>",
+                &None,
+                &QUERY_RUNTIME_VARS,
+            )?,
+            http_runtime: compile(
+                DEFAULT_HTTP_RUNTIME,
+                "<builtin http runtime>",
+                &None,
+                &HTTP_RUNTIME_VARS,
+            )?,
+            handler_http: compile(
+                DEFAULT_HANDLER_HTTP,
+                "<builtin http handler>",
+                &None,
+                &HANDLER_VARS,
+            )?,
+            handler_http_no_input: compile(
+                DEFAULT_HANDLER_HTTP_NO_INPUT,
+                "<builtin no-input http handler>",
+                &None,
+                &HANDLER_VARS,
             )?,
             handler_subscription: compile(
                 DEFAULT_HANDLER_SUBSCRIPTION,
@@ -294,6 +348,21 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
             &glob_import(config.rust.types_path.as_deref()),
         ),
     ]))?);
+
+    let operations = || api.services.iter().flat_map(|service| &service.operations);
+
+    // Reading an input out of a URL is shared by every form that does it, so it
+    // is emitted once, before the runtimes that call it.
+    if operations().any(|op| needs_runtime(op) || op.http.is_some()) {
+        out.push_str(
+            &templates
+                .query_runtime
+                .render(&templates.vars(&[("invalid_body_code", &invalid_body_code())]))?,
+        );
+    }
+    if operations().any(|op| op.http.is_some()) {
+        out.push_str(&templates.http_runtime.render(&templates.vars(&[]))?);
+    }
 
     // Streaming and raw bodies bring their own imports and helpers, so they are
     // emitted only for an API that has an operation needing them.
@@ -702,12 +771,17 @@ fn emit_operations_module(out: &mut String, api: &Api) {
     }
     out.push_str(
         "    }\n\n    \
-         /// Every operation, sorted by `path`, which no two operations share.\n    \
+         /// Every operation, sorted by `path` and then `method`: two operations share\n    \
+         /// a path only under different methods.\n    \
          pub const ALL: &[Operation] = &[\n",
     );
 
     let mut ops: Vec<&Operation> = api.services.iter().flat_map(|s| &s.operations).collect();
-    ops.sort_by(|a, b| a.path.cmp(&b.path));
+    ops.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.http_method().cmp(b.http_method()))
+    });
     let some = |ty: Option<&str>, name: Option<&String>| match (ty, name) {
         (Some(ty), Some(name)) => format!("Some(super::{ty}::{})", pascal_case(name)),
         _ => "None".to_string(),
@@ -751,10 +825,14 @@ fn emit_operations_module(out: &mut String, api: &Api) {
          /// The operation the router mounts at `method path`; `None` for a route it\n    \
          /// does not, so a caller that refuses on `None` fails closed. `method` is\n    \
          /// matched as spelled: `HEAD`, which a router may answer for a `GET` route,\n    \
-         /// is no row, and is refused rather than read as the `GET`.\n    \
+         /// is no row, and is refused rather than read as the `GET`. An `ANY` row\n    \
+         /// answers every method, as its route does.\n    \
          pub fn by_route(method: &str, path: &str) -> Option<&'static Operation> {\n        \
-         let found = ALL.binary_search_by(|op| op.path.cmp(path)).ok()?;\n        \
-         ALL.get(found).filter(|op| op.method == method)\n    }\n\n    \
+         let start = ALL.partition_point(|op| op.path < path);\n        \
+         ALL.get(start..)?\n            \
+         .iter()\n            \
+         .take_while(|op| op.path == path)\n            \
+         .find(|op| op.method == method || op.method == \"ANY\")\n    }\n\n    \
          /// The operation whose `operationId` is `id`; `None` for an id the API lacks,\n    \
          /// so a misspelt one never reads as an operation that needs nothing.\n    \
          pub fn by_id(id: &str) -> Option<&'static Operation> {\n        \
@@ -1381,8 +1459,14 @@ fn emit_service(
     let mut routes = String::new();
     for op in &service.operations {
         // axum's routing function is the method's lower-case name, and the
-        // method is the one `operations` and OpenAPI also read.
+        // method is the one `operations` and OpenAPI also read. An `@http`
+        // operation names its function in full: the preamble imports only the
+        // `post` every other operation uses, and `any` covers `ANY`.
         let verb = op.http_method().to_ascii_lowercase();
+        let verb = match op.http {
+            Some(_) => format!("axum::routing::{verb}"),
+            None => verb,
+        };
         let _ = writeln!(
             routes,
             "        .route(\"{}\", {verb}({module}_{}::<S>))",
@@ -1430,6 +1514,22 @@ fn emit_service(
             ("body_field", &body_field),
             ("context_extractor", &context_extractor(op)),
             ("context_arg", &context_arg),
+            ("path_fields", &path_fields_literal(op)),
+            (
+                "http_body",
+                match op.http.as_ref().map(|http| http.body) {
+                    Some(HttpBody::Json) => "Json",
+                    Some(HttpBody::Form) => "Form",
+                    Some(HttpBody::None) | None => "None",
+                },
+            ),
+            (
+                "respond",
+                match op.enveloped() {
+                    true => "response.into_response()",
+                    false => "axum::Json(response).into_response()",
+                },
+            ),
             ("access_guard", &access_guard(api, op)?),
         ]))?);
     }
@@ -1463,6 +1563,11 @@ fn success_type(api: &Api, op: &Operation) -> String {
         // The output type is one event, not the stream, so the stream is named
         // here rather than in the SDL.
         return format!("EventStream<{}>", rust_type(api, &op.output));
+    }
+    if !op.enveloped() {
+        // `@http(envelope: false)`: the value is the body, so the service
+        // returns the value itself and the handler writes it as JSON.
+        return rust_type(api, &op.output);
     }
     if op.raw_response.is_some() {
         // The declared type is the binary scalar, which says the body is bytes
@@ -1612,6 +1717,12 @@ fn require_permission_method(api: &Api) -> String {
 /// The handler form for one operation: where its input comes from, and what
 /// its answer is.
 fn handler_template<'a>(templates: &'a Templates, op: &Operation) -> &'a Template {
+    if op.http.is_some() {
+        return match op.input {
+            Some(_) => &templates.handler_http,
+            None => &templates.handler_http_no_input,
+        };
+    }
     if op.raw_request_stream {
         return &templates.handler_raw_request_stream;
     }
@@ -1638,6 +1749,18 @@ fn handler_template<'a>(templates: &'a Templates, op: &Operation) -> &'a Templat
 ///
 /// Only the operations that read their input from the URL render it; for the
 /// rest it is an unused variable in a template that never mentions it.
+/// An `@http` operation's path parameters as a `[&str; N]` literal; `[]` for
+/// every other operation, which no template reading it renders.
+fn path_fields_literal(op: &Operation) -> String {
+    let params = op
+        .http
+        .as_ref()
+        .map(|http| http.path_params.as_slice())
+        .unwrap_or_default();
+    let quoted: Vec<String> = params.iter().map(|p| format!("{p:?}")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
 fn query_fields_literal(api: &Api, op: &Operation) -> String {
     let fields = api.query_fields(op);
     if fields.is_empty() {
