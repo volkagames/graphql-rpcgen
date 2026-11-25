@@ -303,12 +303,6 @@ impl HttpMethod {
             _ => None,
         }
     }
-
-    /// Whether a request of this method carries a body by convention. `ANY`
-    /// may or may not, so it does not count: its body is optional.
-    pub fn sends_body(self) -> bool {
-        matches!(self, Self::Post | Self::Put | Self::Patch)
-    }
 }
 
 /// Where an `@http` operation's input fields, other than its path parameters,
@@ -325,6 +319,20 @@ pub enum HttpBody {
 }
 
 impl HttpBody {
+    /// The body an `@http` directive without `body:` has under `method`: JSON
+    /// for the methods that carry a body by convention (`POST`, `PUT`,
+    /// `PATCH`), none for the others — `ANY` may or may not carry one, so it
+    /// does not count. What `treat`'s `HttpBodyKind::default_for` answers,
+    /// and so what an `HttpSpec` built for `method` already holds: the
+    /// compiler fills an absent `body:` with it, and the Rust emitter spells a
+    /// body only where it differs.
+    pub fn default_for(method: HttpMethod) -> Self {
+        match method {
+            HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch => Self::Json,
+            HttpMethod::Get | HttpMethod::Delete | HttpMethod::Any => Self::None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "NONE",
@@ -576,6 +584,29 @@ pub struct Scopes {
     pub query: Option<String>,
 }
 
+/// How one field's text — in a query string, a form body or a path — becomes
+/// a JSON value, read off the field's declared type by [`Api::query_kind`].
+///
+/// The text cannot say: `2` is the number 2 for an `Int!` field and the string
+/// `"2"` for a `String!` one, and only the schema knows which was meant. The
+/// Rust server reads a request by this kind and the clients write one by it,
+/// each target spelling it its own way (`QueryKind::Int`, `'int'`), so the
+/// decision is made here once and the spellings cannot disagree about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    /// Taken as it is written: a `String`-like scalar, an `ID`, an enum value.
+    Str,
+    /// A scalar whose OpenAPI type is `integer`.
+    Int,
+    /// A scalar whose OpenAPI type is `number`.
+    Float,
+    /// A scalar whose OpenAPI type is `boolean`.
+    Bool,
+    /// JSON text: an object, or a scalar with no text form of its own, such as
+    /// the unconstrained `JSON` (see [`Api::is_json_text`]).
+    Json,
+}
+
 #[derive(Debug, Clone)]
 pub struct Api {
     pub types: Vec<ApiType>,
@@ -725,6 +756,29 @@ impl Api {
         }
     }
 
+    /// How the field's text in a URL or a form body becomes a JSON value. See
+    /// [`QueryKind`].
+    pub fn query_kind(&self, f: &Field) -> QueryKind {
+        let name = f.ty.base_name();
+        // An object, or the unconstrained `JSON` scalar, has no text spelling of
+        // its own, so it travels as JSON text — which is what both clients
+        // write for one.
+        if self.is_json_text(name) {
+            return QueryKind::Json;
+        }
+        match self.find_type(name) {
+            Some(ApiType::Scalar(s)) => match s.openapi_type.as_str() {
+                "integer" => QueryKind::Int,
+                "number" => QueryKind::Float,
+                "boolean" => QueryKind::Bool,
+                _ => QueryKind::Str,
+            },
+            // An enum value is a string on the wire, whatever it is called in
+            // a target.
+            _ => QueryKind::Str,
+        }
+    }
+
     /// Whether the named type is a binary scalar. See [`ScalarType::is_binary`].
     pub fn is_binary(&self, name: &str) -> bool {
         self.find_scalar(name).is_some_and(ScalarType::is_binary)
@@ -802,7 +856,8 @@ impl Api {
         to: &str,
         seen: &mut std::collections::BTreeSet<String>,
     ) -> bool {
-        if !seen.insert(from.to_string()) {
+        let first = seen.insert(from.to_string());
+        if !first {
             return false;
         }
         let fields = match self.find_type(from) {

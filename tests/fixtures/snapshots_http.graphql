@@ -1,0 +1,24 @@
+enum ErrorCode { invalid_body internal_error not_found }
+input UserInput { user_id: String! }
+input InfoInput { session_id: String verbose: Boolean }
+input RenameInput { id: String! name: String! }
+input Filter { a: Int }
+input SearchInput { filters: [Filter!] one: Filter }
+type User { id: String! }
+type Info { session_id: String }
+type Users @service {
+  user(input: UserInput!): User!
+    @query @http(method: GET, path: "/api/user/{user_id}", envelope: false) @throws(codes: ["not_found"])
+  info(input: InfoInput!): Info!
+    @query @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
+  drop(input: UserInput!): User!
+    @mutation @http(method: DELETE, path: "/api/user/{user_id}")
+  rename(input: RenameInput!): User!
+    @mutation @http(method: PUT, path: "/items/{id}")
+  search(input: SearchInput!): User!
+    @query @http(method: GET, path: "/search")
+  find(input: SearchInput!): User!
+    @mutation @http(method: POST, path: "/find", body: FORM)
+  logout: User!
+    @mutation @http(method: POST, path: "/logout")
+}

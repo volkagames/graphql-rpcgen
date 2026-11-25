@@ -1,0 +1,66 @@
+scalar UUID
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  bad_request
+  not_found
+}
+
+"A unix second count, 0 through 10 in the test below."
+scalar ZoroTime
+  @scalar(rust: "u32", typescript: "number", openapiType: "integer", openapiFormat: "int64", rustNewtype: true, rustCopy: true, rustRange: true)
+  @range(min: 0, max: 10)
+
+"A nickname, between one and twelve characters."
+scalar Nick @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true) @length(min: 1, max: 12)
+
+"A slug, inherited: lowercase letters, digits, dashes."
+scalar Slug @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true) @pattern(value: "^[a-z0-9-]+$")
+
+"""
+A money amount. The one newtype here over a floating-point representation,
+which is the case `Eq`, `Ord` and `Hash` cannot be derived for — and the case
+`rustRange` exists for, so the two have to hold at once.
+"""
+scalar Money
+  @scalar(rust: "f64", typescript: "number", openapiType: "number", rustNewtype: true, rustRange: true)
+  @range(min: 0)
+
+input CardInput { token: String! }
+input CryptoInput { coin: String! }
+
+type CardPayment @variant(tag: "card") { last4: String! }
+type CryptoPayment { network: String! }
+union PaymentMethod = CardPayment | CryptoPayment
+
+enum SettingKind { flag number }
+"One value whose wire name is not its identifier."
+enum Visibility { private public_link @variant(tag: "public-link") }
+type FlagSetting @variant(tag: "flag") { tribool: Boolean }
+type NumberSetting @variant(tag: "number") { min: Int }
+union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
+type Param { label: String! kind: SettingKind! settings: Setting! }
+
+input PaymentInput @oneOf {
+  card: CardInput
+  crypto: CryptoInput
+  nick: Nick
+  slug: Slug
+  tag: String @pattern(value: "^[a-z]+$")
+  exp: ZoroTime
+  amount: Money
+}
+
+"""
+An expression that describes itself. A `@oneOf` input is emitted as an enum,
+and an arm naming the enum has to be boxed or the type has no finite size.
+"""
+input ExprInput @oneOf {
+  negate: ExprInput
+  literal: Int
+}
+
+type Things @service {
+  get(input: CardInput!): CardPayment! @query @throws(codes: ["bad_request"])
+}

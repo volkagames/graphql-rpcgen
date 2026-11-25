@@ -13,6 +13,9 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod common;
+
+use common::flat;
 use graphql_rpcgen::config::Config;
 use graphql_rpcgen::{generate_rust, generate_rust_client};
 
@@ -105,32 +108,32 @@ fn a_subscription_is_a_get_returning_a_stream() -> TestResult {
     let out = server()?;
 
     assert!(
-        out.contains(
-            "async fn watch(&self, input: WatchInput) -> Result<EventStream<Event>, \
-             ApiError<FilesWatchCodes>>;"
+        flat(&out).contains(
+            "async fn watch(&self, input: WatchInput) -> Result<::treat::rpc::server::EventStream<Event>, \
+             ::treat::ApiError<FilesWatchCodes>>;"
         ),
         "{out}"
     );
     assert!(
-        out.contains(r#".route("/watch", get(files_watch::<S>))"#),
+        out.contains(r#".route("/watch", ::axum::routing::get(files_watch::<S>))"#),
         "{out}"
     );
-    // The input has no body to arrive in, so it is decoded from the URL.
-    assert!(out.contains("RawQuery(query): RawQuery,"), "{out}");
-    assert!(out.contains("Ok(stream) => sse_response(stream),"), "{out}");
-    // An idle stream would sit silent until the next event and an idle proxy
-    // would cut it, so the runtime must pin the legacy 30-second `:keep-alive`
-    // comment, which is invisible to the client.
-    assert!(out.contains(".keep_alive("), "{out}");
+    // The input has no body to arrive in, so it is decoded from the URL, and
+    // the events go back as SSE: both `treat::rpc`'s.
     assert!(
-        out.contains("axum::response::sse::KeepAlive::new()"),
+        flat(&out).contains("::axum::extract::RawQuery(query): ::axum::extract::RawQuery)"),
         "{out}"
     );
     assert!(
-        out.contains(".interval(std::time::Duration::from_secs(30))"),
+        out.contains(
+            "    let input = Rt::query_input(query.as_deref(), wire::FILES_WATCH_FIELDS)?;\n"
+        ),
         "{out}"
     );
-    assert!(out.contains(r#".text("keep-alive")"#), "{out}");
+    assert!(
+        out.contains("    Ok(Rt::respond_events(result))\n"),
+        "{out}"
+    );
     Ok(())
 }
 
@@ -141,21 +144,27 @@ fn a_raw_response_returns_bytes() -> TestResult {
     let out = server()?;
 
     assert!(
-        out.contains(
-            "async fn export(&self, input: ExportInput) -> Result<RawBody, \
-             ApiError<FilesExportCodes>>;"
+        flat(&out).contains(
+            "async fn export(&self, input: ExportInput) -> Result<::treat::rpc::server::RawBody, \
+             ::treat::ApiError<FilesExportCodes>>;"
         ),
         "{out}"
     );
     // Still a POST with a JSON body: only the answer is raw.
     assert!(
-        out.contains(r#".route("/export", post(files_export::<S>))"#),
+        out.contains(r#".route("/export", ::axum::routing::post(files_export::<S>))"#),
         "{out}"
     );
+    let handler = out
+        .split("async fn files_export<")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .ok_or("the raw-response handler is emitted")?;
     assert!(
-        out.contains("<ApiJson<ExportInput> as axum::extract::FromRequest<()>>"),
-        "{out}"
+        handler.contains("let input = Rt::json_input(request).await?;"),
+        "{handler}"
     );
+    assert!(handler.contains("Ok(Rt::respond_raw(result))"), "{handler}");
     Ok(())
 }
 
@@ -165,14 +174,36 @@ fn a_raw_response_returns_bytes() -> TestResult {
 fn a_raw_request_reads_body_and_query() -> TestResult {
     let out = server()?;
 
-    assert!(out.contains("body: axum::body::Body,"), "{out}");
+    let handler = out
+        .split("async fn files_upload<")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .ok_or("the raw-request handler is emitted")?;
+    // The query string first, then the body under a declared type and within
+    // the bound, then the input's rules.
+    let steps = [
+        "let mut input: UploadInput = Rt::input_from_query(request.uri().query(), wire::FILES_UPLOAD_FIELDS)?;",
+        "input.body = Rt::raw_body(request, wire::FILES_UPLOAD_TYPES, ::treat::rpc::server::RAW_BODY_LIMIT).await?;",
+        "Rt::validate(&input)?;",
+        "let result = service.upload(input).await;",
+    ];
+    let handler = flat(handler);
+    let at: Vec<Option<usize>> = steps.iter().map(|step| handler.find(step)).collect();
+    assert!(at.iter().all(Option::is_some), "{handler}");
     assert!(
-        out.contains("input.body = match raw_body(body, RAW_BODY_LIMIT).await {"),
+        at.windows(2).all(|pair| pair.first() < pair.get(1)),
+        "{handler}"
+    );
+    // The types the operation declares, which the body is checked against.
+    assert!(
+        out.contains(
+            r#"pub static FILES_UPLOAD_TYPES: &[&str] = &["text/csv", "application/json"];"#
+        ),
         "{out}"
     );
     // The payload is not one of the parameters it travels beside.
     assert!(
-        !out.contains(r#"QueryField { name: "body""#),
+        !flat(&out).contains(r#"("body")"#),
         "the payload must not be decoded as a query parameter:\n{out}"
     );
     Ok(())
@@ -183,25 +214,24 @@ fn a_raw_request_reads_body_and_query() -> TestResult {
 /// them: a raw *response* still takes an ordinary JSON body.
 #[test]
 fn query_parameters_are_typed_by_the_schema() -> TestResult {
-    let out = server()?;
+    let out = flat(&server()?);
 
-    assert!(
-        out.contains(r#"QueryField { name: "id", kind: QueryKind::Str, list: false },"#),
-        "{out}"
-    );
-    // An enum is a string on the wire whatever it is called in Rust.
-    assert!(
-        out.contains(r#"QueryField { name: "kind", kind: QueryKind::Str, list: false },"#),
-        "{out}"
-    );
-    assert!(
-        out.contains(r#"QueryField { name: "tags", kind: QueryKind::Str, list: true },"#),
-        "{out}"
-    );
-    assert!(
-        out.contains(r#"QueryField { name: "count", kind: QueryKind::Int, list: false },"#),
-        "{out}"
-    );
+    // Each entry through `QueryField`'s constructor for its kind, `.list()`
+    // after a list.
+    for (entry, list) in [
+        (r#"QueryField::str("id")"#, false),
+        // An enum is a string on the wire whatever it is called in Rust.
+        (r#"QueryField::str("kind")"#, false),
+        (r#"QueryField::str("tags")"#, true),
+        (r#"QueryField::int("count")"#, false),
+    ] {
+        assert!(out.contains(entry), "{entry}: {out}");
+        assert_eq!(
+            out.contains(&format!("{entry}.list()")),
+            list,
+            "{entry}: {out}"
+        );
+    }
     Ok(())
 }
 
@@ -221,19 +251,19 @@ fn the_payload_field_is_skipped_on_both_sides() -> TestResult {
 /// a payload to send with the content type the caller chose.
 #[test]
 fn the_client_has_a_method_per_form() -> TestResult {
-    let out = client()?;
+    let out = flat(&client()?);
 
     assert!(
         out.contains(
             "pub async fn watch(&self, input: &WatchInput) -> \
-             ClientResult<EventStream<Event>, FilesWatchCodes>"
+             ::treat::rpc::client::ClientResult<::treat::rpc::client::EventStream<Event>, FilesWatchCodes>"
         ),
         "{out}"
     );
     assert!(
         out.contains(
             "pub async fn export(&self, input: &ExportInput) -> \
-             ClientResult<reqwest::Response, FilesExportCodes>"
+             ::treat::rpc::client::ClientResult<::treat::rpc::client::reqwest::Response, FilesExportCodes>"
         ),
         "{out}"
     );
@@ -242,7 +272,7 @@ fn the_client_has_a_method_per_form() -> TestResult {
     assert!(
         out.contains(
             "pub async fn upload(&self, input: &UploadInput, content_type: &str) -> \
-             ClientResult<UploadResult, FilesUploadCodes>"
+             ::treat::rpc::client::ClientResult<UploadResult, FilesUploadCodes>"
         ),
         "{out}"
     );
@@ -276,8 +306,9 @@ type Rows @service {
     assert!(!server.contains("RAW_BODY_LIMIT"), "{server}");
 
     let client = generate_rust_client::generate(&plain, &Config::default())?;
-    assert!(!client.contains("sse_stream"), "{client}");
-    assert!(!client.contains("fn to_query"), "{client}");
+    // Nor does it name `rpc-stream`'s types, so it builds without the feature.
+    assert!(!client.contains("EventStream"), "{client}");
+    assert!(!client.contains("StreamError"), "{client}");
     Ok(())
 }
 
@@ -288,9 +319,9 @@ fn a_streamed_request_hands_the_body_over_unread() -> TestResult {
     let out = server()?;
 
     assert!(
-        out.contains(
-            "async fn store(&self, input: UploadInput, body: RawRequest) -> \
-             Result<ApiResponse<UploadResult>, ApiError<FilesStoreCodes>>;"
+        flat(&out).contains(
+            "async fn store(&self, input: UploadInput, body: ::treat::rpc::server::RawRequest) -> \
+             Result<::treat::ApiResponse<UploadResult>, ::treat::ApiError<FilesStoreCodes>>;"
         ),
         "{out}"
     );
@@ -300,33 +331,35 @@ fn a_streamed_request_hands_the_body_over_unread() -> TestResult {
         out.contains(
             "    /// Bytes in, handed over unread.\n    ///\n    \
              /// The request body arrives unread as `body`; `input.body` is always empty.\n    \
-             /// No size limit is applied to it: this method must bound it — see [`RawRequest`].\n    async fn store("
+             /// No size limit is applied to it: this method must bound it — see\n    \
+             /// [`treat::rpc::server::RawRequest`].\n    async fn store("
         ),
         "{out}"
     );
-    assert!(out.contains("pub struct RawRequest {"), "{out}");
-    assert!(
-        out.contains("pub fn into_reader(self) -> impl futures_util::io::AsyncRead"),
-        "{out}"
-    );
+    // `treat`'s, re-exported for the implementation.
+    assert!(out.contains("RawRequest"), "{out}");
+    assert!(!out.contains("pub struct RawRequest {"), "{out}");
 
     let handler = out
         .split("async fn files_store<")
         .nth(1)
         .and_then(|rest| rest.split("\n}\n").next())
         .ok_or("the streamed handler is emitted")?;
-    // The whole request is the last extractor, split here rather than by axum
-    // so the query string and the body come from one value.
+    // The unread request is the last extractor; its type is checked before
+    // anything else, then the query string read from it.
     assert!(
-        handler.contains("request: axum::extract::Request,"),
+        handler.contains("raw: ::treat::rpc::server::RawRequest)"),
         "{handler}"
     );
     assert!(
-        handler.contains("input_from_query(parts.uri.query(), &["),
+        handler.contains(
+            "    Rt::require_content_type(raw.headers(), wire::FILES_STORE_TYPES)?;\n    \
+             let input = Rt::query_input(raw.query(), wire::FILES_STORE_FIELDS)?;\n"
+        ),
         "{handler}"
     );
     assert!(
-        handler.contains("service.store(input, RawRequest { parts, body }).await"),
+        handler.contains("service.store(input, raw).await"),
         "{handler}"
     );
     assert!(
@@ -340,19 +373,18 @@ fn a_streamed_request_hands_the_body_over_unread() -> TestResult {
 /// the payload as the body, and only the server decides not to hold it.
 #[test]
 fn the_client_sends_a_streamed_body_like_any_raw_one() -> TestResult {
-    let out = client()?;
+    let out = flat(&client()?);
     assert!(
         out.contains(
             "pub async fn store(&self, input: &UploadInput, content_type: &str) -> \
-             ClientResult<UploadResult, FilesStoreCodes>"
+             ::treat::rpc::client::ClientResult<UploadResult, FilesStoreCodes>"
         ),
         "{out}"
     );
     Ok(())
 }
 
-/// `RawRequest` is the one piece of the runtime needing `futures-util`'s `io`
-/// feature, so an API whose raw requests are all buffered does not get it.
+/// An API whose raw requests are all buffered names no `RawRequest`.
 #[test]
 fn a_buffered_api_gets_no_raw_request() -> TestResult {
     let buffered = graphql_rpcgen::compile_str(
@@ -370,6 +402,5 @@ type Files @service {
     let server = generate_rust::generate(&buffered, &Config::default())?;
     assert!(server.contains("RAW_BODY_LIMIT"), "{server}");
     assert!(!server.contains("RawRequest"), "{server}");
-    assert!(!server.contains("futures_util::io"), "{server}");
     Ok(())
 }

@@ -57,7 +57,8 @@ impl Version {
         let major = next("major")?;
         let minor = next("minor")?;
         let patch = next("patch")?;
-        if parts.next().is_some() {
+        let extra = parts.next();
+        if extra.is_some() {
             return Err(invalid(text, "too many parts"));
         }
 

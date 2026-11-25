@@ -1,0 +1,68 @@
+scalar UUID
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  not_found
+  "Declared by no operation, so every generated set keeps a reachable fallback."
+  database_error
+  role_required
+}
+
+enum Role @roles { admin }
+
+input UserInput { user_id: String! }
+input FindInput { email: String! limit: Int }
+input InfoInput { session_id: String session_cookie: String verbose: Boolean }
+input RenameInput { id: UUID! name: String! }
+
+"Every key present, an absent value as null: the format the clients already read."
+type User @explicitNulls { id: String! email: String! limit: Int }
+type Info { session_id: String verbose: Boolean! }
+type Renamed { id: UUID! name: String! }
+type Me { user_id: String! }
+
+type Users @service {
+  "A path parameter, answered bare."
+  user(input: UserInput!): User!
+    @query
+    @http(method: GET, path: "/api/user/{user_id}", envelope: false)
+    @throws(codes: ["not_found"])
+
+  "Everything in the query string."
+  byEmail(input: FindInput!): User!
+    @query
+    @http(method: GET, path: "/api/user_by_email", envelope: false)
+
+  "Any method; a form body over the query string."
+  info(input: InfoInput!): Info!
+    @query
+    @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
+
+  "Any method, nothing to read."
+  me: Me!
+    @query
+    @http(method: ANY, path: "/api/me", envelope: false)
+
+  "A JSON body beside a path parameter, the envelope kept."
+  rename(input: RenameInput!): Renamed!
+    @mutation
+    @http(method: PUT, path: "/items/{id}")
+
+  "A second method on a path `user` already answers."
+  drop(input: UserInput!): Me!
+    @mutation
+    @http(method: DELETE, path: "/api/user/{user_id}", envelope: false)
+
+  "A fixed segment where `user` has its parameter: the router tries it first."
+  blank: Me!
+    @query
+    @http(method: GET, path: "/api/user/new", envelope: false)
+
+  "A session and a role, answered bare: both refusals need a status."
+  whoami: Me!
+    @query
+    @http(method: GET, path: "/api/whoami", envelope: false)
+    @auth(require: session, role: admin)
+    @throws(codes: ["role_required"])
+}

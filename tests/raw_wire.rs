@@ -33,7 +33,9 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-use std::process::Command;
+mod common;
+
+use common::Dependency;
 
 /// Every shape the raw emitters branch on, and a subscription beside them
 /// because both forms share one runtime.
@@ -41,204 +43,12 @@ use std::process::Command;
 /// The four raw operations are chosen to reach all four handler templates and
 /// all four client-method templates: a raw response with an input and without
 /// one, a raw request, and both directions at once.
-const SDL: &str = r#"
-scalar UUID
-
-"An opaque body: bytes on the wire rather than a value in the JSON envelope."
-scalar Binary
-  @scalar(
-    rust: "Vec<u8>"
-    typescript: "Blob"
-    openapiType: "string"
-    openapiFormat: "binary"
-  )
-
-enum ErrorCode {
-  invalid_body
-  internal_error
-  not_found
-  role_required
-  "Declared by no operation, so every generated set keeps a reachable fallback."
-  database_error
-  "Tagged: the envelope must carry `files::gone`, not the identifier."
-  files__gone @variant(tag: "files::gone")
-}
-
-"A junior role and one inheriting it, so the guard below passes by inheritance."
-enum Role @roles {
-  files_read
-  files_write @inherits(roles: [files_read])
-}
-
-"What a token may do; one scope tagged, so its wire name is not its identifier."
-enum Scope @scopes(query: read) {
-  read
-  write
-  purge @variant(tag: "files.purge")
-}
-
-type Event { line: String! }
-
-input WatchInput { id: UUID! }
-
-input ReportInput {
-  id: UUID!
-  "A parameter of a raw-response call still travels as JSON."
-  rows: Int
-}
-
-input IngestInput {
-  id: UUID!
-  "A list repeats its key in the query string once the body is spent."
-  tags: [String!]
-  "The one binary field: this is the request body itself."
-  body: Binary!
-}
-
-input ConvertInput {
-  id: UUID!
-  body: Binary!
-}
-
-input UploadInput {
-  id: UUID!
-  "Left empty by the server: the payload reaches the service unread."
-  body: Binary!
-}
-
-type IngestResult { written: Int! }
-
-type UploadResult {
-  "Bytes the service read from the body."
-  received: Int!
-  "The `Content-Length` the request declared."
-  declared: Int
-  "Whether every byte read was the byte the test sent."
-  intact: Boolean!
-}
-
-type Files @service {
-  "A stream of events, sharing the runtime the raw forms emit."
-  watch(input: WatchInput!): Event! @subscription @rpc(path: "/watch")
-
-  "Bytes out, JSON in."
-  report(input: ReportInput!): Binary!
-    @query
-    @rpc(path: "/report")
-    @raw(response: ["text/csv"])
-    @throws(codes: ["not_found", "files__gone"])
-
-  "Bytes out, nothing in."
-  manifest: Binary!
-    @query
-    @rpc(path: "/manifest")
-    @raw(response: ["application/json"])
-
-  "Bytes in, JSON out."
-  ingest(input: IngestInput!): IngestResult!
-    @mutation
-    @rpc(path: "/ingest")
-    @raw(request: ["text/csv", "application/json"])
-
-  "Bytes in, bytes out."
-  convert(input: ConvertInput!): Binary!
-    @mutation
-    @rpc(path: "/convert")
-    @raw(request: ["text/csv"], response: ["application/json"])
-
-  "Bytes in unread, JSON out."
-  upload(input: UploadInput!): UploadResult!
-    @mutation
-    @rpc(path: "/upload")
-    @raw(request: ["application/octet-stream"], stream: true)
-
-  "Bytes in unread, bytes out, for a caller with a session: the one form with every extractor."
-  echo(input: ConvertInput!): Binary!
-    @mutation(scope: write)
-    @rpc(path: "/echo")
-    @raw(request: ["application/octet-stream"], response: ["application/octet-stream"], stream: true)
-    @auth(require: session, role: files_read)
-    @throws(codes: ["role_required"])
-}
-"#;
+const SDL: &str = include_str!("fixtures/raw_wire.graphql");
 
 /// The permission check, in an API of its own: an API declares a role set or a
 /// permission set, not both. Emitted as one self-contained server module beside
 /// the first, and mounted on the same router.
-const PERMISSIONS_SDL: &str = r#"
-scalar UUID
-
-scalar Binary
-  @scalar(
-    rust: "Vec<u8>"
-    typescript: "Blob"
-    openapiType: "string"
-    openapiFormat: "binary"
-  )
-
-enum ErrorCode {
-  invalid_body
-  internal_error
-  permission_required
-  "Declared by no operation, so every generated set keeps a reachable fallback."
-  database_error
-}
-
-"Permission ids are not GraphQL identifiers, so each travels by its tag."
-enum Permission @permissions(codes: ["permission_required"]) {
-  files_purge @variant(tag: "files.purge")
-  files_wipe @variant(tag: "files.wipe")
-}
-
-type Event { line: String! }
-
-input WatchInput { id: UUID! }
-
-input IngestInput { id: UUID! body: Binary! }
-
-type IngestResult { written: Int! }
-
-type Admin @service @auth(require: session, permission: files_purge) {
-  "Inherits a permission the caller holds, so the call reaches the service."
-  purge(input: WatchInput!): IngestResult!
-    @mutation
-    @rpc(path: "/purge")
-    @throws(codes: ["permission_required"])
-
-  "A permission the caller lacks, so the call is refused before the service."
-  wipe(input: WatchInput!): IngestResult!
-    @mutation
-    @rpc(path: "/wipe")
-    @auth(require: session, permission: files_wipe)
-    @throws(codes: ["permission_required"])
-
-  "The same refusal in every other handler form, each of which reads its request its own way."
-  wipe_all: IngestResult!
-    @mutation @rpc(path: "/admin/no_input")
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  watch(input: WatchInput!): Event!
-    @subscription @rpc(path: "/admin/watch")
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  watch_all: Event!
-    @subscription @rpc(path: "/admin/watch_all")
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  report(input: WatchInput!): Binary!
-    @query @rpc(path: "/admin/report") @raw(response: ["text/csv"])
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  manifest: Binary!
-    @query @rpc(path: "/admin/manifest") @raw(response: ["text/csv"])
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  ingest(input: IngestInput!): IngestResult!
-    @mutation @rpc(path: "/admin/ingest") @raw(request: ["text/csv"])
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  convert(input: IngestInput!): Binary!
-    @mutation @rpc(path: "/admin/convert") @raw(request: ["text/csv"], response: ["text/csv"])
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-  upload(input: IngestInput!): IngestResult!
-    @mutation @rpc(path: "/admin/upload") @raw(request: ["application/octet-stream"], stream: true)
-    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
-}
-"#;
+const PERMISSIONS_SDL: &str = include_str!("fixtures/raw_wire_permissions.graphql");
 
 /// An implementation of the generated trait, one use of each client method, and
 /// the streamed request on the wire.
@@ -249,10 +59,14 @@ type Admin @service @auth(require: session, permission: files_purge) {
 /// value of the right shape — only their shapes are checked. The streamed ones
 /// read what they were sent, since that is what `wire` below asserts.
 const DRIVER: &str = r##"
+//! The test driver: implementations of the generated traits, one use of each
+//! client method, and the wire tests. Not generated code, so the lints the
+//! generated modules are held to are not this module's.
+#![allow(clippy::all, dead_code, unused_imports, reason = "a test driver, not generated code")]
 
-// --- driver ------------------------------------------------------------------
-
-use futures_util::io::AsyncReadExt;
+use crate::{client, permissions, server, types};
+use treat::rpc::futures_util::io::AsyncReadExt;
+use treat::rpc::WireEnum;
 
 #[derive(Clone)]
 pub struct Files;
@@ -263,38 +77,37 @@ pub struct Files;
 /// generated hierarchy rather than a direct match.
 pub struct Caller;
 
-impl server::FromRequestContext for Caller {
+/// Resolving the caller is `treat`'s contract, shared by both generated
+/// modules; each adds its own access checks.
+impl treat::rpc::server::ResolveContext for Caller {
     async fn from_parts(
         _parts: &mut axum::http::request::Parts,
-    ) -> Result<Self, axum::response::Response> {
+    ) -> Result<Self, treat::rpc::server::Refusal> {
         Ok(Caller)
     }
+}
 
-    fn require_role(&self, role: server::Role) -> Result<(), axum::response::Response> {
+impl server::FromRequestContext for Caller {
+    fn require_role(&self, role: server::Role) -> Result<(), server::Refusal> {
         if server::Role::FilesWrite.authorizes(role) {
             return Ok(());
         }
         Err(axum::response::IntoResponse::into_response(
             axum::http::StatusCode::FORBIDDEN,
-        ))
+        )
+        .into())
     }
 }
 
 /// The same caller, to the permission API: that module names its own context
 /// trait, with the permission check and no role check.
 impl permissions::FromRequestContext for Caller {
-    async fn from_parts(
-        _parts: &mut axum::http::request::Parts,
-    ) -> Result<Self, axum::response::Response> {
-        Ok(Caller)
-    }
-
     /// Holds `files.purge` only, read by its id as an implementation keeping the
     /// assignment in data would: `wipe` is refused before its method runs.
     async fn require_permission(
         &self,
         permission: permissions::Permission,
-    ) -> Result<(), axum::response::Response> {
+    ) -> Result<(), permissions::Refusal> {
         if permissions::Permission::from_name("files.purge") == Some(permission) {
             return Ok(());
         }
@@ -303,8 +116,14 @@ impl permissions::FromRequestContext for Caller {
             axum::Json(serde_json::json!({
                 "errors": [{ "code": "permission_required", "message": permission.as_str() }]
             })),
-        )))
+        ))
+        .into())
     }
+}
+
+/// The first `len` bytes of what `wire` sends.
+pub fn pattern_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(pattern).collect()
 }
 
 /// The byte at offset `i` of what `wire` sends, so the service can tell a body
@@ -321,7 +140,7 @@ impl server::FilesService for Files {
         &self,
         _input: server::WatchInput,
     ) -> Result<server::EventStream<server::Event>, server::ApiError<server::FilesWatchCodes>> {
-        Ok(server::event_stream(futures_util::stream::empty()))
+        Ok(server::event_stream(treat::rpc::futures_util::stream::empty()))
     }
 
     async fn convert(
@@ -523,7 +342,6 @@ pub fn router() -> axum::Router {
 /// content type as a parameter, a no-input operation takes nothing — so naming
 /// each correctly is the whole check, and running it would need a server on the
 /// other end to prove nothing extra.
-#[allow(dead_code)]
 async fn client_forms(api: &client::ApiClient) {
     let convert = types::ConvertInput { id: uuid::Uuid::nil(), body: Vec::new() };
     let ingest = types::IngestInput { id: uuid::Uuid::nil(), tags: None, body: Vec::new() };
@@ -545,6 +363,8 @@ async fn client_forms(api: &client::ApiClient) {
 
 #[cfg(test)]
 mod wire {
+    use treat::rpc::WireEnum;
+
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// Past the buffered bound by a margin, so a handler that still buffered
@@ -558,6 +378,9 @@ mod wire {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         tokio::spawn(async move { axum::serve(listener, super::router()).await });
+        // The tables the lookups search are ones they can search.
+        assert_eq!(treat::rpc::route::check_table(crate::types::operations::ALL), Ok(()));
+        assert_eq!(treat::rpc::route::check_table(crate::permissions::operations::ALL), Ok(()));
         Ok(format!("http://{addr}"))
     }
 
@@ -608,11 +431,49 @@ mod wire {
         let base = serve().await?;
         let response = reqwest::Client::new()
             .post(format!("{base}/upload?id=nope"))
+            .header("content-type", "application/octet-stream")
             .body(body(10))
             .send()
             .await?;
+        // At the envelope's `200`, as an RPC route answers an input it cannot
+        // read: not the `415` of a type it does not take.
+        assert_eq!(response.status(), 200);
         let json: serde_json::Value = response.json().await?;
         assert_eq!(json["errors"][0]["code"], "invalid_body", "{json}");
+        Ok(())
+    }
+
+    /// A raw request is read only under a type its `@raw(request:)` lists —
+    /// the generated list, checked before the body is: a buffered one and a
+    /// streamed one alike.
+    #[tokio::test]
+    async fn a_raw_body_of_an_undeclared_type_is_refused() -> TestResult {
+        let base = serve().await?;
+        let http = reqwest::Client::new();
+        for (path, declared) in [
+            ("ingest", "text/csv"),
+            ("ingest", "application/json"),
+            ("upload", "application/octet-stream"),
+        ] {
+            let response = http
+                .post(format!("{base}/{path}?id={ID}"))
+                .header("content-type", declared)
+                .body("a,b")
+                .send()
+                .await?;
+            assert_eq!(response.status(), 200, "{path} under {declared}");
+        }
+        for (path, other) in [("ingest", "text/plain"), ("upload", "text/csv")] {
+            let response = http
+                .post(format!("{base}/{path}?id={ID}"))
+                .header("content-type", other)
+                .body("a,b")
+                .send()
+                .await?;
+            assert_eq!(response.status(), 415, "{path} under {other}");
+            let json: serde_json::Value = response.json().await?;
+            assert_eq!(json["errors"][0]["code"], "invalid_body", "{json}");
+        }
         Ok(())
     }
 
@@ -642,7 +503,7 @@ mod wire {
 
         // And by the route a gate in front of the router reads off the request:
         // the method counts, and a route the router does not mount has no row.
-        use crate::server::operations::{by_route, Auth, Kind, ALL};
+        use crate::server::operations::{by_route, Auth, Kind};
         let echo = by_route("POST", "/echo").ok_or("the router mounts POST /echo")?;
         assert_eq!(echo.id, "files_echo");
         assert_eq!((echo.kind, echo.auth), (Kind::Mutation, Auth::Session));
@@ -656,7 +517,6 @@ mod wire {
         assert!(by_route("POST", "/nowhere").is_none());
         let upload = by_route("POST", "/upload").ok_or("the router mounts POST /upload")?;
         assert_eq!((upload.role, upload.scope), (None, None));
-        assert!(ALL.windows(2).all(|pair| matches!(pair, [a, b] if a.path < b.path)));
         assert_eq!(crate::server::Scope::from_name("files.purge"), Some(crate::server::Scope::Purge));
         assert_eq!(crate::server::Scope::Purge.as_str(), "files.purge");
 
@@ -702,6 +562,76 @@ mod wire {
         Ok(())
     }
 
+    /// The generated client against the generated router, one call per form:
+    /// what each method sends is what its handler reads — the path, the
+    /// query table, the body and its declared type — and each answer is read
+    /// back as the form says.
+    #[tokio::test]
+    async fn the_generated_client_reaches_every_form() -> TestResult {
+        use treat::rpc::futures_util::StreamExt;
+
+        let base = serve().await?;
+        let api = crate::client::ApiClient::new(&base);
+        let files = api.files();
+        let id = uuid::Uuid::nil();
+
+        let events: Vec<_> = files.watch(&crate::types::WatchInput { id }).await?.collect().await;
+        assert!(events.is_empty());
+
+        let report = files.report(&crate::types::ReportInput { id, rows: Some(3) }).await?;
+        assert_eq!(
+            report.headers().get("content-disposition").map(|v| v.as_bytes()),
+            Some(&b"attachment; filename=\"report.csv\""[..])
+        );
+        let manifest = files.manifest().await?;
+        assert_eq!(manifest.bytes().await?.as_ref(), b"{}");
+
+        let ingest = crate::types::IngestInput { id, tags: Some(vec!["a b".to_string()]), body: b"x,y".to_vec() };
+        let written = files.ingest(&ingest, "text/csv").await?;
+        assert_eq!(written.written, 3);
+        let refused = files.ingest(&ingest, "text/plain").await;
+        assert!(matches!(refused, Err(crate::client::ClientError::Api(_))), "{refused:?}");
+
+        let convert = crate::types::ConvertInput { id, body: br#"{"k":1}"#.to_vec() };
+        let converted = files.convert(&convert, "text/csv").await?;
+        assert_eq!(converted.bytes().await?.as_ref(), br#"{"k":1}"#);
+
+        let upload = crate::types::UploadInput { id, body: super::pattern_bytes(1000) };
+        let uploaded = files.upload(&upload, "application/octet-stream").await?;
+        assert_eq!((uploaded.received, uploaded.intact), (1000, true));
+
+        let echoed = files.echo(&convert, "application/octet-stream").await?;
+        assert_eq!(echoed.bytes().await?.as_ref(), br#"{"k":1}"#);
+        Ok(())
+    }
+
+    /// The plain RPC forms, by the generated client: an input and none, a
+    /// success and a refusal read from `errors[]` against the operation's set.
+    #[tokio::test]
+    async fn the_generated_client_calls_rpc_operations() -> TestResult {
+        let base = serve().await?;
+        let admin = crate::permissions_client::ApiClient::new(&base);
+        let input = crate::permissions::WatchInput { id: uuid::Uuid::nil() };
+
+        let purged = admin.admin().purge(&input).await?;
+        assert_eq!(purged.written, 1);
+
+        let wiped = admin.admin().wipe(&input).await;
+        match wiped {
+            Err(crate::permissions_client::ClientError::Api(errors)) => {
+                assert!(errors.is(crate::permissions::AdminWipeCodes::PermissionRequired));
+                assert_eq!(
+                    errors.code::<crate::permissions::ErrorCode>(),
+                    Some(crate::permissions::ErrorCode::permission_required)
+                );
+            }
+            other => return Err(format!("expected the refusal, got {other:?}").into()),
+        }
+        let all = admin.admin().wipe_all().await;
+        assert!(matches!(all, Err(crate::permissions_client::ClientError::Api(_))), "{all:?}");
+        Ok(())
+    }
+
     /// A streamed request answering with raw bytes, through the context
     /// extractor.
     #[tokio::test]
@@ -730,14 +660,17 @@ mod wire {
 /// `types_path` points at a module of the same crate rather than a sibling one,
 /// which is the single-crate layout a scratch project wants; the split layout is
 /// what every other test already covers.
-fn generated() -> TestResult<(String, String, String, String)> {
+fn generated() -> TestResult<(String, String, String, String, String)> {
     let api = graphql_rpcgen::compile_str(SDL)?;
     let mut config = graphql_rpcgen::config::Config::default();
     config.rust.types_path = Some("crate::types".to_string());
     config.rust_client.types_path = Some("crate::types".to_string());
 
     // Self-contained, its types inline: nothing else in the crate shares them.
+    // Its client reaches them there, and carries the plain RPC forms.
     let permissions = graphql_rpcgen::compile_str(PERMISSIONS_SDL)?;
+    let mut permissions_client = graphql_rpcgen::config::Config::default();
+    permissions_client.rust_client.types_path = Some("crate::permissions".to_string());
 
     Ok((
         graphql_rpcgen::generate_rust::generate_types(&api, &config)?,
@@ -747,144 +680,72 @@ fn generated() -> TestResult<(String, String, String, String)> {
             &permissions,
             &graphql_rpcgen::config::Config::default(),
         )?,
+        graphql_rpcgen::generate_rust_client::generate(&permissions, &permissions_client)?,
     ))
 }
 
-/// What the generated code reaches for, with this crate's lockfile as the
-/// source of truth for versions.
+/// The scratch project, and what the generated code reaches for: `treat`'s
+/// server and client runtime with `rpc-stream`, which the raw and streaming
+/// forms need and nothing else does. No `futures-*`, `bytes` or `reqwest`
+/// `stream` feature: the generated code names none of them, and the driver
+/// reaches `futures_util` through `treat::rpc`. `reqwest` and `tokio` are the
+/// driver's, for requests the generated client would never send.
 ///
-/// `reqwest`'s `stream` feature is in this list for the raw and streaming
-/// runtime alone, and `futures-util`'s `io` feature for a streamed request: drop any of them and the emitted code stops compiling,
-/// which is the failure this test exists to make visible. `tokio` is the
-/// driver's alone, for the `wire` tests.
-const DEPENDENCIES: &[&str] = &[
-    "async-trait",
-    "axum",
-    "bytes",
-    "chrono",
-    "derive_more",
-    "error_set",
-    "futures-core",
-    "futures-util",
-    "regex",
-    "reqwest",
-    "serde",
-    "serde_json",
-    "tokio",
-    "treat",
-    "uuid",
-    "validator",
-];
-
-/// Per-dependency features, exactly as the generated code needs them.
-fn features_of(dep: &str) -> &'static str {
-    match dep {
-        "chrono" => r#"{ version = "{v}", features = ["serde"] }"#,
-        "derive_more" => r#"{ version = "{v}", features = ["from", "into", "display", "as_ref"] }"#,
-        "futures-util" => r#"{ version = "{v}", features = ["io"] }"#,
-        "reqwest" => {
-            r#"{ version = "{v}", default-features = false, features = ["json", "rustls", "stream"] }"#
-        }
-        "serde" => r#"{ version = "{v}", features = ["derive"] }"#,
-        "tokio" => r#"{ version = "{v}", features = ["macros", "net", "rt"] }"#,
-        // `validator-extract` already implies `serde-path`, which is what
-        // `treat::extract_axum` needs; `rpc-status-header` compiles nothing
-        // here but is what emits the `x-rpc-status` the OpenAPI document
-        // describes, so the README names it and this set matches the README.
-        "treat" => {
-            r#"{ version = "{v}", features = ["axum", "validator-extract", "rpc-status-header"] }"#
-        }
-        "uuid" => r#"{ version = "{v}", features = ["serde"] }"#,
-        "validator" => r#"{ version = "{v}", features = ["derive"] }"#,
-        _ => r#""{v}""#, // a plain version requirement
-    }
-}
-
-fn manifest_for(root: &std::path::Path) -> TestResult<String> {
-    // Pinning to this crate's lockfile is what keeps the build hermetic and in
-    // step: a version bump there lands here on the next run, and a version the
-    // lock does not carry is an error instead of a fetch.
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
-    let lock: toml::Table = toml::from_str(&lock)?;
-    let packages = lock
-        .get("package")
-        .and_then(toml::Value::as_array)
-        .ok_or("lockfile has no [[package]] array")?;
-
-    let mut deps = Vec::new();
-    for dep in DEPENDENCIES {
-        // Every version carrying this name, not the first: the lockfile is
-        // sorted by (name, version), so taking the first would silently pin the
-        // *older* half of a duplicated major. Two versions mean the assumption
-        // this pinning rests on is gone, and picking either one is a guess.
-        let versions: Vec<&str> = packages
-            .iter()
-            .filter(|p| p.get("name").and_then(toml::Value::as_str) == Some(*dep))
-            .filter_map(|p| p.get("version").and_then(toml::Value::as_str))
-            .collect();
-        let version = match versions.as_slice() {
-            [only] => *only,
-            [] => {
-                return Err(format!(
-                    "`{dep}` is in the generated code's dependency set but not in Cargo.lock"
-                )
-                .into());
-            }
-            many => {
-                return Err(format!(
-                    "Cargo.lock carries {} versions of `{dep}` ({}); this test pins one version per crate",
-                    many.len(),
-                    many.join(", ")
-                )
-                .into());
-            }
-        };
-        deps.push(format!(
-            "{dep} = {}",
-            features_of(dep).replacen("{v}", version, 1)
-        ));
-    }
-
-    Ok(format!(
-        "[package]\nname = \"raw_wire\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n{}\n\n[workspace]\n",
-        deps.join("\n")
-    ))
-}
+/// `--lib`: the emitted doc comments are documentation, not doctests.
+const PROJECT: common::ScratchProject = common::ScratchProject {
+    name: "raw_wire",
+    dir: "raw-wire-test",
+    dependencies: &[
+        Dependency::plain("async-trait"),
+        Dependency::plain("axum"),
+        Dependency::with("chrono", &["serde"]),
+        Dependency::with("derive_more", &["from", "into", "display", "as_ref"]),
+        Dependency::plain("error_set"),
+        Dependency::only("reqwest", &["json"]),
+        Dependency::with("serde", &["derive"]),
+        Dependency::plain("serde_json"),
+        Dependency::with("tokio", &["macros", "net", "rt"]),
+        // `rpc-status-header` changes no line of the generated code, but is
+        // what emits the `x-rpc-status` the OpenAPI document describes, so the
+        // README names it and this set matches the README.
+        Dependency::with(
+            "treat",
+            &[
+                "rpc-client",
+                "rpc-server",
+                "rpc-status-header",
+                "rpc-stream",
+            ],
+        ),
+        Dependency::with("uuid", &["serde"]),
+        Dependency::with("validator", &["derive"]),
+    ],
+    test_args: &["--lib"],
+    target: None,
+    edition: "2021",
+};
 
 #[test]
 fn the_generated_raw_server_and_client_compile_and_serve() -> TestResult {
-    let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))?;
-
-    // Stable locations: the project's lockfile and target directory survive
-    // across runs, so the dependency tree resolves once, offline, and later runs
-    // reuse it. Only the generated sources are rewritten.
-    let project = root.join("target").join("raw-wire-test");
-    let project_target = root.join("target").join("raw-wire-test-target");
-    let src = project.join("src");
-    std::fs::create_dir_all(&src)?;
-
-    let (types, server, client, permissions) = generated()?;
-    std::fs::write(src.join("types.rs"), types)?;
-    std::fs::write(src.join("server.rs"), server)?;
-    std::fs::write(src.join("client.rs"), client)?;
-    std::fs::write(src.join("permissions.rs"), permissions)?;
-    std::fs::write(
-        src.join("lib.rs"),
-        format!("pub mod client;\npub mod permissions;\npub mod server;\npub mod types;\n{DRIVER}"),
-    )?;
-    std::fs::write(project.join("Cargo.toml"), manifest_for(&root)?)?;
-
-    // `--lib`: the emitted doc comments are documentation, not doctests.
-    let output = Command::new("cargo")
-        .args(["test", "--lib", "--quiet", "--offline"])
-        .current_dir(&project)
-        .env("CARGO_TARGET_DIR", &project_target)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "the generated raw server and client must compile and pass the wire tests:\n{stdout}\n{stderr}"
-    );
-    Ok(())
+    let (types, server, client, permissions, permissions_client) = generated()?;
+    let lib = "pub mod client;\nmod driver;\npub mod permissions;\npub mod permissions_client;\n\
+               pub mod server;\npub mod types;\n";
+    PROJECT.check(
+        &[
+            ("types.rs", &types),
+            ("server.rs", &server),
+            ("client.rs", &client),
+            ("permissions.rs", &permissions),
+            ("permissions_client.rs", &permissions_client),
+            ("driver.rs", DRIVER),
+            ("lib.rs", lib),
+        ],
+        &[
+            "types.rs",
+            "server.rs",
+            "client.rs",
+            "permissions.rs",
+            "permissions_client.rs",
+        ],
+    )
 }

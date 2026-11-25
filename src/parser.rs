@@ -18,7 +18,8 @@ pub struct SdlFile {
 
 /// Recursively collect `*.graphql` files, sorted for deterministic output.
 pub fn discover(dir: &Path) -> erris::Result<Vec<PathBuf>> {
-    if !dir.is_dir() {
+    let found = dir.is_dir();
+    if !found {
         return Err(report!("SDL directory not found: {}", dir.display()));
     }
 
@@ -39,7 +40,8 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> erris::Result<()> {
     for entry in entries {
         let entry = entry.wrap_report(format_args!("cannot read {}", dir.display()))?;
         let path = entry.path();
-        if path.is_dir() {
+        let is_dir = path.is_dir();
+        if is_dir {
             collect(&path, out)?;
         } else if path.extension().is_some_and(|e| e == "graphql") {
             out.push(path);

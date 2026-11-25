@@ -1,0 +1,101 @@
+# Every way an input field is spelled as text, on every operation form that
+# sends one: the SDL of `ts_check`'s runtime test, which runs the generated
+# TypeScript client under node, and of `snapshots`' check that the TypeScript
+# field tables are the Rust server's.
+
+scalar UUID
+scalar JSON
+
+"An opaque body."
+scalar Binary
+  @scalar(
+    rust: "Vec<u8>"
+    typescript: "Blob"
+    openapiType: "string"
+    openapiFormat: "binary"
+  )
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  not_found
+}
+
+enum Color {
+  red
+  green
+}
+
+input Point {
+  x: Int!
+  y: Int!
+}
+
+"One field of each kind, plain and as a list."
+input QueryInput {
+  id: UUID!
+  name: String
+  limit: Int
+  ratio: Float
+  flag: Boolean
+  color: Color
+  tags: [String!]
+  counts: [Int!]
+  point: Point
+  points: [Point!]
+  data: JSON
+  datas: [JSON]
+}
+
+"Nothing a table would change: every field is written as a plain string is."
+input PlainInput {
+  id: UUID!
+  limit: Int
+  flag: Boolean
+}
+
+input PathInput {
+  id: String!
+  n: Int!
+  tags: [String!]
+}
+
+input PutInput {
+  id: String!
+  tags: [String!]
+  point: Point
+}
+
+input UploadInput {
+  id: UUID!
+  tags: [String!]
+  meta: JSON
+  body: Binary!
+}
+
+type Out {
+  ok: Boolean!
+}
+
+type Event {
+  line: String!
+}
+
+type Kinds @service {
+  get(input: PlainInput!): Out! @query @rpc(path: "/get")
+  watch(input: QueryInput!): Event! @subscription @rpc(path: "/watch")
+  watchPlain(input: PlainInput!): Event! @subscription @rpc(path: "/watch_plain")
+  search(input: QueryInput!): Out! @query @http(method: GET, path: "/search")
+  form(input: QueryInput!): Out! @mutation @http(method: POST, path: "/form", body: FORM)
+  item(input: PathInput!): Out! @query @http(method: GET, path: "/items/{id}/{n}")
+  put(input: PutInput!): Out! @mutation @http(method: PUT, path: "/put/{id}")
+  upload(input: UploadInput!): Out!
+    @mutation
+    @rpc(path: "/upload")
+    @raw(request: ["text/csv", "application/json"])
+  download(input: PlainInput!): Binary!
+    @query
+    @rpc(path: "/download")
+    @raw(response: ["text/csv", "application/json"])
+    @throws(codes: ["not_found"])
+}

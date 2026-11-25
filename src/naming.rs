@@ -7,6 +7,9 @@ const RUST_KEYWORDS: &[&str] = &[
     "self", "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where",
     "while", "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro",
     "override", "priv", "typeof", "unsized", "virtual", "yield",
+    // Reserved by the 2024 edition. `r#gen` is as good a name in the earlier
+    // editions, so the escape holds whichever edition compiles the output.
+    "gen",
 ];
 
 /// The three keywords `r#` cannot rescue.
@@ -136,6 +139,8 @@ mod tests {
         assert_eq!(snake_case("match"), "r#match");
         // Reserved since the 2018 edition, and so not usable bare.
         assert_eq!(snake_case("try"), "r#try");
+        // Reserved since the 2024 edition; the escape compiles in 2021 too.
+        assert_eq!(snake_case("gen"), "r#gen");
     }
 
     /// The escape is not universal, and the compiler has to know which three

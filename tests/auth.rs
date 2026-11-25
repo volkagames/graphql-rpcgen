@@ -13,6 +13,9 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod common;
+
+use common::{flat, operation_row};
 use graphql_rpcgen::config::Config;
 use graphql_rpcgen::generate_rust;
 
@@ -93,11 +96,12 @@ fn expect_error_in(body: &str) -> TestResult<String> {
 #[test]
 fn a_session_operation_receives_the_context() -> TestResult {
     let out = server()?;
+    let flat = flat(&out);
 
     assert!(
-        out.contains(
+        flat.contains(
             "async fn get(&self, ctx: &Self::Ctx, input: GetInput) \
-             -> Result<ApiResponse<Thing>, ApiError<GuardedGetCodes>>;"
+             -> Result<::treat::ApiResponse<Thing>, ::treat::ApiError<GuardedGetCodes>>;"
         ),
         "{out}"
     );
@@ -105,16 +109,14 @@ fn a_session_operation_receives_the_context() -> TestResult {
     // order axum accepts: the request has to be last. Its body is read in the
     // handler, after any access check.
     assert!(
-        out.contains(
-            "async fn guarded_get<S: GuardedService>(\n    \
-             State(service): State<S>,\n    \
-             Ctx(ctx): Ctx<S::Ctx>,\n    \
-             request: axum::extract::Request,\n"
+        flat.contains(
+            "async fn guarded_get<S: GuardedService>(::axum::extract::State(service): ::axum::extract::State<S>, \
+             ::treat::rpc::server::Ctx(ctx): ::treat::rpc::server::Ctx<S::Ctx>, request: ::axum::extract::Request) -> Result<::axum::response::Response, ::treat::rpc::server::Refusal> {"
         ),
         "{out}"
     );
     assert!(
-        out.contains("match service.get(&ctx, input).await {"),
+        out.contains("    let result = service.get(&ctx, input).await;\n"),
         "{out}"
     );
     Ok(())
@@ -127,13 +129,16 @@ fn a_session_operation_without_input_takes_only_the_context() -> TestResult {
     let out = server()?;
 
     assert!(
-        out.contains(
+        flat(&out).contains(
             "async fn me(&self, ctx: &Self::Ctx) \
-             -> Result<ApiResponse<Thing>, ApiError<GuardedMeCodes>>;"
+             -> Result<::treat::ApiResponse<Thing>, ::treat::ApiError<GuardedMeCodes>>;"
         ),
         "{out}"
     );
-    assert!(out.contains("match service.me(&ctx).await {"), "{out}");
+    assert!(
+        out.contains("    let result = service.me(&ctx).await;\n"),
+        "{out}"
+    );
     Ok(())
 }
 
@@ -143,12 +148,10 @@ fn a_session_operation_without_input_takes_only_the_context() -> TestResult {
 fn a_role_is_checked_before_the_method_runs() -> TestResult {
     let out = server()?;
 
+    // A refusal is the context's own, answered as it is: `?` on the
+    // `Result<(), Refusal>` the check returns.
     assert!(
-        out.contains(
-            "    let access = ctx.require_role(Role::ContentManager);\n    \
-             if let Err(response) = access {\n        \
-             return response;\n    }\n"
-        ),
+        out.contains("    ctx.require_role(Role::ContentManager)?;\n"),
         "{out}"
     );
 
@@ -162,7 +165,7 @@ fn a_role_is_checked_before_the_method_runs() -> TestResult {
         .find("require_role")
         .ok_or("guard must be present")?;
     let validate = handler
-        .find("FromRequest<()>>::from_request(request")
+        .find("Rt::json_input(request)")
         .ok_or("the body must be read in the handler")?;
     assert!(
         guard < validate,
@@ -176,20 +179,19 @@ fn a_role_is_checked_before_the_method_runs() -> TestResult {
 #[test]
 fn a_subscription_receives_the_context() -> TestResult {
     let out = server()?;
+    let flat = flat(&out);
 
     assert!(
-        out.contains(
+        flat.contains(
             "async fn watch(&self, ctx: &Self::Ctx, input: GetInput) \
-             -> Result<EventStream<Event>, ApiError<GuardedWatchCodes>>;"
+             -> Result<::treat::rpc::server::EventStream<Event>, ::treat::ApiError<GuardedWatchCodes>>;"
         ),
         "{out}"
     );
     assert!(
-        out.contains(
-            "async fn guarded_watch<S: GuardedService>(\n    \
-             State(service): State<S>,\n    \
-             Ctx(ctx): Ctx<S::Ctx>,\n    \
-             RawQuery(query): RawQuery,\n"
+        flat.contains(
+            "async fn guarded_watch<S: GuardedService>(::axum::extract::State(service): ::axum::extract::State<S>, \
+             ::treat::rpc::server::Ctx(ctx): ::treat::rpc::server::Ctx<S::Ctx>, ::axum::extract::RawQuery(query): ::axum::extract::RawQuery)"
         ),
         "{out}"
     );
@@ -207,9 +209,9 @@ fn an_operation_needing_no_session_gets_no_context() -> TestResult {
         ("export", "GuardedExportCodes"),
     ] {
         assert!(
-            out.contains(&format!(
+            flat(&out).contains(&format!(
                 "async fn {method}(&self, input: GetInput) \
-                 -> Result<ApiResponse<Thing>, ApiError<{codes}>>;"
+                 -> Result<::treat::ApiResponse<Thing>, ::treat::ApiError<{codes}>>;"
             )),
             "{method} must take no context: {out}"
         );
@@ -221,7 +223,10 @@ fn an_operation_needing_no_session_gets_no_context() -> TestResult {
         .and_then(|s| s.split("\n}").next())
         .ok_or("the open handler must be emitted")?;
     assert!(!open.contains("Ctx"), "{open}");
-    assert!(open.contains("match service.open(input).await {"), "{open}");
+    assert!(
+        open.contains("let result = service.open(input).await;"),
+        "{open}"
+    );
     Ok(())
 }
 
@@ -241,9 +246,9 @@ type Plain @service {{
     let out = generate_rust::generate(&api, &Config::default())?;
 
     assert!(
-        out.contains(
+        flat(&out).contains(
             "async fn get(&self, input: GetInput) \
-             -> Result<ApiResponse<Thing>, ApiError<PlainGetCodes>>;"
+             -> Result<::treat::ApiResponse<Thing>, ::treat::ApiError<PlainGetCodes>>;"
         ),
         "{out}"
     );
@@ -260,12 +265,26 @@ fn the_context_is_an_associated_type_on_the_service() -> TestResult {
     let out = server()?;
 
     assert!(out.contains("    type Ctx: FromRequestContext;"), "{out}");
-    // The contract the project satisfies, emitted beside the extractor.
+    // The contract the project satisfies: `treat`'s `ResolveContext`, which
+    // the extractor reads the caller with, plus the API's own access checks.
     assert!(
-        out.contains("pub trait FromRequestContext: Sized + Send + Sync + 'static {"),
+        out.contains("pub trait FromRequestContext: ::treat::rpc::server::ResolveContext {"),
         "{out}"
     );
-    assert!(out.contains("pub struct Ctx<T>(pub T);"), "{out}");
+    let reexports = flat(&out)
+        .split("pub use ::treat::rpc::server::{")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .map(str::to_string)
+        .ok_or("the server must re-export the runtime it names")?;
+    // What an implementation names; the extractor `Ctx` is the handlers',
+    // which name it by its path.
+    for item in ["ResolveContext", "Refusal"] {
+        assert!(
+            reexports.split(", ").any(|name| name == item),
+            "{item}: {reexports}"
+        );
+    }
     Ok(())
 }
 
@@ -511,9 +530,13 @@ fn a_service_role_is_checked_on_each_operation_that_inherits_it() -> TestResult 
 }
 
 /// One operation's entry in `createApi`, from its key to its closing brace.
+///
+/// Read from the object `createApi` returns, past the `ops` and `keys` it
+/// builds first, whose per-service blocks open the same way.
 fn api_entry<'a>(out: &'a str, service: &str, op: &str) -> TestResult<&'a str> {
     out.split("export function createApi(")
         .nth(1)
+        .and_then(|s| s.split("\n  return {").nth(1))
         .and_then(|s| s.split(&format!("\n    {service}: {{\n")).nth(1))
         .and_then(|s| s.split("\n    },\n").next())
         .and_then(|s| s.split(&format!("      {op}: {{\n")).nth(1))
@@ -579,8 +602,10 @@ type Ops @service @auth(require: session, role: content_ops) {{
         rust.contains("ctx.require_role(Role::ContentOps)"),
         "{rust}"
     );
+    // `WireEnum` reads the wire name from the rename, so `from_name` and
+    // `as_str` spell it as the session does.
     assert!(
-        rust.contains("            \"content-ops\" => Some(Self::ContentOps),\n"),
+        rust.contains("    #[serde(rename = \"content-ops\")]\n    ContentOps,\n"),
         "{rust}"
     );
 
@@ -601,15 +626,19 @@ fn the_rust_role_set_reads_names_and_follows_the_hierarchy() -> TestResult {
     let out = server()?;
 
     assert!(out.contains("\nimpl Role {\n"), "{out}");
+    // Names both ways come from `WireEnum`, by the renames serde reads.
     assert!(
-        out.contains("            \"content_edit\" => Some(Self::ContentEdit),\n"),
+        out.contains(
+            "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize, ::treat::rpc::WireEnum)]\n\
+             pub enum Role {"
+        ),
         "{out}"
     );
-    assert!(out.contains("            _ => None,\n"), "{out}");
     assert!(
-        out.contains("            Self::ContentEdit => \"content_edit\",\n"),
+        out.contains("    #[serde(rename = \"content_edit\")]\n    ContentEdit,\n"),
         "{out}"
     );
+    let out = flat(&out);
     for arm in [
         "Self::ContentTranslate => matches!(required, Self::ContentTranslate),",
         "Self::ContentEdit => matches!(required, Self::ContentEdit | Self::ContentTranslate),",
@@ -628,7 +657,7 @@ fn the_rust_role_set_reads_names_and_follows_the_hierarchy() -> TestResult {
 fn the_role_check_takes_the_role_type() -> TestResult {
     let out = server()?;
     assert!(
-        out.contains("    fn require_role(&self, role: Role) -> Result<(), Response>;\n"),
+        out.contains("    fn require_role(&self, role: Role) -> Result<(), ::treat::rpc::server::Refusal>;\n"),
         "{out}"
     );
     Ok(())
@@ -647,11 +676,8 @@ fn the_operation_table_carries_each_operations_role() -> TestResult {
         ("releases_list", "None"),
         ("releases_feed", "None"),
     ] {
-        let row = out
-            .lines()
-            .find(|line| line.contains(&format!("Operation {{ id: \"{id}\", ")))
-            .ok_or_else(|| format!("no row for {id}: {out}"))?;
-        assert!(row.ends_with(&format!(", role: {role} }},")), "{id}: {row}");
+        let row = operation_row(&out, id).ok_or_else(|| format!("no row for {id}: {out}"))?;
+        assert!(row.ends_with(&format!(", role: {role} }}")), "{id}: {row}");
         assert!(
             !row.contains("permission:"),
             "no permission set, no column: {row}"
@@ -702,7 +728,8 @@ fn the_typescript_role_set_lists_roles_and_follows_the_hierarchy() -> TestResult
     assert!(
         out.contains(
             "export function roleAuthorizes(held: Role, required: Role): boolean {\n  \
-             return held === required || roleInherits[held].includes(required)\n}"
+             const inherited: readonly Role[] = roleInherits[held]\n  \
+             return held === required || inherited.includes(required)\n}"
         ),
         "{out}"
     );

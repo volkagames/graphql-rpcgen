@@ -16,27 +16,24 @@ mustache = "0.9.0"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-toml = { version = "1.2.1", default-features = false, features = [
+toml = { version = "1.2.3", default-features = false, features = [
     "parse",
     "display",
     "serde",
 ] }
 
 # What the *generated* Rust reaches for, not what the generator needs. The
-# `oneof_wire` and `raw_wire` tests compile generated code in scratch projects
-# and pin their versions to this lockfile, so the set has to resolve here even
-# though no line of `src/` mentions any of it.
-#
-# `raw_wire` is why the server and client halves are here: a `@raw` operation
-# emits handlers and client methods, not just types, and those reach for a web
-# framework and an HTTP stack. `reqwest`'s `stream` feature is what the
-# generated streaming client needs and nothing else does, and `futures-util`'s
-# `io` feature is for a streamed `@raw` request alone
-# — see "What the generated Rust needs on the other side" in the README.
+# `*_wire` tests compile generated code in scratch projects and pin their
+# versions to this lockfile, so the set has to resolve here even though no
+# line of `src/` mentions any of it. The runtime itself is `treat`'s
+# (`treat::rpc`): `rpc-server` for the server target, `rpc-client` for the
+# client, `rpc-stream` for SSE and raw bodies, `validator` for `@pattern` —
+# see "What the generated Rust needs on the other side" in the README.
+# `reqwest` and `tokio` are the wire tests' drivers' alone, for requests the
+# generated client would never send.
 [dev-dependencies]
 async-trait = "0.1"
 axum = "0.8"
-bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 derive_more = { version = "2", features = [
     "from",
@@ -45,18 +42,16 @@ derive_more = { version = "2", features = [
     "as_ref",
 ] }
 error_set = "0.9"
-futures-core = "0.3"
-futures-util = { version = "0.3", features = ["io"] }
-reqwest = { version = "0.13", default-features = false, features = [
-    "json",
-    "rustls",
-    "stream",
-] }
-treat = { version = "0.25", features = [
-    "axum",
+# Not the generated code's: `tests/golden.rs` keeps every target's output
+# with it.
+insta = "1.49"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+treat = { version = "0.27", features = [
+    "rpc-client",
+    "rpc-server",
     "rpc-status-header",
-    "serde-path",
-    "validator-extract",
+    "rpc-stream",
+    "validator",
 ] }
 uuid = { version = "1", features = ["serde"] }
 validator = { version = "0.21", features = ["derive"] }

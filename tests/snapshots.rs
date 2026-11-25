@@ -2,7 +2,9 @@
 //!
 //! Assertions target the constructs that are easy to get wrong (nullability,
 //! unions, oneOf, recursion, constraints) rather than whole-file byte equality,
-//! which would break on every cosmetic change.
+//! which would break on every cosmetic change. The whole files are kept too, by
+//! `golden.rs`, where a cosmetic change is a reviewed diff rather than a
+//! failure to puzzle over.
 
 #![allow(
     clippy::panic_in_result_fn,
@@ -13,6 +15,8 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod common;
+
 use graphql_rpcgen::config::Config;
 use graphql_rpcgen::{generate_openapi, generate_rust, generate_typescript, generate_zod};
 
@@ -21,111 +25,7 @@ fn config() -> Config {
     Config::default()
 }
 
-const SDL: &str = r#"
-scalar UUID
-scalar DateTime
-scalar JSON
-
-"A point in time as whole seconds since the unix epoch."
-scalar ZoroTime
-  @scalar(rust: "u32", typescript: "number", openapiType: "integer", openapiFormat: "int64")
-  @range(min: 0)
-
-scalar PlayerId
-  @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true)
-
-"Identifies a clan. A UUID on the wire."
-scalar ClanId
-  @scalar(
-    rust: "uuid::Uuid"
-    typescript: "string"
-    openapiType: "string"
-    openapiFormat: "uuid"
-    rustNewtype: true
-    rustCopy: true
-  )
-
-"A slug: the pattern lives on the scalar, and every use inherits it."
-scalar Slug
-  @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true)
-  @pattern(value: "^[a-z0-9-]+$")
-
-"A documented enum."
-enum Status { ACTIVE DISABLED }
-
-type Node {
-  id: ClanId!
-  "Recursive reference."
-  parent: Node
-  children: [Node!]!
-}
-
-type Example {
-  a: String!
-  b: String
-  c: [String!]!
-  d: [String]
-  when: DateTime!
-  blob: JSON
-  status: Status!
-}
-
-"The wire tag is not the type name, so the SDL states it."
-type CardPayment @variant(tag: "card") { last4: String! }
-type CryptoPayment { network: String! }
-union PaymentMethod @discriminator(field: "kind") = CardPayment | CryptoPayment
-
-enum SettingKind { flag number }
-type FlagSetting @variant(tag: "flag") { tribool: Boolean }
-type NumberSetting @variant(tag: "number") { min: Int }
-"Selected by the holder's own `kind`, so the member carries no copy of the tag."
-union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
-type Param {
-  label: String!
-  "Which shape `settings` takes."
-  kind: SettingKind!
-  settings: Setting!
-}
-"Nothing but the pair."
-type BareParam { kind: SettingKind! settings: Setting! }
-
-input CardInput { token: String! }
-
-"A tree holding itself through a list, which is what makes its schema recursive."
-input TreeInput {
-  id: String!
-  children: [TreeInput!]
-}
-input CryptoInput { address: String! }
-input PaymentInput @oneOf { card: CardInput crypto: CryptoInput nick: String @length(min: 1) slug: Slug tag: String @pattern(value: "^[a-z]+$") seen: ZoroTime }
-
-input CreateInput {
-  name: String! @length(min: 1, max: 100)
-  age: Int @range(min: 18, max: 150)
-  email: String! @pattern(value: "^[^@]+@[^@]+$")
-  seen: ZoroTime!
-  "A field description overrides the scalar's."
-  touched: ZoroTime
-  bounded: ZoroTime! @range(min: 50, max: 100)
-  "On a list, @length counts elements rather than characters."
-  tags: [String!]! @length(min: 1, max: 5)
-  nested: CardInput
-}
-
-enum ErrorCode {
-  invalid_body
-  internal_error
-  not_found
-  "A code whose wire name is not an identifier, as `ns::name` codes are."
-  things__gone @variant(tag: "things::gone")
-}
-
-type Things @service {
-  "Fetch one thing."
-  get(input: CreateInput!): Example! @query @throws(codes: ["not_found", "things__gone"])
-  make(input: PaymentInput!): PaymentMethod! @mutation
-}
-"#;
+const SDL: &str = include_str!("fixtures/snapshots.graphql");
 
 fn api() -> TestResult<graphql_rpcgen::ir::Api> {
     Ok(graphql_rpcgen::compile_str(SDL)?)
@@ -134,6 +34,7 @@ fn api() -> TestResult<graphql_rpcgen::ir::Api> {
 #[test]
 fn rust_snapshot() -> TestResult {
     let out = generate_rust::generate(&api()?, &config())?;
+    let flat = common::flat(&out);
 
     assert!(out.starts_with("// @generated"), "missing generated header");
     assert!(out.contains("DO NOT EDIT MANUALLY."));
@@ -156,10 +57,14 @@ fn rust_snapshot() -> TestResult {
     assert!(out.contains("pub struct ClanId(pub uuid::Uuid);"));
     assert!(out.contains("pub id: ClanId,"));
     // Conversions are derived, not hand-written.
-    assert!(out.contains("AsRef, Display, From, Into,"));
-    assert!(out.contains("use derive_more::{AsRef, Display, From, Into};"));
+    assert!(flat.contains(
+        "::derive_more::AsRef, ::derive_more::Display, ::derive_more::From, ::derive_more::Into)]"
+    ));
+    // By their paths: the generated code imports nothing an SDL type could
+    // be spelt like.
+    assert!(!out.contains("use derive_more"), "{out}");
     // Ord is required for use as a BTreeMap key.
-    assert!(out.contains("PartialOrd, Ord, Hash,"));
+    assert!(flat.contains("PartialOrd, Ord, Hash,"));
 
     // `Deref` would auto-deref the inner type's whole API onto the wrapper
     // (`clan_id.as_u128()`), dissolving the barrier the newtype exists to be.
@@ -183,7 +88,9 @@ fn rust_snapshot() -> TestResult {
 
     // Constraints are enforced, not merely documented: an input derives
     // `Validate` and each field carries the rules the SDL declared for it.
-    assert!(out.contains("Serialize, Deserialize, Validate)]\npub struct CreateInput {"));
+    assert!(out.contains(
+        "::serde::Serialize, ::serde::Deserialize, ::validator::Validate)]\npub struct CreateInput {"
+    ));
     assert!(out.contains(
         r#"#[validate(length(min = 1, max = 100, message = "length must be between 1 and 100"))]"#
     ));
@@ -210,10 +117,19 @@ fn rust_snapshot() -> TestResult {
 
     // A pattern is compiled once rather than per request, and kept as an
     // `Option` so one that does not compile rejects rather than panicking.
-    assert!(out.contains("static FIELD_CREATE_INPUT_EMAIL_PATTERN: LazyLock<Option<Regex>> ="));
-    assert!(out.contains(r#"Regex::new("^[^@]+@[^@]+$").ok()"#));
-    assert!(out.contains(
-        "fn check_field_create_input_email_pattern<T: validator::ValidateRegex + ?Sized>("
+    // Its source is a `const` of its own, which the failure message quotes.
+    assert!(out.contains(r#"const FIELD_CREATE_INPUT_EMAIL_SOURCE: &str = "^[^@]+@[^@]+$";"#));
+    assert!(flat.contains(
+        "static FIELD_CREATE_INPUT_EMAIL_PATTERN: ::std::sync::LazyLock<Option<::treat::rpc::validate::regex::Regex>> = \
+         ::std::sync::LazyLock::new(|| ::treat::rpc::validate::regex::Regex::new(FIELD_CREATE_INPUT_EMAIL_SOURCE).ok());"
+    ));
+    assert!(flat.contains(
+        "fn check_field_create_input_email_pattern<T>(value: &T) -> \
+         Result<(), ::validator::ValidationError> where T: ::validator::ValidateRegex + ?Sized,"
+    ));
+    // The check binds its outcome before branching on it.
+    assert!(flat.contains(
+        "let matched = ::treat::rpc::validate::matches_pattern(&FIELD_CREATE_INPUT_EMAIL_PATTERN, value); if matched {"
     ));
     assert!(out.contains("#[validate(custom(function = check_field_create_input_email_pattern))]"));
 
@@ -221,81 +137,99 @@ fn rust_snapshot() -> TestResult {
     // is written out: a nested arm delegates, and a scalar arm is measured with
     // the same traits and messages a `#[validate(...)]` attribute would use,
     // under the arm's own key.
-    assert!(out.contains("impl Validate for PaymentInput {"));
-    assert!(out.contains("Self::Card(value) => value.validate(),"));
+    assert!(out.contains("impl ::validator::Validate for PaymentInput {"));
+    assert!(out.contains("Self::Card(value) => ::validator::Validate::validate(value),"));
     assert!(out.contains("Self::Nick(value) => {"));
-    assert!(out
-        .contains(r"if !validator::ValidateLength::validate_length(value, Some(1), None, None) {"));
-    assert!(out.contains(
-        r##"errors.add("nick", validator::ValidationError::new("length").with_message("length must be at least 1".into()));"##
+    assert!(flat.contains(
+        "let length_ok = ::validator::ValidateLength::validate_length(value, Some(1), None, None); \
+         if !length_ok {"
+    ));
+    assert!(flat.contains(
+        r##"let mut error = ::validator::ValidationError::new("length"); error.message = Some("length must be at least 1".into()); errors.add("nick", error);"##
     ));
     // A pattern is borrowed, not moved: the static is a LazyLock, and moving a
     // static out is not legal Rust. Inherited patterns take the scalar's
     // static, field-level ones the owner's.
     assert!(out.contains("Self::Slug(value) => {"));
-    assert!(out.contains("matches_pattern(&SCALAR_SLUG_PATTERN, value)"));
+    assert!(out.contains("matches_pattern(&SCALAR_SLUG_PATTERN, value);"));
     assert!(out.contains("Self::Tag(value) => {"));
     assert!(out.contains("matches_pattern(&FIELD_PAYMENT_INPUT_TAG_PATTERN, value)"));
     assert!(out.contains("Self::Seen(value) => {"));
     // The arm inherits the scalar's own bound, the same as an ordinary field.
-    assert!(out.contains(
-        r"if !validator::ValidateRange::validate_range(value, Some(0), None, None, None) {"
+    assert!(flat.contains(
+        "let range_ok = ::validator::ValidateRange::validate_range(value, Some(0), None, None, None); \
+         if !range_ok {"
     ));
 
     // A constraint on a newtype-typed field measures the wire value inside it.
-    assert!(out.contains("impl validator::ValidateLength<u64> for PlayerId {"));
-    assert!(out.contains("validator::ValidateLength::length(&self.0)"));
-    assert!(out.contains("impl validator::ValidateRegex for ClanId {"));
-    assert!(out.contains("validator::ValidateRegex::validate_regex(&self.to_string(), regex)"));
+    assert!(out.contains("impl ::validator::ValidateLength<u64> for PlayerId {"));
+    assert!(out.contains("::validator::ValidateLength::length(&self.0)"));
+    assert!(out.contains("impl ::validator::ValidateRegex for ClanId {"));
+    assert!(out.contains("::validator::ValidateRegex::validate_regex(&self.to_string(), regex)"));
 
     // A body that parses but breaks a rule is rejected before the trait is
-    // called, as the registry code for a body that did not match the input.
-    assert!(out.contains("let validation = validator::Validate::validate(&input);\n    if let Err(violations) = validation {"));
-    assert!(out.contains("return invalid_input(&violations);"));
-    assert!(out.contains("message.code = ErrorCode::invalid_body.to_string();"));
+    // called, as the registry code for a body that did not match the input:
+    // `json_input` reads and validates, and `RuntimeCodes` names the code.
+    assert!(out.contains("    let input = Rt::json_input(request).await?;\n"));
+    assert!(out.contains(
+        "impl ::treat::rpc::RuntimeCodes for ErrorCode {\n    \
+         const INVALID_BODY: Self = Self::invalid_body;\n    \
+         const INTERNAL_ERROR: Self = Self::internal_error;\n}"
+    ));
+    assert!(out.contains("type Rt = ::treat::rpc::Runtime<ErrorCode>;"));
 
     // Enum variants keep their wire spelling.
     assert!(out.contains(r#"#[serde(rename = "ACTIVE")]"#));
     assert!(out.contains("    Active,"));
-    // Every enum lists its values in SDL order and spells them both ways, so a
-    // consumer storing one as text writes no array or `match` of its own; and
-    // it is `Hash`, so it keys a set or a map.
+    // Every enum lists its values in SDL order and spells them both ways —
+    // `WireEnum`, reading the renames — so a consumer storing one as text
+    // writes no array or `match` of its own; and it is `Hash`, so it keys a
+    // set or a map. The trait is re-exported, so a glob import reaches
+    // `Status::from_name`.
     assert!(out.contains(
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]\npub enum Status {"
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize, ::treat::rpc::WireEnum)]\n\
+         pub enum Status {"
     ));
-    assert!(out.contains(
-        "impl Status {\n    /// Every value, in the order the SDL declares them.\n    \
-         pub const ALL: &[Self] = &[\n        Self::Active,\n        Self::Disabled,\n    ];\n"
-    ));
-    assert!(out.contains("            \"DISABLED\" => Some(Self::Disabled),\n"));
-    assert!(out.contains("            Self::Disabled => \"DISABLED\",\n"));
-    assert!(out.contains(
-        "pub const ALL: &[Self] = &[\n        Self::Flag,\n        Self::Number,\n    ];"
-    ));
+    assert!(out.contains("    #[serde(rename = \"DISABLED\")]\n    Disabled,\n"));
+    assert!(
+        out.contains("pub use ::treat::rpc::{Narrow, UNDECLARED_CODE_META, Undeclared, WireEnum};")
+    );
+    assert!(
+        !out.contains("pub const ALL: &[Self]"),
+        "the trait lists the values: {out}"
+    );
 
     // Service trait and Axum bindings.
     assert!(out.contains("pub trait ThingsService: Clone + Send + Sync + 'static {"));
     // The success half is the envelope; the failure half names the codes this
     // operation is allowed to use, so an undeclared one does not type-check.
-    assert!(out.contains(
-        "async fn get(&self, input: CreateInput) -> Result<ApiResponse<Example>, ApiError<ThingsGetCodes>>;"
+    assert!(flat.contains(
+        "async fn get(&self, input: CreateInput) -> Result<::treat::ApiResponse<Example>, ::treat::ApiError<ThingsGetCodes>>;"
     ));
-    assert!(out.contains("pub fn things_router<S: ThingsService>(service: S) -> Router {"));
-    assert!(out.contains(r#".route("/rpc/things/get", post(things_get::<S>))"#));
+    assert!(out.contains("pub fn things_router<S: ThingsService>(service: S) -> ::axum::Router {"));
+    assert!(out.contains(r#".route("/rpc/things/get", ::axum::routing::post(things_get::<S>))"#));
 
     // The error model is codes and nothing else: one flat registry naming every
     // code the API can return, with no per-code payload struct.
     assert!(out.contains("pub enum ErrorCode {"));
-    assert!(out.contains("Serialize, Deserialize, ApiErrorCode)]"));
-    assert!(out.contains("#[allow(non_camel_case_types)]"));
+    assert!(flat.contains(
+        "::serde::Deserialize, ::treat::ApiErrorCode, ::treat::rpc::WireEnum)] pub enum ErrorCode {"
+    ));
+    assert!(out.contains("#[allow(non_camel_case_types, reason = "));
     assert!(out.contains(r#"    #[message("not found")]"#));
     assert!(out.contains("    not_found,"));
 
     // Every operation's set is a variant list in one `error_set!` declaration:
     // one block, so the macro sees which sets are subsets of which and derives
     // the conversions a shared check needs.
-    assert!(out.contains("error_set! {"));
-    assert!(out.contains(r#"        #[display("not_found")] NotFound,"#));
+    assert!(out.contains("::error_set::error_set! {"));
+    // `ApiErrorCode` writes the code by its `#[code]`, which is also what
+    // `WireEnum` narrows by; `error_set`'s own `Display` is skipped for it.
+    assert!(out.contains(
+        "    #[skip(Display)]\n    #[derive(Clone, Copy, ::treat::ApiErrorCode, ::treat::rpc::WireEnum)]\n    ThingsGetCodes := {"
+    ));
+    assert!(out.contains(r#"        #[code("not_found")] NotFound,"#));
+    assert!(out.contains(r#"        #[undeclared] #[code("internal_error")] InternalError,"#));
 
     // A tagged code keeps its identifier as the Rust name and carries the tag
     // everywhere a string is produced: `Display` (what `treat` writes into the
@@ -303,18 +237,10 @@ fn rust_snapshot() -> TestResult {
     assert!(out.contains(
         "    #[message(\"gone\")]\n    #[code(\"things::gone\")]\n    #[serde(rename = \"things::gone\")]\n    things__gone,"
     ));
-    assert!(out.contains(r#"        #[display("things::gone")] ThingsGone,"#));
-    assert!(!out.contains(r#"#[display("things__gone")]"#));
-    // The registry gets what every enum gets, over its own variant names, and
-    // spells a tagged code by its tag there too.
-    assert!(out.contains("Hash, Serialize, Deserialize, ApiErrorCode)]"));
-    assert!(out.contains(
-        "impl ErrorCode {\n    /// Every value, in the order the SDL declares them.\n    \
-         pub const ALL: &[Self] = &[\n        Self::invalid_body,\n        Self::internal_error,\n        \
-         Self::not_found,\n        Self::things__gone,\n    ];\n"
-    ));
-    assert!(out.contains("            \"things::gone\" => Some(Self::things__gone),\n"));
-    assert!(out.contains("            Self::things__gone => \"things::gone\",\n"));
+    assert!(out.contains(r#"        #[code("things::gone")] ThingsGone,"#));
+    assert!(!out.contains(r#"#[code("things__gone")]"#));
+    // No conversion per set: `Narrow` reads a code into a set by its wire name.
+    assert!(!out.contains("impl TryFrom<ErrorCode>"), "{out}");
 
     // A set names what the operation declared, then what the runtime can emit
     // on its own. Anything else fails to compile at the handler, which is what
@@ -326,14 +252,11 @@ fn rust_snapshot() -> TestResult {
     assert!(!out.contains("statuses"), "no status plumbing may survive");
     assert!(!out.contains("STATUS"), "no per-error status constant");
 
-    // The body is parsed by treat's extractor, which reports `invalid_body`
-    // with a JSON Pointer instead of a bare 400.
-    assert!(out.contains("use treat::extract_axum::ApiJson;"));
-    assert!(out.contains("<ApiJson<CreateInput> as axum::extract::FromRequest<()>>"));
-    // The handler translates nothing: the envelope is a response, and so is
-    // `ApiError`.
-    assert!(out.contains("match service.get(input).await"));
-    assert!(out.contains("Err(error) => error.into_response(),"));
+    // The handler translates nothing: the runtime answers with the envelope
+    // the service returned, or the failure's.
+    assert!(
+        out.contains("    let result = service.get(input).await;\n    Ok(Rt::respond(result))\n")
+    );
     Ok(())
 }
 
@@ -447,6 +370,18 @@ fn typescript_snapshot() -> TestResult {
     assert!(out.contains("queryOptions: (input: CreateInput)"));
     assert!(out.contains("mutationOptions: ()"));
     assert!(out.contains("queryKey('things', 'get', input)"));
+    // `createApi` is built on the per-service object: the request is spelled
+    // once, there, and the entry's call and helpers go through it, the query
+    // key built once and reused by `queryOptions`.
+    assert_eq!(
+        out.matches("client.call<Example>('/rpc/things/get'")
+            .count(),
+        1
+    );
+    assert!(out.contains("    things: createThingsOperations(client),\n"));
+    assert!(out.contains("        call: ops.things.get,\n        queryKey: keys.things.get,\n"));
+    assert!(out.contains("          queryKey: keys.things.get(input),\n"));
+    assert!(out.contains("          queryFn: ({ signal }) => ops.things.get(input, { signal }),\n"));
     // The prefix every key of an operation starts with, without a client in
     // reach, so invalidating all of its queries names it typed.
     assert!(out.contains("export const operationKeys = {\n  things: {\n"));
@@ -458,8 +393,9 @@ fn typescript_snapshot() -> TestResult {
     assert!(out.contains("export interface RpcErrorItem {"));
     // `meta` is an object, not an arbitrary value: indexing it must not need
     // a cast at the call site.
-    assert!(out.contains("meta?: Record<string, unknown>"));
-    assert!(out.contains("metaFor(code: RpcErrorCode): Record<string, unknown> | undefined {"));
+    assert!(out.contains("meta?: globalThis.Record<string, unknown>"));
+    assert!(out
+        .contains("metaFor(code: RpcErrorCode): globalThis.Record<string, unknown> | undefined {"));
     assert!(out.contains("export interface RpcErrorSource {"));
     assert!(out.contains("get pointer(): string | undefined {"));
     assert!(out.contains("export type RpcRuntimeErrorCode = 'invalid_body' | 'internal_error'"));
@@ -848,32 +784,7 @@ fn zod_snapshot() -> TestResult {
 
 /// An `@http` operation in the targets nothing compiles: the TypeScript client
 /// and the OpenAPI document. `http_wire` covers the Rust ones on a socket.
-const HTTP_SDL: &str = r#"
-enum ErrorCode { invalid_body internal_error not_found }
-input UserInput { user_id: String! }
-input InfoInput { session_id: String verbose: Boolean }
-input RenameInput { id: String! name: String! }
-input Filter { a: Int }
-input SearchInput { filters: [Filter!] one: Filter }
-type User { id: String! }
-type Info { session_id: String }
-type Users @service {
-  user(input: UserInput!): User!
-    @query @http(method: GET, path: "/api/user/{user_id}", envelope: false) @throws(codes: ["not_found"])
-  info(input: InfoInput!): Info!
-    @query @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
-  drop(input: UserInput!): User!
-    @mutation @http(method: DELETE, path: "/api/user/{user_id}")
-  rename(input: RenameInput!): User!
-    @mutation @http(method: PUT, path: "/items/{id}")
-  search(input: SearchInput!): User!
-    @query @http(method: GET, path: "/search")
-  find(input: SearchInput!): User!
-    @mutation @http(method: POST, path: "/find", body: FORM)
-  logout: User!
-    @mutation @http(method: POST, path: "/logout")
-}
-"#;
+const HTTP_SDL: &str = include_str!("fixtures/snapshots_http.graphql");
 
 #[test]
 fn http_typescript_snapshot() -> TestResult {
@@ -888,9 +799,30 @@ fn http_typescript_snapshot() -> TestResult {
     ] {
         assert!(ts.contains(expected), "missing `{expected}` in:\n{ts}");
     }
-    assert!(ts.contains("throw new TypeError(`path parameter \\`${name}\\` is missing`)"));
-    // An object in a list rides as JSON text, as the server reads it.
-    assert!(ts.contains("for (const item of value) params.append(key, queryParam(item))"));
+    assert!(
+        ts.contains("throw new globalThis.TypeError(`path parameter \\`${name}\\` is missing`)")
+    );
+    // An object rides as JSON text, a list's items included, and only a list
+    // repeats its key: the table the server reads with says which field is
+    // which, so it rides with the spec wherever it changes the spelling.
+    for expected in [
+        "client.http<User>('/search', input, { method: 'GET', pathFields: [], body: 'none', envelope: true, fields: { filters: 'json[]', one: 'json' } }, options)",
+        "client.http<User>('/find', input, { method: 'POST', pathFields: [], body: 'form', envelope: true, fields: { filters: 'json[]', one: 'json' } }, options)",
+    ] {
+        assert!(ts.contains(expected), "missing `{expected}` in:\n{ts}");
+    }
+    // A JSON body beside a plain path parameter needs no table: every field
+    // it carries is JSON already.
+    assert!(
+        ts.contains("client.http<User>('/items/{id}', input, { method: 'PUT', pathFields: ['id'], body: 'json', envelope: true }, options)"),
+        "{ts}"
+    );
+    assert!(
+        ts.contains("for (const text of paramTexts(key, value, table)) params.append(key, text)")
+    );
+    assert!(ts.contains(
+        "throw new globalThis.TypeError(`list field \\`${key}\\` has a \\`null\\` item, which no query parameter spells`)"
+    ));
     assert!(
         ts.contains("this.validate?.(`${spec.method} ${path}`, input ?? {})"),
         "{ts}"
@@ -1052,4 +984,149 @@ type Users @service { me: User! @query  plain: Plain! @query }
         Some(&serde_json::json!(["id"]))
     );
     Ok(())
+}
+
+/// Every way an input field is spelled as text, on every operation form that
+/// sends one; shared with `ts_check`'s runtime test.
+const FIELD_KINDS_SDL: &str = include_str!("ts/field_kinds.graphql");
+
+/// One field-table entry as both targets spell it: name, kind (`Str`, `Int`,
+/// `Float`, `Bool`, `Json`) and whether it is a list.
+type Entry = (String, String, bool);
+
+/// The TypeScript client's field tables are the Rust server's.
+///
+/// The two generators each derive a field's kind from its type, so this holds
+/// them to one answer: wherever the TypeScript spec carries a table, it lists
+/// the entries of the `static` the server reads with, in order; where it
+/// carries none, every entry it would have counted is a plain one — not JSON,
+/// not a list — which the TypeScript runtime writes the same way with or
+/// without a table.
+#[test]
+fn the_typescript_field_tables_are_the_servers() -> TestResult {
+    let mut sdls: Vec<(&str, &str)> = common::fixtures::FIXTURES
+        .iter()
+        .map(|fixture| (fixture.name, fixture.sdl))
+        .collect();
+    sdls.push(("field_kinds", FIELD_KINDS_SDL));
+    let mut tables = 0usize;
+    let mut omitted = 0usize;
+    for (name, sdl) in sdls {
+        let api = graphql_rpcgen::compile_str(sdl)?;
+        let ts = generate_typescript::generate(&api);
+        let rust = common::flat(&generate_rust::generate_types(&api, &config())?);
+        for service in &api.services {
+            for op in &service.operations {
+                let at = format!("{name}: {}.{}", service.name, op.name);
+                let rows = rust_table(&rust, &service.name, &op.name);
+                let table = ts_table(&ts, &service.name, &op.name).ok_or(at.clone())?;
+                match (table, rows) {
+                    (Some(entries), rows) => {
+                        assert_eq!(Some(entries), rows, "{at}");
+                        tables = tables.saturating_add(1);
+                    }
+                    (None, None) => {}
+                    (None, Some(rows)) => {
+                        // A JSON body carries every field but the path's as
+                        // JSON whatever the table says.
+                        let counted = |row: &&Entry| match &op.http {
+                            Some(http) if http.body == graphql_rpcgen::ir::HttpBody::Json => {
+                                http.path_params.contains(&row.0)
+                            }
+                            _ => true,
+                        };
+                        let plain = rows
+                            .iter()
+                            .filter(counted)
+                            .all(|(_, kind, list)| kind != "Json" && !list);
+                        assert!(plain, "{at}: no table, but {rows:?}");
+                        omitted = omitted.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    assert!(tables >= 8, "only {tables} tables compared");
+    assert!(omitted >= 8, "only {omitted} omitted tables checked");
+    Ok(())
+}
+
+/// The entries of an operation's field table in generated Rust (flattened):
+/// its `_FIELDS` static, else its `_HTTP` spec's `.fields(..)`; `None` without
+/// either. Each entry is a `QueryField` constructor — `QueryField::int("n")`,
+/// `.list()` after it for a list — read back as the kind's variant name.
+fn rust_table(rust: &str, service: &str, operation: &str) -> Option<Vec<Entry>> {
+    let name = format!(
+        "{}_{}",
+        graphql_rpcgen::naming::snake_case_raw(service),
+        graphql_rpcgen::naming::snake_case_raw(operation)
+    )
+    .to_uppercase();
+    let fields = format!("pub static {name}_FIELDS: &[QueryField] = &[");
+    let http = format!("pub static {name}_HTTP: HttpSpec = ");
+    let segment = match rust.split_once(&fields) {
+        Some((_, rest)) => rest.split_once("];").map(|(table, _)| table),
+        None => {
+            let (_, spec) = rust.split_once(&http)?;
+            let (spec, _) = spec.split_once(';')?;
+            Some(
+                spec.split_once(".fields(&[")
+                    .and_then(|(_, rest)| rest.split_once("])"))
+                    .map_or("", |(table, _)| table),
+            )
+        }
+    }?;
+    let entries = segment
+        .split("QueryField::")
+        .skip(1)
+        .filter_map(|entry| {
+            let (constructor, rest) = entry.split_once("(\"")?;
+            let (field, rest) = rest.split_once("\")")?;
+            let list = rest.starts_with(".list()");
+            let mut kind = constructor.chars();
+            let first = kind.next()?.to_ascii_uppercase();
+            Some((field.to_string(), format!("{first}{}", kind.as_str()), list))
+        })
+        .collect();
+    Some(entries)
+}
+
+/// The entries of the table an operation's TypeScript call passes, from its
+/// `create<Service>Operations` object: `Some(None)` when it passes none, and
+/// `None` when the call itself is not found.
+fn ts_table(ts: &str, service: &str, operation: &str) -> Option<Option<Vec<Entry>>> {
+    let start = format!("export function create{service}Operations(client: RpcClient) {{\n");
+    let (_, object) = ts.split_once(&start)?;
+    let (object, _) = object.split_once("\n}\n")?;
+    let (_, call) = object.split_once(&format!("\n    {operation}: ("))?;
+    let call = call.lines().nth(1)?;
+    let literal = match call.split_once("fields: { ") {
+        Some((_, rest)) => rest,
+        None => match call.split_once("handlers, { ") {
+            Some((_, rest)) => rest,
+            None => return Some(None),
+        },
+    };
+    let (literal, _) = literal.split_once(" }")?;
+    let entries = literal
+        .split(", ")
+        .filter_map(|entry| {
+            let (field, kind) = entry.split_once(": ")?;
+            let kind = kind.trim_matches('\'');
+            let (kind, list) = match kind.strip_suffix("[]") {
+                Some(kind) => (kind, true),
+                None => (kind, false),
+            };
+            let kind = match kind {
+                "str" => "Str",
+                "int" => "Int",
+                "float" => "Float",
+                "bool" => "Bool",
+                "json" => "Json",
+                _ => return None,
+            };
+            Some((field.to_string(), kind.to_string(), list))
+        })
+        .collect();
+    Some(Some(entries))
 }

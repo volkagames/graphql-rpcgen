@@ -1,0 +1,103 @@
+scalar UUID
+scalar DateTime
+scalar JSON
+
+"A point in time as whole seconds since the unix epoch."
+scalar ZoroTime
+  @scalar(rust: "u32", typescript: "number", openapiType: "integer", openapiFormat: "int64")
+  @range(min: 0)
+
+scalar PlayerId
+  @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true)
+
+"Identifies a clan. A UUID on the wire."
+scalar ClanId
+  @scalar(
+    rust: "uuid::Uuid"
+    typescript: "string"
+    openapiType: "string"
+    openapiFormat: "uuid"
+    rustNewtype: true
+    rustCopy: true
+  )
+
+"A slug: the pattern lives on the scalar, and every use inherits it."
+scalar Slug
+  @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true)
+  @pattern(value: "^[a-z0-9-]+$")
+
+"A documented enum."
+enum Status { ACTIVE DISABLED }
+
+type Node {
+  id: ClanId!
+  "Recursive reference."
+  parent: Node
+  children: [Node!]!
+}
+
+type Example {
+  a: String!
+  b: String
+  c: [String!]!
+  d: [String]
+  when: DateTime!
+  blob: JSON
+  status: Status!
+}
+
+"The wire tag is not the type name, so the SDL states it."
+type CardPayment @variant(tag: "card") { last4: String! }
+type CryptoPayment { network: String! }
+union PaymentMethod @discriminator(field: "kind") = CardPayment | CryptoPayment
+
+enum SettingKind { flag number }
+type FlagSetting @variant(tag: "flag") { tribool: Boolean }
+type NumberSetting @variant(tag: "number") { min: Int }
+"Selected by the holder's own `kind`, so the member carries no copy of the tag."
+union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
+type Param {
+  label: String!
+  "Which shape `settings` takes."
+  kind: SettingKind!
+  settings: Setting!
+}
+"Nothing but the pair."
+type BareParam { kind: SettingKind! settings: Setting! }
+
+input CardInput { token: String! }
+
+"A tree holding itself through a list, which is what makes its schema recursive."
+input TreeInput {
+  id: String!
+  children: [TreeInput!]
+}
+input CryptoInput { address: String! }
+input PaymentInput @oneOf { card: CardInput crypto: CryptoInput nick: String @length(min: 1) slug: Slug tag: String @pattern(value: "^[a-z]+$") seen: ZoroTime }
+
+input CreateInput {
+  name: String! @length(min: 1, max: 100)
+  age: Int @range(min: 18, max: 150)
+  email: String! @pattern(value: "^[^@]+@[^@]+$")
+  seen: ZoroTime!
+  "A field description overrides the scalar's."
+  touched: ZoroTime
+  bounded: ZoroTime! @range(min: 50, max: 100)
+  "On a list, @length counts elements rather than characters."
+  tags: [String!]! @length(min: 1, max: 5)
+  nested: CardInput
+}
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  not_found
+  "A code whose wire name is not an identifier, as `ns::name` codes are."
+  things__gone @variant(tag: "things::gone")
+}
+
+type Things @service {
+  "Fetch one thing."
+  get(input: CreateInput!): Example! @query @throws(codes: ["not_found", "things__gone"])
+  make(input: PaymentInput!): PaymentMethod! @mutation
+}

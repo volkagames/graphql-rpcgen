@@ -1,0 +1,867 @@
+---
+source: tests/golden.rs
+expression: output
+---
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RPC API",
+    "version": "0.1.0",
+    "description": "Generated from GraphQL SDL by graphql-rpcgen. RPC operations are POST + JSON; an operation bound to HTTP keeps its own method, path and body, as each one describes."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Users"
+    }
+  ],
+  "paths": {
+    "/api/user/new": {
+      "get": {
+        "operationId": "users_blank",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.blank",
+        "description": "A fixed segment where `user` has its parameter: the router tries it first.",
+        "x-rpc-kind": "query",
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/user_by_email": {
+      "get": {
+        "operationId": "users_byemail",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.byEmail",
+        "description": "Everything in the query string.",
+        "x-rpc-kind": "query",
+        "parameters": [
+          {
+            "name": "email",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/user/{user_id}": {
+      "delete": {
+        "operationId": "users_drop",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.drop",
+        "description": "A second method on a path `user` already answers.",
+        "x-rpc-kind": "mutation",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "users_user",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.user",
+        "description": "A path parameter, answered bare.",
+        "x-rpc-kind": "query",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "not_found",
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/info": {
+      "post": {
+        "operationId": "users_info",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.info",
+        "description": "Any method; a form body over the query string.",
+        "x-rpc-kind": "query",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "session_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "session_cookie": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "verbose": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-rpc-any-method": true,
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Info"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/me": {
+      "get": {
+        "operationId": "users_me",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.me",
+        "description": "Any method, nothing to read.",
+        "x-rpc-kind": "query",
+        "x-rpc-any-method": true,
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/items/{id}": {
+      "put": {
+        "operationId": "users_rename",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.rename",
+        "description": "A JSON body beside a path parameter, the envelope kept.",
+        "x-rpc-kind": "mutation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "default": {
+            "description": "A failure the runtime answers with a status: `400` for an input it cannot read (`413` for a body past the limit), `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. A failure the service returns answers 200 unless it carries another status; the others are described under `default`.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Renamed"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/whoami": {
+      "get": {
+        "operationId": "users_whoami",
+        "tags": [
+          "Users"
+        ],
+        "summary": "Users.whoami",
+        "description": "A session and a role, answered bare: both refusals need a status.",
+        "x-rpc-kind": "query",
+        "x-role": "admin",
+        "responses": {
+          "200": {
+            "description": "The value itself, not the `data` envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure: the envelope with `errors[]`, under the status the error carries, `500` when it carries none; `400` (`413` past the body limit) for an input the runtime cannot read, `401` for a refused session, `403` for denied access.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Failure",
+                  "type": "object",
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "allOf": [
+                          {
+                            "$ref": "#/components/schemas/RpcErrorItem"
+                          }
+                        ],
+                        "properties": {
+                          "code": {
+                            "enum": [
+                              "role_required",
+                              "invalid_body",
+                              "internal_error"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "errors"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorCode": {
+        "type": "string",
+        "enum": [
+          "invalid_body",
+          "internal_error",
+          "not_found",
+          "database_error",
+          "role_required"
+        ]
+      },
+      "FindInput": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        },
+        "required": [
+          "email"
+        ]
+      },
+      "Info": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verbose": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "verbose"
+        ]
+      },
+      "InfoInput": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_cookie": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verbose": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "Me": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ]
+      },
+      "RenameInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "Renamed": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "admin"
+        ]
+      },
+      "User": {
+        "description": "Every key present, an absent value as null: the format the clients already read.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "limit"
+        ]
+      },
+      "UserInput": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ]
+      },
+      "RpcErrorItem": {
+        "type": "object",
+        "description": "One entry of `errors[]`, as produced by `treat::ErrorMessage`.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object",
+            "description": "Free-form context; its keys depend on the code."
+          },
+          "type": {
+            "type": "string",
+            "description": "RFC 9457 problem type URI."
+          },
+          "instance": {
+            "type": "string",
+            "description": "RFC 9457 occurrence id."
+          },
+          "source": {
+            "type": "object",
+            "description": "Locator for the offending input (JSON:API `source`).",
+            "properties": {
+              "pointer": {
+                "type": "string",
+                "description": "RFC 6901 JSON Pointer."
+              },
+              "parameter": {
+                "type": "string"
+              },
+              "header": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RpcErrorItem"
+            }
+          }
+        },
+        "required": [
+          "errors"
+        ]
+      }
+    },
+    "headers": {
+      "x-rpc-status": {
+        "description": "`ok` when `errors[]` is empty, `error` otherwise.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -207,7 +207,7 @@ fn the_client_emits_a_method_per_operation() -> TestResult {
     assert!(client.contains("pub fn query(&self) -> QueryOperations<'_>"));
     assert!(
         client.contains(
-            "pub async fn get(&self, input: &GetInput) -> ClientResult<GetOutput, QueryGetCodes>"
+            "pub async fn get(&self, input: &GetInput) -> ::treat::rpc::client::ClientResult<GetOutput, QueryGetCodes>"
         ),
         "{client}"
     );
@@ -255,11 +255,15 @@ fn the_client_reuses_the_treat_envelope() -> TestResult {
     let api = graphql_rpcgen::compile_str(&sdl(PLAIN_SDL))?;
     let client = graphql_rpcgen::generate_rust_client::generate(&api, &Config::default())?;
 
+    // Re-exported from `treat::rpc::client`, which defines them over
+    // `treat`'s own entries; the generated module keeps their paths.
     assert!(
-        client.contains("pub use treat::{ErrorMessage, ErrorSource};"),
+        client.contains(
+            "pub use ::treat::rpc::client::{ApiErrors, ApiResponse, ClientError, ClientResult, \
+             ErrorMessage, ErrorSource, reqwest};"
+        ),
         "{client}"
     );
-    assert!(client.contains("= treat::ApiResponse<T,"), "{client}");
     for copy in [
         "pub struct ErrorMessage",
         "pub struct ErrorSource",
@@ -292,35 +296,37 @@ fn an_operation_without_input_emits_no_parameter() -> TestResult {
     let server = graphql_rpcgen::generate_rust::generate(&api, &config)?;
     assert!(
         server.contains(
-            "async fn me(&self) -> Result<ApiResponse<MeOutput>, ApiError<QueryMeCodes>>;"
+            "async fn me(&self) -> Result<::treat::ApiResponse<MeOutput>, ::treat::ApiError<QueryMeCodes>>;"
         ),
         "the trait method takes no input: {server}"
     );
-    // The body is still validated — a malformed one must be `invalid_body`
+    // The body is still read — a malformed one must be `invalid_body`
     // rather than reaching the handler — but nothing is bound from it.
     assert!(
-        server.contains("<ApiJson<serde::de::IgnoredAny> as axum::extract::FromRequest<()>>"),
-        "the body is validated and discarded: {server}"
+        server.contains("    Rt::no_input(request).await?;\n"),
+        "the body is read and discarded: {server}"
     );
     assert!(
-        server.contains("match service.me().await"),
+        server.contains("    let result = service.me().await;\n"),
         "the trait call passes no input: {server}"
     );
 
     let client = graphql_rpcgen::generate_rust_client::generate(&api, &config)?;
     assert!(
-        client.contains("pub async fn me(&self) -> ClientResult<MeOutput, QueryMeCodes>"),
+        client.contains(
+            "pub async fn me(&self) -> ::treat::rpc::client::ClientResult<MeOutput, QueryMeCodes>"
+        ),
         "{client}"
     );
     // The empty object still goes on the wire, so the server sees no change.
     assert!(
-        client.contains(r#"self.client.call("/me", &serde_json::json!({})).await"#),
+        client.contains(r#"self.client.call("/me", &::treat::rpc::client::NoInput).await"#),
         "{client}"
     );
 
     let ts = graphql_rpcgen::generate_typescript::generate(&api);
     assert!(
-        ts.contains("me: (options?: RpcCallOptions): Promise<MeOutput> =>"),
+        ts.contains("me: (options?: RpcCallOptions): globalThis.Promise<MeOutput> =>"),
         "{ts}"
     );
     assert!(

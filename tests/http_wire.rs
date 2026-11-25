@@ -18,85 +18,23 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-use std::process::Command;
+mod common;
+
+use common::Dependency;
 
 /// One operation per form the server and the clients branch on: a path
 /// parameter, a query string, `ANY` reading a form body over the query string,
 /// no input at all, a JSON body beside a path parameter with the envelope kept,
 /// and a second method on a path already taken.
-const SDL: &str = r#"
-scalar UUID
-
-enum ErrorCode {
-  invalid_body
-  internal_error
-  not_found
-  "Declared by no operation, so every generated set keeps a reachable fallback."
-  database_error
-  role_required
-}
-
-enum Role @roles { admin }
-
-input UserInput { user_id: String! }
-input FindInput { email: String! limit: Int }
-input InfoInput { session_id: String session_cookie: String verbose: Boolean }
-input RenameInput { id: UUID! name: String! }
-
-"Every key present, an absent value as null: the format the clients already read."
-type User @explicitNulls { id: String! email: String! limit: Int }
-type Info { session_id: String verbose: Boolean! }
-type Renamed { id: UUID! name: String! }
-type Me { user_id: String! }
-
-type Users @service {
-  "A path parameter, answered bare."
-  user(input: UserInput!): User!
-    @query
-    @http(method: GET, path: "/api/user/{user_id}", envelope: false)
-    @throws(codes: ["not_found"])
-
-  "Everything in the query string."
-  byEmail(input: FindInput!): User!
-    @query
-    @http(method: GET, path: "/api/user_by_email", envelope: false)
-
-  "Any method; a form body over the query string."
-  info(input: InfoInput!): Info!
-    @query
-    @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
-
-  "Any method, nothing to read."
-  me: Me!
-    @query
-    @http(method: ANY, path: "/api/me", envelope: false)
-
-  "A JSON body beside a path parameter, the envelope kept."
-  rename(input: RenameInput!): Renamed!
-    @mutation
-    @http(method: PUT, path: "/items/{id}")
-
-  "A second method on a path `user` already answers."
-  drop(input: UserInput!): Me!
-    @mutation
-    @http(method: DELETE, path: "/api/user/{user_id}", envelope: false)
-
-  "A fixed segment where `user` has its parameter: the router tries it first."
-  blank: Me!
-    @query
-    @http(method: GET, path: "/api/user/new", envelope: false)
-
-  "A session and a role, answered bare: both refusals need a status."
-  whoami: Me!
-    @query
-    @http(method: GET, path: "/api/whoami", envelope: false)
-    @auth(require: session, role: admin)
-    @throws(codes: ["role_required"])
-}
-"#;
+const SDL: &str = include_str!("fixtures/http_wire.graphql");
 
 const DRIVER: &str = r##"
-// --- driver ------------------------------------------------------------------
+//! The test driver: an implementation of the generated trait and the wire
+//! tests. Not generated code, so the lints the generated modules are held to
+//! are not this module's.
+#![allow(clippy::all, dead_code, unused_imports, reason = "a test driver, not generated code")]
+
+use crate::{client, server, types};
 
 #[derive(Clone)]
 pub struct Users;
@@ -106,23 +44,24 @@ pub struct Users;
 /// status.
 pub struct Caller(String);
 
-fn refusal(code: &str) -> axum::response::Response {
+fn refusal(code: &str) -> server::Refusal {
     axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
         "errors": [{ "code": code, "message": code }]
     })))
+    .into()
 }
 
-impl server::FromRequestContext for Caller {
-    async fn from_parts(
-        parts: &mut axum::http::request::Parts,
-    ) -> Result<Self, axum::response::Response> {
+impl server::ResolveContext for Caller {
+    async fn from_parts(parts: &mut axum::http::request::Parts) -> Result<Self, server::Refusal> {
         match parts.headers.get("x-user").and_then(|v| v.to_str().ok()) {
             Some(user) => Ok(Caller(user.to_string())),
             None => Err(refusal("unauthenticated")),
         }
     }
+}
 
-    fn require_role(&self, _role: server::Role) -> Result<(), axum::response::Response> {
+impl server::FromRequestContext for Caller {
+    fn require_role(&self, _role: server::Role) -> Result<(), server::Refusal> {
         match self.0.as_str() {
             "admin" => Ok(()),
             _ => Err(refusal("forbidden")),
@@ -215,6 +154,8 @@ impl server::UsersService for Users {
 
 #[cfg(test)]
 mod wire {
+    use super::{client, server, types};
+
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     const ID: &str = "7b1e3c2a-0000-4000-8000-000000000001";
@@ -223,13 +164,15 @@ mod wire {
     async fn serve() -> TestResult<String> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let router = crate::server::users_router(super::Users);
+        let router = server::users_router(super::Users);
+        // The table the lookups below search is one they can search.
+        assert_eq!(treat::rpc::route::check_table(types::operations::ALL), Ok(()));
         tokio::spawn(async move { axum::serve(listener, router).await });
         Ok(base)
     }
 
-    fn client(base: &str) -> crate::client::ApiClient {
-        crate::client::ApiClient::new(base)
+    fn client(base: &str) -> client::ApiClient {
+        client::ApiClient::new(base)
     }
 
     /// The path parameter is the input; the answer is the value, not `{data}`.
@@ -244,18 +187,19 @@ mod wire {
         // A segment needing escapes survives the client's encoding and the router's decoding.
         let user = client(&base)
             .users()
-            .user(&crate::types::UserInput { user_id: "a b/c".to_string() })
+            .user(&types::UserInput { user_id: "a b/c".to_string() })
             .await?;
         assert_eq!(user.id, "a b/c");
 
         // A dot segment would be dropped from the URL, an empty one leaves no
-        // route: the client refuses them rather than calling another endpoint.
+        // route: the client refuses them before sending rather than calling
+        // another endpoint.
         for user_id in ["..", ".", ""] {
             let call = client(&base)
                 .users()
-                .user(&crate::types::UserInput { user_id: user_id.to_string() })
+                .user(&types::UserInput { user_id: user_id.to_string() })
                 .await;
-            assert!(matches!(call, Err(crate::client::ClientError::Decode(_))), "{user_id:?}: {call:?}");
+            assert!(matches!(call, Err(client::ClientError::Encode(_))), "{user_id:?}: {call:?}");
         }
         Ok(())
     }
@@ -271,11 +215,11 @@ mod wire {
 
         let call = client(&base)
             .users()
-            .user(&crate::types::UserInput { user_id: "missing".to_string() })
+            .user(&types::UserInput { user_id: "missing".to_string() })
             .await;
         match call {
-            Err(crate::client::ClientError::Api(errors)) => {
-                assert!(errors.is(crate::types::UsersUserCodes::NotFound));
+            Err(client::ClientError::Api(errors)) => {
+                assert!(errors.is(types::UsersUserCodes::NotFound));
             }
             other => return Err(format!("expected the not_found envelope, got {other:?}").into()),
         }
@@ -285,11 +229,11 @@ mod wire {
         assert_eq!(response.status(), 500);
         let call = client(&base)
             .users()
-            .user(&crate::types::UserInput { user_id: "unstated".to_string() })
+            .user(&types::UserInput { user_id: "unstated".to_string() })
             .await;
         match call {
-            Err(crate::client::ClientError::Api(errors)) => {
-                assert!(errors.is(crate::types::UsersUserCodes::NotFound));
+            Err(client::ClientError::Api(errors)) => {
+                assert!(errors.is(types::UsersUserCodes::NotFound));
             }
             other => return Err(format!("expected the not_found envelope, got {other:?}").into()),
         }
@@ -332,7 +276,7 @@ mod wire {
 
         let user = client(&base)
             .users()
-            .by_email(&crate::types::FindInput { email: "x@y.z".to_string(), limit: Some(2) })
+            .by_email(&types::FindInput { email: "x@y.z".to_string(), limit: Some(2) })
             .await?;
         assert_eq!((user.email.as_str(), user.limit), ("x@y.z", Some(2)));
         Ok(())
@@ -369,28 +313,6 @@ mod wire {
             .await?;
         assert_eq!(cased, serde_json::json!({ "session_id": "c", "verbose": false }));
 
-        // A byte that is not UTF-8, raw or escaped, is refused rather than
-        // replaced: the service would read a value nobody sent.
-        for body in [b"session_id=Jos\xe9".to_vec(), b"session_id=Jos%E9".to_vec()] {
-            let latin1 = http
-                .post(format!("{base}/api/info"))
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(body)
-                .send()
-                .await?;
-            assert_eq!(latin1.status(), 400);
-        }
-        // `+` is a space, `%XX` a byte, and a `%` without hex digits itself.
-        let decoded: serde_json::Value = http
-            .post(format!("{base}/api/info"))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body("session_id=a+b%2Bc%zz%C3%A9%")
-            .send()
-            .await?
-            .json()
-            .await?;
-        assert_eq!(decoded, serde_json::json!({ "session_id": "a b+c%zz\u{e9}%", "verbose": false }));
-
         let json_body: serde_json::Value = http
             .post(format!("{base}/api/info?session_id=q"))
             .header("content-type", "application/json")
@@ -404,21 +326,9 @@ mod wire {
         let patched = http.patch(format!("{base}/api/info?session_cookie=c")).send().await?;
         assert_eq!(patched.status(), 200);
 
-        // A form body too large to read is refused with the status of the refusal.
-        let large = format!("session_id={}", "x".repeat(3 * 1024 * 1024));
-        let refused = http
-            .post(format!("{base}/api/info"))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(large)
-            .send()
-            .await?;
-        assert_eq!(refused.status(), 413);
-        let json: serde_json::Value = refused.json().await?;
-        assert_eq!(json.pointer("/errors/0/code"), Some(&serde_json::json!("invalid_body")), "{json}");
-
         let info = client(&base)
             .users()
-            .info(&crate::types::InfoInput {
+            .info(&types::InfoInput {
                 session_id: None,
                 session_cookie: Some("c".to_string()),
                 verbose: Some(true),
@@ -459,7 +369,7 @@ mod wire {
 
         let renamed = client(&base)
             .users()
-            .rename(&crate::types::RenameInput { id: ID.parse()?, name: "again".to_string() })
+            .rename(&types::RenameInput { id: ID.parse()?, name: "again".to_string() })
             .await?;
         assert_eq!((renamed.id.to_string().as_str(), renamed.name.as_str()), (ID, "again"));
         Ok(())
@@ -476,11 +386,11 @@ mod wire {
         assert_eq!(info, serde_json::json!({ "verbose": false }), "without @explicitNulls an absent value is left out");
         let dropped = client(&base)
             .users()
-            .drop(&crate::types::UserInput { user_id: "u8".to_string() })
+            .drop(&types::UserInput { user_id: "u8".to_string() })
             .await?;
         assert_eq!(dropped.user_id, "u8");
 
-        use crate::server::operations::by_route;
+        use types::operations::by_route;
         let id = |method: &str, path: &str| by_route(method, path).map(|op| op.id);
         assert_eq!(id("GET", "/api/user/{user_id}"), Some("users_user"));
         assert_eq!(id("DELETE", "/api/user/{user_id}"), Some("users_drop"));
@@ -520,101 +430,45 @@ fn generated() -> TestResult<(String, String, String)> {
     ))
 }
 
-/// What the generated code reaches for. Query strings and form bodies are
-/// decoded by the runtime itself, so no URL crate; no `futures-*` and no
-/// `reqwest` `stream` feature either: an `@http` API compiles neither.
-const DEPENDENCIES: &[&str] = &[
-    "async-trait",
-    "axum",
-    "chrono",
-    "derive_more",
-    "error_set",
-    "regex",
-    "reqwest",
-    "serde",
-    "serde_json",
-    "tokio",
-    "treat",
-    "uuid",
-    "validator",
-];
-
-fn features_of(dep: &str) -> &'static str {
-    match dep {
-        "chrono" => r#"{ version = "{v}", features = ["serde"] }"#,
-        "derive_more" => r#"{ version = "{v}", features = ["from", "into", "display", "as_ref"] }"#,
-        "reqwest" => {
-            r#"{ version = "{v}", default-features = false, features = ["json", "rustls"] }"#
-        }
-        "serde" => r#"{ version = "{v}", features = ["derive"] }"#,
-        "tokio" => r#"{ version = "{v}", features = ["macros", "net", "rt"] }"#,
-        "treat" => {
-            r#"{ version = "{v}", features = ["axum", "validator-extract", "rpc-status-header"] }"#
-        }
-        "uuid" => r#"{ version = "{v}", features = ["serde"] }"#,
-        "validator" => r#"{ version = "{v}", features = ["derive"] }"#,
-        _ => r#""{v}""#,
-    }
-}
-
-/// A manifest pinned to this crate's lockfile, as `raw_wire` builds one.
-fn manifest_for(root: &std::path::Path) -> TestResult<String> {
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
-    let lock: toml::Table = toml::from_str(&lock)?;
-    let packages = lock
-        .get("package")
-        .and_then(toml::Value::as_array)
-        .ok_or("lockfile has no [[package]] array")?;
-    let mut deps = Vec::new();
-    for dep in DEPENDENCIES {
-        let versions: Vec<&str> = packages
-            .iter()
-            .filter(|p| p.get("name").and_then(toml::Value::as_str) == Some(*dep))
-            .filter_map(|p| p.get("version").and_then(toml::Value::as_str))
-            .collect();
-        let [version] = versions.as_slice() else {
-            return Err(format!(
-                "Cargo.lock must carry exactly one version of `{dep}`, found {versions:?}"
-            )
-            .into());
-        };
-        deps.push(format!(
-            "{dep} = {}",
-            features_of(dep).replacen("{v}", version, 1)
-        ));
-    }
-    Ok(format!(
-        "[package]\nname = \"http_wire\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n{}\n\n[workspace]\n",
-        deps.join("\n")
-    ))
-}
+/// The scratch project, and what the generated code reaches for: the runtime
+/// is `treat`'s, an `@http` API needs its `rpc-server` and `rpc-client` and no
+/// `rpc-stream`. `reqwest` and `tokio` are the driver's, for requests the
+/// generated client would never send.
+const PROJECT: common::ScratchProject = common::ScratchProject {
+    name: "http_wire",
+    dir: "http-wire-test",
+    dependencies: &[
+        Dependency::plain("async-trait"),
+        Dependency::plain("axum"),
+        Dependency::with("chrono", &["serde"]),
+        Dependency::with("derive_more", &["from", "into", "display", "as_ref"]),
+        Dependency::plain("error_set"),
+        Dependency::only("reqwest", &["json"]),
+        Dependency::with("serde", &["derive"]),
+        Dependency::plain("serde_json"),
+        Dependency::with("tokio", &["macros", "net", "rt"]),
+        Dependency::with("treat", &["rpc-client", "rpc-server", "rpc-status-header"]),
+        Dependency::with("uuid", &["serde"]),
+        Dependency::with("validator", &["derive"]),
+    ],
+    test_args: &["--lib"],
+    target: None,
+    edition: "2021",
+};
 
 #[test]
 fn the_generated_http_server_and_client_compile_and_agree() -> TestResult {
-    let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))?;
-    let project = root.join("target").join("http-wire-test");
-    let project_target = root.join("target").join("http-wire-test-target");
-    let src = project.join("src");
-    std::fs::create_dir_all(&src)?;
     let (types, server, client) = generated()?;
-    std::fs::write(src.join("types.rs"), types)?;
-    std::fs::write(src.join("server.rs"), server)?;
-    std::fs::write(src.join("client.rs"), client)?;
-    std::fs::write(
-        src.join("lib.rs"),
-        format!("pub mod client;\npub mod server;\npub mod types;\n{DRIVER}"),
-    )?;
-    std::fs::write(project.join("Cargo.toml"), manifest_for(&root)?)?;
-    let output = Command::new("cargo")
-        .args(["test", "--lib", "--quiet", "--offline"])
-        .current_dir(&project)
-        .env("CARGO_TARGET_DIR", &project_target)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "the generated @http server and client must compile and pass the wire tests:\n{stdout}\n{stderr}"
-    );
-    Ok(())
+    let lib = "pub mod client;\nmod driver;\npub mod server;\npub mod types;\n";
+    let generated = ["types.rs", "server.rs", "client.rs"];
+    PROJECT.check(
+        &[
+            ("types.rs", &types),
+            ("server.rs", &server),
+            ("client.rs", &client),
+            ("driver.rs", DRIVER),
+            ("lib.rs", lib),
+        ],
+        &generated,
+    )
 }

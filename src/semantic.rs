@@ -3,18 +3,22 @@
 //! Everything downstream reads the IR, so all rejection of unsupported or
 //! inconsistent SDL happens here.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use graphql_parser::schema::{
-    Definition, Directive, EnumValue as GqlEnumValue, Field as GqlField, InputValue,
-    ScalarType as ScalarTypeDef, Type as GqlType, TypeDefinition, Value,
+    Definition, Directive, EnumType as EnumTypeDef, EnumValue as GqlEnumValue, Field as GqlField,
+    InputObjectType as InputObjectTypeDef, InputValue, ObjectType as ObjectTypeDef,
+    ScalarType as ScalarTypeDef, Type as GqlType, TypeDefinition, UnionType as UnionTypeDef, Value,
 };
 use graphql_parser::Pos;
 
 use crate::config::builtin_scalars;
+use crate::emit_common::fields_static_name;
 use crate::error::{CompileError, Errors};
 use crate::ir::*;
+use crate::naming::{codes_type_name, pascal_case, snake_case_raw};
 use crate::parser::SdlFile;
 
 /// Directives consumed by the compiler, each with the arguments it reads.
@@ -183,6 +187,15 @@ struct PermissionEnum {
     codes: Vec<String>,
 }
 
+/// A service or an operation holding the names the targets derive from it, as
+/// [`Analyzer::check_generated_names`] reports it: `` service `Users` `` or
+/// `` `Users.get` ``, and where it is declared, when that is known.
+#[derive(Clone)]
+struct Claimant {
+    label: String,
+    site: Option<String>,
+}
+
 /// An enum marked `@scopes`, as declared: where, and the scope a query needs
 /// when it states none. Whether that default is one of the enum's values is
 /// checked once the enum is resolved.
@@ -282,6 +295,8 @@ impl<'a> Analyzer<'a> {
         self.check_paths(&api);
         self.check_path_parameter_names(&api);
         self.check_operation_ids(&api);
+        self.check_generated_names(&api);
+        self.check_rust_item_names(&api);
         self.check_errors(&api);
         self.check_error_code_registry(&api);
         self.check_input_output_separation(&api);
@@ -320,7 +335,8 @@ impl<'a> Analyzer<'a> {
     ) {
         let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
         for (sdl, wire) in names {
-            if let Some(other) = seen.insert(wire, sdl) {
+            let previous = seen.insert(wire, sdl);
+            if let Some(other) = previous {
                 self.errors.push(CompileError::at(
                     format!("type `{owner}`: fields `{other}` and `{sdl}` both become `{wire}`"),
                     file,
@@ -361,7 +377,8 @@ impl<'a> Analyzer<'a> {
             return;
         }
 
-        if let Some((previous, _)) = self.declared_at(name) {
+        let previous = self.declared_at(name);
+        if let Some((previous, _)) = previous {
             self.errors.push(CompileError::at(
                 format!("duplicate type `{name}`, already declared at {previous}"),
                 file,
@@ -377,306 +394,10 @@ impl<'a> Analyzer<'a> {
             // be taken: it may override a built-in, which the duplicate check
             // between here and there would refuse.
             TypeDefinition::Scalar(_) => {}
-            TypeDefinition::Object(t) => {
-                self.check_directives(
-                    file,
-                    &t.directives,
-                    &[
-                        "service",
-                        "version",
-                        "variant",
-                        "auth",
-                        "mcp",
-                        "explicitNulls",
-                    ],
-                );
-                let is_service = find_directive(&t.directives, "service").is_some();
-                let explicit_nulls = find_directive(&t.directives, "explicitNulls").is_some();
-                if is_service && explicit_nulls {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "type `{}`: @explicitNulls describes how an output type is written; \
-                             a @service has no fields to write",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
-
-                if let Some(d) = find_directive(&t.directives, "variant") {
-                    match string_arg(d, "tag") {
-                        Some(tag) => {
-                            self.variant_tags.insert(t.name.clone(), tag);
-                        }
-                        None => self.errors.push(CompileError::at(
-                            format!(
-                                "type `{}`: malformed @variant, expected a string `tag` argument",
-                                t.name
-                            ),
-                            file,
-                            d.position,
-                        )),
-                    }
-                }
-
-                // A version is a property of the routes, so on a plain output
-                // type it would have nothing to prefix.
-                if !is_service && find_directive(&t.directives, "version").is_some() {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "type `{}`: @version applies to a @service or one of its operations",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
-
-                // Authentication guards operations. On a plain output type
-                // there is nothing to guard, so a rule written there would
-                // read as protection that is not happening.
-                if !is_service && find_directive(&t.directives, "auth").is_some() {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "type `{}`: @auth applies to a @service or one of its operations",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
-
-                // Tool exposure is a property of operations. On a plain output
-                // type the directive would expose nothing and read as if it did.
-                if !is_service && find_directive(&t.directives, "mcp").is_some() {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "type `{}`: @mcp applies to a @service or one of its operations",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
-
-                if !t.implements_interfaces.is_empty() {
-                    self.errors.push(CompileError::at(
-                        format!("type `{}`: interfaces are not supported", t.name),
-                        file,
-                        t.position,
-                    ));
-                }
-
-                if is_service {
-                    if let Some(service) = self.build_service(file, t) {
-                        services.push(service);
-                    }
-                } else {
-                    let fields: Vec<Field> = t
-                        .fields
-                        .iter()
-                        .map(|f| self.output_field(file, &t.name, f))
-                        .collect();
-                    self.check_field_names(
-                        file,
-                        &t.name,
-                        t.position,
-                        t.fields
-                            .iter()
-                            .map(|f| f.name.as_str())
-                            .zip(fields.iter().map(|f| f.name.as_str())),
-                    );
-                    types.push(ApiType::Object(ObjectType {
-                        name: t.name.clone(),
-                        description: t.description.clone(),
-                        fields,
-                        explicit_nulls,
-                    }));
-                }
-            }
-            TypeDefinition::InputObject(t) => {
-                self.check_directives(file, &t.directives, &["oneOf"]);
-                let one_of = find_directive(&t.directives, "oneOf").is_some();
-                let fields: Vec<Field> = t
-                    .fields
-                    .iter()
-                    .map(|f| self.input_field(file, &t.name, f))
-                    .collect();
-                self.check_field_names(
-                    file,
-                    &t.name,
-                    t.position,
-                    t.fields
-                        .iter()
-                        .map(|f| f.name.as_str())
-                        .zip(fields.iter().map(|f| f.name.as_str())),
-                );
-
-                if one_of {
-                    self.validate_one_of(file, t.position, &t.name, &fields);
-                }
-
-                types.push(ApiType::InputObject(InputObjectType {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    fields,
-                    one_of,
-                }));
-            }
-            TypeDefinition::Enum(t) => {
-                self.check_directives(file, &t.directives, &["roles", "permissions", "scopes"]);
-                let is_roles = find_directive(&t.directives, "roles").is_some();
-                let permissions = find_directive(&t.directives, "permissions");
-                let scopes = find_directive(&t.directives, "scopes");
-                // The registry names what can go wrong, not who may act, and
-                // its Rust form is not the one an access enum gets.
-                for (marked, directive) in [
-                    (is_roles, "roles"),
-                    (permissions.is_some(), "permissions"),
-                    (scopes.is_some(), "scopes"),
-                ] {
-                    if marked && t.name == ERROR_CODE_ENUM {
-                        self.errors.push(CompileError::at(
-                            format!(
-                                "`{ERROR_CODE_ENUM}` is the error code registry; it cannot be \
-                                 @{directive}"
-                            ),
-                            file,
-                            t.position,
-                        ));
-                    }
-                }
-                // A role is who acts and a permission is what is done: one value
-                // cannot be both, and `@auth` names either by its set.
-                if is_roles && permissions.is_some() {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "enum `{}`: @roles and @permissions are two sets; mark one",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
-                // A scope is what a credential may do for whoever holds it,
-                // not who acts or what a user may be granted: one value cannot
-                // answer two of those questions.
-                if scopes.is_some() && (is_roles || permissions.is_some()) {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "enum `{}`: @scopes is the set a credential carries, apart from the \
-                             roles and the permissions; mark one",
-                            t.name
-                        ),
-                        file,
-                        t.position,
-                    ));
-                }
-                if let Some(d) = scopes {
-                    let query = self.scope_default(file, &t.name, d);
-                    self.scope_enums.push(ScopeEnum {
-                        file: file.to_path_buf(),
-                        pos: t.position,
-                        name: t.name.clone(),
-                        query,
-                    });
-                }
-                if let Some(d) = permissions {
-                    let codes = self.permission_codes(file, &t.name, d);
-                    self.permission_enums.push(PermissionEnum {
-                        file: file.to_path_buf(),
-                        pos: t.position,
-                        name: t.name.clone(),
-                        codes,
-                    });
-                }
-                let mut inherits = Vec::new();
-                let values: Vec<EnumValue> = t
-                    .values
-                    .iter()
-                    .map(|v| {
-                        self.check_directives(file, &v.directives, &["variant", "inherits"]);
-                        match (is_roles, find_directive(&v.directives, "inherits")) {
-                            (true, _) => inherits
-                                .push((v.name.clone(), self.inherited_roles(file, &t.name, v))),
-                            // The hierarchy is between roles; on any other
-                            // enum it would read as a grant that is not made.
-                            (false, Some(d)) => self.errors.push(CompileError::at(
-                                format!(
-                                    "enum `{}`: @inherits applies to a value of the @roles enum",
-                                    t.name
-                                ),
-                                file,
-                                d.position,
-                            )),
-                            (false, None) => {}
-                        }
-                        EnumValue {
-                            name: v.name.clone(),
-                            description: v.description.clone(),
-                            variant_tag: self.enum_variant_tag(file, &t.name, v),
-                        }
-                    })
-                    .collect();
-                if is_roles {
-                    self.role_enums.push(RoleEnum {
-                        file: file.to_path_buf(),
-                        pos: t.position,
-                        name: t.name.clone(),
-                        inherits,
-                    });
-                }
-                self.check_enum_wire_names(file, &t.name, &values, t.position);
-                if t.name == ERROR_CODE_ENUM {
-                    for v in t
-                        .values
-                        .iter()
-                        .filter(|v| ENUM_ITEMS.contains(&v.name.as_str()))
-                    {
-                        self.errors.push(CompileError::at(
-                            format!(
-                                "`{ERROR_CODE_ENUM}` cannot list `{}`: the generated `{}::{}` \
-                                 would be shadowed by it",
-                                v.name, ERROR_CODE_ENUM, v.name
-                            ),
-                            file,
-                            v.position,
-                        ));
-                    }
-                }
-                types.push(ApiType::Enum(EnumType {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    values,
-                }));
-            }
-            TypeDefinition::Union(t) => {
-                self.check_directives(file, &t.directives, &["discriminator"]);
-                if t.types.is_empty() {
-                    self.errors.push(CompileError::at(
-                        format!("union `{}` has no members", t.name),
-                        file,
-                        t.position,
-                    ));
-                }
-                let tagging = self.union_tagging(file, t);
-                types.push(ApiType::Union(UnionType {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    // The tag defaults to the type name here and is replaced by
-                    // any `@variant` once every file has been read.
-                    members: t
-                        .types
-                        .iter()
-                        .map(|m| UnionMember {
-                            name: m.clone(),
-                            tag: m.clone(),
-                        })
-                        .collect(),
-                    tagging,
-                }));
-            }
+            TypeDefinition::Object(t) => self.collect_object(file, t, types, services),
+            TypeDefinition::InputObject(t) => self.collect_input_object(file, t, types),
+            TypeDefinition::Enum(t) => self.collect_enum(file, t, types),
+            TypeDefinition::Union(t) => self.collect_union(file, t, types),
             TypeDefinition::Interface(t) => {
                 self.errors.push(CompileError::at(
                     format!("interface `{}` is not supported", t.name),
@@ -685,6 +406,361 @@ impl<'a> Analyzer<'a> {
                 ));
             }
         }
+    }
+
+    /// An object type: a `@service`, built into `services`, or an output type.
+    fn collect_object(
+        &mut self,
+        file: &Path,
+        t: &ObjectTypeDef<'static, String>,
+        types: &mut Vec<ApiType>,
+        services: &mut Vec<Service>,
+    ) {
+        self.check_directives(
+            file,
+            &t.directives,
+            &[
+                "service",
+                "version",
+                "variant",
+                "auth",
+                "mcp",
+                "explicitNulls",
+            ],
+        );
+        let is_service = find_directive(&t.directives, "service").is_some();
+        let explicit_nulls = find_directive(&t.directives, "explicitNulls").is_some();
+        if is_service && explicit_nulls {
+            self.errors.push(CompileError::at(
+                format!(
+                    "type `{}`: @explicitNulls describes how an output type is written; \
+                     a @service has no fields to write",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+
+        if let Some(d) = find_directive(&t.directives, "variant") {
+            match string_arg(d, "tag") {
+                Some(tag) => {
+                    self.variant_tags.insert(t.name.clone(), tag);
+                }
+                None => self.errors.push(CompileError::at(
+                    format!(
+                        "type `{}`: malformed @variant, expected a string `tag` argument",
+                        t.name
+                    ),
+                    file,
+                    d.position,
+                )),
+            }
+        }
+
+        if !is_service {
+            self.reject_operation_directives(file, t);
+        }
+
+        if !t.implements_interfaces.is_empty() {
+            self.errors.push(CompileError::at(
+                format!("type `{}`: interfaces are not supported", t.name),
+                file,
+                t.position,
+            ));
+        }
+
+        if is_service {
+            let service = self.build_service(file, t);
+            if let Some(service) = service {
+                services.push(service);
+            }
+        } else {
+            let fields: Vec<Field> = t
+                .fields
+                .iter()
+                .map(|f| self.output_field(file, &t.name, f))
+                .collect();
+            self.check_field_names(
+                file,
+                &t.name,
+                t.position,
+                t.fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .zip(fields.iter().map(|f| f.name.as_str())),
+            );
+            types.push(ApiType::Object(ObjectType {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                fields,
+                explicit_nulls,
+            }));
+        }
+    }
+
+    /// The directives of a `@service` or its operations, written on a plain
+    /// output type, where each would read as an effect that is not happening.
+    fn reject_operation_directives(&mut self, file: &Path, t: &ObjectTypeDef<'static, String>) {
+        // A version is a property of the routes, so on a plain output
+        // type it would have nothing to prefix.
+        if find_directive(&t.directives, "version").is_some() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "type `{}`: @version applies to a @service or one of its operations",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+
+        // Authentication guards operations. On a plain output type
+        // there is nothing to guard, so a rule written there would
+        // read as protection that is not happening.
+        if find_directive(&t.directives, "auth").is_some() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "type `{}`: @auth applies to a @service or one of its operations",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+
+        // Tool exposure is a property of operations. On a plain output
+        // type the directive would expose nothing and read as if it did.
+        if find_directive(&t.directives, "mcp").is_some() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "type `{}`: @mcp applies to a @service or one of its operations",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+    }
+
+    /// An input object, `@oneOf` or not.
+    fn collect_input_object(
+        &mut self,
+        file: &Path,
+        t: &InputObjectTypeDef<'static, String>,
+        types: &mut Vec<ApiType>,
+    ) {
+        self.check_directives(file, &t.directives, &["oneOf"]);
+        let one_of = find_directive(&t.directives, "oneOf").is_some();
+        let fields: Vec<Field> = t
+            .fields
+            .iter()
+            .map(|f| self.input_field(file, &t.name, f))
+            .collect();
+        self.check_field_names(
+            file,
+            &t.name,
+            t.position,
+            t.fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .zip(fields.iter().map(|f| f.name.as_str())),
+        );
+
+        if one_of {
+            self.validate_one_of(file, t.position, &t.name, &fields);
+        }
+
+        types.push(ApiType::InputObject(InputObjectType {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            fields,
+            one_of,
+        }));
+    }
+
+    /// An enum, and the access set it may be marked as: `@roles` with its
+    /// `@inherits` hierarchy, `@permissions` or `@scopes`.
+    fn collect_enum(
+        &mut self,
+        file: &Path,
+        t: &EnumTypeDef<'static, String>,
+        types: &mut Vec<ApiType>,
+    ) {
+        self.check_directives(file, &t.directives, &["roles", "permissions", "scopes"]);
+        let is_roles = find_directive(&t.directives, "roles").is_some();
+        let permissions = find_directive(&t.directives, "permissions");
+        let scopes = find_directive(&t.directives, "scopes");
+        self.check_enum_sets(file, t, is_roles, permissions.is_some(), scopes.is_some());
+        if let Some(d) = scopes {
+            let query = self.scope_default(file, &t.name, d);
+            self.scope_enums.push(ScopeEnum {
+                file: file.to_path_buf(),
+                pos: t.position,
+                name: t.name.clone(),
+                query,
+            });
+        }
+        if let Some(d) = permissions {
+            let codes = self.permission_codes(file, &t.name, d);
+            self.permission_enums.push(PermissionEnum {
+                file: file.to_path_buf(),
+                pos: t.position,
+                name: t.name.clone(),
+                codes,
+            });
+        }
+        let mut inherits = Vec::new();
+        let values: Vec<EnumValue> = t
+            .values
+            .iter()
+            .map(|v| {
+                self.check_directives(file, &v.directives, &["variant", "inherits"]);
+                match (is_roles, find_directive(&v.directives, "inherits")) {
+                    (true, _) => {
+                        inherits.push((v.name.clone(), self.inherited_roles(file, &t.name, v)))
+                    }
+                    // The hierarchy is between roles; on any other
+                    // enum it would read as a grant that is not made.
+                    (false, Some(d)) => self.errors.push(CompileError::at(
+                        format!(
+                            "enum `{}`: @inherits applies to a value of the @roles enum",
+                            t.name
+                        ),
+                        file,
+                        d.position,
+                    )),
+                    (false, None) => {}
+                }
+                EnumValue {
+                    name: v.name.clone(),
+                    description: v.description.clone(),
+                    variant_tag: self.enum_variant_tag(file, &t.name, v),
+                }
+            })
+            .collect();
+        if is_roles {
+            self.role_enums.push(RoleEnum {
+                file: file.to_path_buf(),
+                pos: t.position,
+                name: t.name.clone(),
+                inherits,
+            });
+        }
+        self.check_enum_wire_names(file, &t.name, &values, t.position);
+        if t.name == ERROR_CODE_ENUM {
+            for v in t
+                .values
+                .iter()
+                .filter(|v| ENUM_ITEMS.contains(&v.name.as_str()))
+            {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{ERROR_CODE_ENUM}` cannot list `{}`: the generated `{}::{}` \
+                         would be shadowed by it",
+                        v.name, ERROR_CODE_ENUM, v.name
+                    ),
+                    file,
+                    v.position,
+                ));
+            }
+        }
+        types.push(ApiType::Enum(EnumType {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            values,
+        }));
+    }
+
+    /// The sets an enum is marked as, each a question of its own: who acts
+    /// (`@roles`), what is done (`@permissions`), what a credential may do
+    /// (`@scopes`). One enum answers one of them, and the error code registry
+    /// none.
+    fn check_enum_sets(
+        &mut self,
+        file: &Path,
+        t: &EnumTypeDef<'static, String>,
+        is_roles: bool,
+        is_permissions: bool,
+        is_scopes: bool,
+    ) {
+        // The registry names what can go wrong, not who may act, and
+        // its Rust form is not the one an access enum gets.
+        for (marked, directive) in [
+            (is_roles, "roles"),
+            (is_permissions, "permissions"),
+            (is_scopes, "scopes"),
+        ] {
+            if marked && t.name == ERROR_CODE_ENUM {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{ERROR_CODE_ENUM}` is the error code registry; it cannot be \
+                         @{directive}"
+                    ),
+                    file,
+                    t.position,
+                ));
+            }
+        }
+        // A role is who acts and a permission is what is done: one value
+        // cannot be both, and `@auth` names either by its set.
+        if is_roles && is_permissions {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{}`: @roles and @permissions are two sets; mark one",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+        // A scope is what a credential may do for whoever holds it,
+        // not who acts or what a user may be granted: one value cannot
+        // answer two of those questions.
+        if is_scopes && (is_roles || is_permissions) {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{}`: @scopes is the set a credential carries, apart from the \
+                     roles and the permissions; mark one",
+                    t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+    }
+
+    /// A union, its members tagged by name until `@variant` tags are resolved.
+    fn collect_union(
+        &mut self,
+        file: &Path,
+        t: &UnionTypeDef<'static, String>,
+        types: &mut Vec<ApiType>,
+    ) {
+        self.check_directives(file, &t.directives, &["discriminator"]);
+        if t.types.is_empty() {
+            self.errors.push(CompileError::at(
+                format!("union `{}` has no members", t.name),
+                file,
+                t.position,
+            ));
+        }
+        let tagging = self.union_tagging(file, t);
+        types.push(ApiType::Union(UnionType {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            // The tag defaults to the type name here and is replaced by
+            // any `@variant` once every file has been read.
+            members: t
+                .types
+                .iter()
+                .map(|m| UnionMember {
+                    name: m.clone(),
+                    tag: m.clone(),
+                })
+                .collect(),
+            tagging,
+        }));
     }
 
     /// A `scalar` declaration, with its target mapping from `@scalar`.
@@ -728,7 +804,8 @@ impl<'a> Analyzer<'a> {
 
         let Some(d) = find_directive(&t.directives, "scalar") else {
             // No mapping given: only valid for a scalar the compiler knows.
-            if !types.iter().any(|k| k.name() == t.name) {
+            let known = types.iter().any(|k| k.name() == t.name);
+            if !known {
                 self.errors.push(CompileError::at(
                     format!(
                         "scalar `{}` has no target mapping: add `@scalar(rust: \"...\", \
@@ -848,7 +925,8 @@ impl<'a> Analyzer<'a> {
             .unwrap_or(false);
 
         for field in &t.fields {
-            if !seen.insert(field.name.clone()) {
+            let first = seen.insert(field.name.clone());
+            if !first {
                 self.errors.push(CompileError::at(
                     format!("service `{}`: duplicate operation `{}`", t.name, field.name),
                     file,
@@ -861,7 +939,8 @@ impl<'a> Analyzer<'a> {
             // alike declare one another twice. The path check cannot stand in
             // for this: `getById` and `get_by_id` are two routes and one method.
             let method = crate::naming::snake_case_raw(&field.name);
-            if let Some(other) = methods.insert(method.clone(), field.name.clone()) {
+            let previous = methods.insert(method.clone(), field.name.clone());
+            if let Some(other) = previous {
                 self.errors.push(CompileError::at(
                     format!(
                         "service `{}`: operations `{other}` and `{}` both become `{method}`",
@@ -884,14 +963,15 @@ impl<'a> Analyzer<'a> {
                 ));
                 continue;
             }
-            if let Some(op) = self.build_operation(
+            let op = self.build_operation(
                 file,
                 &t.name,
                 field,
                 service_version.as_deref(),
                 &service_auth,
                 service_mcp,
-            ) {
+            );
+            if let Some(op) = op {
                 operations.push(op);
             }
         }
@@ -930,42 +1010,7 @@ impl<'a> Analyzer<'a> {
             ],
         );
 
-        let declared: Vec<(&'static str, OperationKind)> = [
-            ("query", OperationKind::Query),
-            ("mutation", OperationKind::Mutation),
-            ("subscription", OperationKind::Subscription),
-        ]
-        .into_iter()
-        .filter(|(name, _)| find_directive(&field.directives, name).is_some())
-        .collect();
-
-        let kind = match declared.as_slice() {
-            [(_, kind)] => *kind,
-            [] => {
-                self.errors.push(CompileError::at(
-                    format!(
-                        "`{service}.{}` must be annotated with @query, @mutation or @subscription",
-                        field.name
-                    ),
-                    file,
-                    field.position,
-                ));
-                return None;
-            }
-            many => {
-                let names = many
-                    .iter()
-                    .map(|(name, _)| format!("@{name}"))
-                    .collect::<Vec<_>>()
-                    .join(" and ");
-                self.errors.push(CompileError::at(
-                    format!("`{service}.{}` is both {names}", field.name),
-                    file,
-                    field.position,
-                ));
-                return None;
-            }
-        };
+        let (kind_directive, kind) = self.operation_kind(file, service, field)?;
 
         let (raw_request, raw_response, raw_request_stream) = self
             .raw_bodies(file, service, field, kind)
@@ -996,7 +1041,6 @@ impl<'a> Analyzer<'a> {
         // The scope as written; defaults and the rules about where one applies
         // are resolved once every file is read, since the `@scopes` enum may be
         // declared after the service.
-        let kind_directive = declared.first().map_or("query", |(name, _)| *name);
         self.operation_sites.insert(
             format!("{service}.{}", field.name),
             (file.to_path_buf(), field.position),
@@ -1038,51 +1082,17 @@ impl<'a> Analyzer<'a> {
             )
             .unwrap_or(service_mcp);
 
-        // A tool call is one JSON request and one JSON response. A subscription
-        // is an open stream and a raw body is not the envelope, so exposing
-        // either would promise a call shape the operation cannot honour.
-        if mcp && kind == OperationKind::Subscription {
-            self.errors.push(CompileError::at(
-                format!(
-                    "`{service}.{}`: a @subscription cannot be an MCP tool; \
-                     exclude it with @mcp(expose: false)",
-                    field.name
-                ),
-                file,
-                field.position,
-            ));
-            return None;
-        }
-        if mcp && http.is_some() {
-            self.errors.push(CompileError::at(
-                format!(
-                    "`{service}.{}`: an @http operation cannot be an MCP tool, whose call is \
-                     the JSON envelope; exclude it with @mcp(expose: false)",
-                    field.name
-                ),
-                file,
-                field.position,
-            ));
-            return None;
-        }
-        if mcp && (raw_request.is_some() || raw_response.is_some()) {
-            self.errors.push(CompileError::at(
-                format!(
-                    "`{service}.{}`: a @raw operation cannot be an MCP tool; \
-                     exclude it with @mcp(expose: false)",
-                    field.name
-                ),
-                file,
-                field.position,
-            ));
-            return None;
+        if mcp {
+            let has_raw = raw_request.is_some() || raw_response.is_some();
+            self.check_mcp_shape(file, service, field, kind, http.is_some(), has_raw)?;
         }
 
         // At most one argument, named `input`: this keeps the wire format a
         // single JSON body rather than a positional argument list. An
         // operation that reads everything from the session declares no
         // argument at all and sends `{}`.
-        if field.arguments.len() > 1 || field.arguments.iter().any(|a| a.name != "input") {
+        let other_argument = field.arguments.iter().any(|a| a.name != "input");
+        if field.arguments.len() > 1 || other_argument {
             self.errors.push(CompileError::at(
                 format!(
                     "`{service}.{}` must take a single argument named `input`, or none at all \
@@ -1102,110 +1112,11 @@ impl<'a> Analyzer<'a> {
             .map(|arg| self.convert_type(&arg.value_type));
         let output = self.convert_type(&field.field_type);
 
-        let rpc = find_directive(&field.directives, "rpc");
-        let http_path = match (&http, rpc) {
-            (Some(_), Some(_)) => {
-                self.errors.push(CompileError::at(
-                    format!(
-                        "`{service}.{}`: @http(path:) and @rpc(path:) both name the route; \
-                         keep @http",
-                        field.name
-                    ),
-                    file,
-                    field.position,
-                ));
-                return None;
-            }
-            (Some(_), None) => {
-                find_directive(&field.directives, "http").and_then(|d| string_arg(d, "path"))
-            }
-            (None, _) => None,
-        };
-        let path = match (http_path, rpc) {
-            (Some(path), _) => path,
-            (None, Some(d)) => match string_arg(d, "path") {
-                Some(p) if is_route(&p) => p,
-                Some(p) => {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "`{service}.{}`: @rpc(path:) must start with `/` and use only \
-                             unreserved URL characters, got `{p}`",
-                            field.name
-                        ),
-                        file,
-                        field.position,
-                    ));
-                    return None;
-                }
-                None => {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "`{service}.{}`: malformed @rpc, expected a string `path` argument",
-                            field.name
-                        ),
-                        file,
-                        field.position,
-                    ));
-                    return None;
-                }
-            },
-            (None, None) => format!(
-                "/rpc/{}/{}",
-                service.to_lowercase(),
-                field.name.to_lowercase()
-            ),
-        };
+        let path = self.declared_path(file, service, field, http.is_some())?;
+        let path =
+            self.versioned_path(file, service, field, http.is_some(), service_version, path)?;
 
-        // The operation's own @version wins over its service's, so one endpoint
-        // can move ahead of the rest. The prefix leads whichever path was
-        // resolved above, derived or pinned — but not an `@http` one: that is
-        // the URL clients already call, and a prefix would move it. Its
-        // service's version passes it by; its own is refused, since the
-        // version belongs in the path it spells out.
-        let own_version = self.version_prefix(
-            file,
-            &format!("{service}.{}", field.name),
-            &field.directives,
-            field.position,
-        );
-        if http.is_some() && own_version.is_some() {
-            self.errors.push(CompileError::at(
-                format!(
-                    "`{service}.{}`: @version would move the @http path clients already call; \
-                     write the version into @http(path:)",
-                    field.name
-                ),
-                file,
-                field.position,
-            ));
-            return None;
-        }
-        let prefix = match http {
-            Some(_) => None,
-            None => own_version.as_deref().or(service_version),
-        };
-        let path = match prefix {
-            Some(prefix) => format!("{prefix}{path}"),
-            None => path,
-        };
-
-        let errors = match find_directive(&field.directives, "throws") {
-            Some(d) => match string_list_arg(d, "codes") {
-                Some(list) => list,
-                None => {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "`{service}.{}`: @throws(codes:) must be a list of strings",
-                            field.name
-                        ),
-                        file,
-                        field.position,
-                    ));
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        };
+        let errors = self.declared_errors(file, service, field);
 
         Some(Operation {
             name: field.name.clone(),
@@ -1225,6 +1136,245 @@ impl<'a> Analyzer<'a> {
             scope,
             http,
         })
+    }
+
+    /// Which of `@query`, `@mutation` and `@subscription` the operation is,
+    /// with the directive that said so; `None` once reported for none or
+    /// several.
+    fn operation_kind(
+        &mut self,
+        file: &Path,
+        service: &str,
+        field: &GqlField<'static, String>,
+    ) -> Option<(&'static str, OperationKind)> {
+        let declared: Vec<(&'static str, OperationKind)> = [
+            ("query", OperationKind::Query),
+            ("mutation", OperationKind::Mutation),
+            ("subscription", OperationKind::Subscription),
+        ]
+        .into_iter()
+        .filter(|(name, _)| find_directive(&field.directives, name).is_some())
+        .collect();
+
+        match declared.as_slice() {
+            [declared] => Some(*declared),
+            [] => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{service}.{}` must be annotated with @query, @mutation or @subscription",
+                        field.name
+                    ),
+                    file,
+                    field.position,
+                ));
+                None
+            }
+            many => {
+                let names = many
+                    .iter()
+                    .map(|(name, _)| format!("@{name}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                self.errors.push(CompileError::at(
+                    format!("`{service}.{}` is both {names}", field.name),
+                    file,
+                    field.position,
+                ));
+                None
+            }
+        }
+    }
+
+    /// Refuse an operation `@mcp` exposes but a tool call cannot carry; `None`
+    /// once reported.
+    fn check_mcp_shape(
+        &mut self,
+        file: &Path,
+        service: &str,
+        field: &GqlField<'static, String>,
+        kind: OperationKind,
+        has_http: bool,
+        has_raw: bool,
+    ) -> Option<()> {
+        // A tool call is one JSON request and one JSON response. A subscription
+        // is an open stream and a raw body is not the envelope, so exposing
+        // either would promise a call shape the operation cannot honour.
+        if kind == OperationKind::Subscription {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: a @subscription cannot be an MCP tool; \
+                     exclude it with @mcp(expose: false)",
+                    field.name
+                ),
+                file,
+                field.position,
+            ));
+            return None;
+        }
+        if has_http {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: an @http operation cannot be an MCP tool, whose call is \
+                     the JSON envelope; exclude it with @mcp(expose: false)",
+                    field.name
+                ),
+                file,
+                field.position,
+            ));
+            return None;
+        }
+        if has_raw {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: a @raw operation cannot be an MCP tool; \
+                     exclude it with @mcp(expose: false)",
+                    field.name
+                ),
+                file,
+                field.position,
+            ));
+            return None;
+        }
+        Some(())
+    }
+
+    /// The route as declared, before any `@version` prefix: `@http(path:)`,
+    /// `@rpc(path:)`, or `/rpc/{service}/{operation}` derived from the names;
+    /// `None` once reported.
+    fn declared_path(
+        &mut self,
+        file: &Path,
+        service: &str,
+        field: &GqlField<'static, String>,
+        has_http: bool,
+    ) -> Option<String> {
+        let rpc = find_directive(&field.directives, "rpc");
+        let http_path = match (has_http, rpc) {
+            (true, Some(_)) => {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "`{service}.{}`: @http(path:) and @rpc(path:) both name the route; \
+                         keep @http",
+                        field.name
+                    ),
+                    file,
+                    field.position,
+                ));
+                return None;
+            }
+            (true, None) => {
+                find_directive(&field.directives, "http").and_then(|d| string_arg(d, "path"))
+            }
+            (false, _) => None,
+        };
+        match (http_path, rpc) {
+            (Some(path), _) => Some(path),
+            (None, Some(d)) => match string_arg(d, "path") {
+                Some(p) => {
+                    let routable = is_route(&p);
+                    if routable {
+                        return Some(p);
+                    }
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "`{service}.{}`: @rpc(path:) must start with `/` and use only \
+                             unreserved URL characters, got `{p}`",
+                            field.name
+                        ),
+                        file,
+                        field.position,
+                    ));
+                    None
+                }
+                None => {
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "`{service}.{}`: malformed @rpc, expected a string `path` argument",
+                            field.name
+                        ),
+                        file,
+                        field.position,
+                    ));
+                    None
+                }
+            },
+            (None, None) => Some(format!(
+                "/rpc/{}/{}",
+                service.to_lowercase(),
+                field.name.to_lowercase()
+            )),
+        }
+    }
+
+    /// `path` under the version prefix that applies to it; `None` once
+    /// reported.
+    fn versioned_path(
+        &mut self,
+        file: &Path,
+        service: &str,
+        field: &GqlField<'static, String>,
+        has_http: bool,
+        service_version: Option<&str>,
+        path: String,
+    ) -> Option<String> {
+        // The operation's own @version wins over its service's, so one endpoint
+        // can move ahead of the rest. The prefix leads whichever path was
+        // resolved above, derived or pinned — but not an `@http` one: that is
+        // the URL clients already call, and a prefix would move it. Its
+        // service's version passes it by; its own is refused, since the
+        // version belongs in the path it spells out.
+        let own_version = self.version_prefix(
+            file,
+            &format!("{service}.{}", field.name),
+            &field.directives,
+            field.position,
+        );
+        if has_http && own_version.is_some() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: @version would move the @http path clients already call; \
+                     write the version into @http(path:)",
+                    field.name
+                ),
+                file,
+                field.position,
+            ));
+            return None;
+        }
+        let prefix = match has_http {
+            true => None,
+            false => own_version.as_deref().or(service_version),
+        };
+        Some(match prefix {
+            Some(prefix) => format!("{prefix}{path}"),
+            None => path,
+        })
+    }
+
+    /// The codes `@throws` lists; none, once reported, for a malformed list.
+    fn declared_errors(
+        &mut self,
+        file: &Path,
+        service: &str,
+        field: &GqlField<'static, String>,
+    ) -> Vec<String> {
+        match find_directive(&field.directives, "throws") {
+            Some(d) => match string_list_arg(d, "codes") {
+                Some(list) => list,
+                None => {
+                    self.errors.push(CompileError::at(
+                        format!(
+                            "`{service}.{}`: @throws(codes:) must be a list of strings",
+                            field.name
+                        ),
+                        file,
+                        field.position,
+                    ));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }
     }
 
     /// Read `@http`: the method, the path and its `{parameters}`, where the
@@ -1261,6 +1411,7 @@ impl<'a> Analyzer<'a> {
             );
         }
 
+        let method_given = has_arg(d, "method");
         let method = match enum_arg(d, "method") {
             Some(name) => match HttpMethod::from_name(&name) {
                 Some(method) => method,
@@ -1273,7 +1424,7 @@ impl<'a> Analyzer<'a> {
             },
             // Present but not an enum value is a quoted method, which is a
             // different mistake from leaving it out and is named as such.
-            None if has_arg(d, "method") => {
+            None if method_given => {
                 return fail(
                     self,
                     "@http(method:) is an enum value, written unquoted: `method: GET`".to_string(),
@@ -1326,8 +1477,7 @@ impl<'a> Analyzer<'a> {
             None if declared_body => {
                 return fail(self, "@http(body:) must be NONE, JSON or FORM".to_string())
             }
-            None if method.sends_body() => HttpBody::Json,
-            None => HttpBody::None,
+            None => HttpBody::default_for(method),
         };
         match (method, body) {
             (HttpMethod::Get | HttpMethod::Delete, HttpBody::Json | HttpBody::Form) => {
@@ -1361,9 +1511,10 @@ impl<'a> Analyzer<'a> {
             _ => {}
         }
 
+        let envelope_given = has_arg(d, "envelope");
         let envelope = match bool_arg(d, "envelope") {
             Some(envelope) => envelope,
-            None if d.arguments.iter().all(|(n, _)| n != "envelope") => true,
+            None if !envelope_given => true,
             None => return fail(self, "@http(envelope:) must be a boolean".to_string()),
         };
 
@@ -1424,9 +1575,10 @@ impl<'a> Analyzer<'a> {
 
         // `expose:` defaults to `true`, so the common case is `@mcp` bare and
         // the exceptions are the ones that spell themselves out.
+        let expose_given = has_arg(d, "expose");
         match bool_arg(d, "expose") {
             Some(expose) => Some(expose),
-            None if d.arguments.iter().all(|(n, _)| n != "expose") => Some(true),
+            None if !expose_given => Some(true),
             None => {
                 self.errors.push(CompileError::at(
                     format!("`{owner}`: @mcp(expose:) must be a boolean"),
@@ -1454,8 +1606,9 @@ impl<'a> Analyzer<'a> {
 
         // `require:` defaults to `session`, so the common case is `@auth` bare
         // and the exceptions are the ones that spell themselves out.
+        let require_given = has_arg(d, "require");
         let require = match enum_arg(d, "require") {
-            None if d.arguments.iter().all(|(n, _)| n != "require") => AuthRequirement::Session,
+            None if !require_given => AuthRequirement::Session,
             Some(v) if v == "session" => AuthRequirement::Session,
             Some(v) if v == "token" => AuthRequirement::Token,
             Some(v) if v == "public" => AuthRequirement::Public,
@@ -1588,8 +1741,9 @@ impl<'a> Analyzer<'a> {
         d: &Directive<'static, String>,
         name: &str,
     ) -> Result<bool, ()> {
+        let given = has_arg(d, name);
         let problem = match bool_arg(d, name) {
-            None if d.arguments.iter().all(|(n, _)| n != name) => return Ok(false),
+            None if !given => return Ok(false),
             Some(true) => return Ok(true),
             Some(false) => "`false` is the default; drop the argument",
             None => "must be `true`",
@@ -1702,7 +1856,8 @@ impl<'a> Analyzer<'a> {
 
         for (arg, types) in [("request", &request), ("response", &response)] {
             let Some(types) = types else { continue };
-            if types.is_empty() || types.iter().any(|t| t.trim().is_empty()) {
+            let blank = types.iter().any(|t| t.trim().is_empty());
+            if types.is_empty() || blank {
                 self.errors.push(CompileError::at(
                     format!("{op}: @raw({arg}:) must be a non-empty list of media types"),
                     file,
@@ -1712,9 +1867,10 @@ impl<'a> Analyzer<'a> {
             }
         }
 
+        let stream_given = has_arg(d, "stream");
         let stream = match bool_arg(d, "stream") {
             Some(stream) => stream,
-            None if d.arguments.iter().all(|(n, _)| n != "stream") => false,
+            None if !stream_given => false,
             None => {
                 self.errors.push(CompileError::at(
                     format!("{op}: @raw(stream:) must be a boolean"),
@@ -1761,46 +1917,61 @@ impl<'a> Analyzer<'a> {
                     continue;
                 }
                 if matches!(f.ty, TypeRef::List { .. }) {
-                    self.errors.push(CompileError::new(format!(
+                    self.type_error(
+                        owner,
+                        format!(
                         "`{owner}.{}`: a binary body cannot be a list — one message has one body",
                         f.name
-                    )));
+                    ),
+                    );
                 }
                 if kind == "output" {
-                    self.errors.push(CompileError::new(format!(
-                        "`{owner}.{}`: a binary value cannot be a field of an output type; \
+                    self.type_error(
+                        owner,
+                        format!(
+                            "`{owner}.{}`: a binary value cannot be a field of an output type; \
                          return it from an operation declaring @raw(response:) instead",
-                        f.name
-                    )));
+                            f.name
+                        ),
+                    );
                 }
             }
         }
 
         for service in &api.services {
             for op in &service.operations {
-                let name = format!("`{}.{}`", service.name, op.name);
+                let owner = format!("{}.{}", service.name, op.name);
 
                 let returns_binary = api.is_binary(op.output.base_name());
                 match (&op.raw_response, returns_binary) {
-                    (Some(_), false) => self.errors.push(CompileError::new(format!(
-                        "{name}: @raw(response:) requires the operation to return a binary \
+                    (Some(_), false) => self.operation_error(
+                        &owner,
+                        format!(
+                            "@raw(response:) requires the operation to return a binary \
                          scalar, but it returns `{}`",
-                        op.output.base_name()
-                    ))),
+                            op.output.base_name()
+                        ),
+                    ),
                     // `@raw` does not combine with `@http`, so its advice would
                     // lead to a second refusal there.
                     (None, true) if op.http.is_some() => {
-                        self.errors.push(CompileError::new(format!(
-                            "{name}: returns the binary scalar `{}`, which only a @raw \
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "returns the binary scalar `{}`, which only a @raw \
                              operation answers with, and @http does not combine with @raw",
-                            op.output.base_name()
-                        )));
+                                op.output.base_name()
+                            ),
+                        );
                     }
-                    (None, true) => self.errors.push(CompileError::new(format!(
-                        "{name}: returns the binary scalar `{}`, so it must declare \
+                    (None, true) => self.operation_error(
+                        &owner,
+                        format!(
+                            "returns the binary scalar `{}`, so it must declare \
                          @raw(response:) — bytes have no place in the JSON envelope",
-                        op.output.base_name()
-                    ))),
+                            op.output.base_name()
+                        ),
+                    ),
                     _ => {}
                 }
 
@@ -1815,25 +1986,33 @@ impl<'a> Analyzer<'a> {
                     .collect();
 
                 match (&op.raw_request, bodies.as_slice()) {
-                    (Some(_), []) => self.errors.push(CompileError::new(format!(
-                        "{name}: @raw(request:) requires exactly one input field of a binary \
-                         scalar to carry the body, but the input declares none"
-                    ))),
+                    (Some(_), []) => self.operation_error(
+                        &owner,
+                        "@raw(request:) requires exactly one input field of a binary scalar to \
+                         carry the body, but the input declares none"
+                            .to_string(),
+                    ),
                     (Some(_), [_]) => {}
-                    (Some(_), many) => self.errors.push(CompileError::new(format!(
-                        "{name}: @raw(request:) requires exactly one binary input field, but \
+                    (Some(_), many) => self.operation_error(
+                        &owner,
+                        format!(
+                            "@raw(request:) requires exactly one binary input field, but \
                          the input declares {} ({})",
-                        many.len(),
-                        many.join(", ")
-                    ))),
+                            many.len(),
+                            many.join(", ")
+                        ),
+                    ),
                     // An `@http` operation's binary field is refused by
                     // `check_http_bindings`, without advice it could not follow.
                     (None, []) => {}
                     (None, _) if op.http.is_some() => {}
-                    (None, [first, ..]) => self.errors.push(CompileError::new(format!(
-                        "{name}: input field `{first}` is a binary scalar, so the operation \
+                    (None, [first, ..]) => self.operation_error(
+                        &owner,
+                        format!(
+                            "input field `{first}` is a binary scalar, so the operation \
                          must declare @raw(request:)"
-                    ))),
+                        ),
+                    ),
                 }
 
                 // A streamed body is never read into the field, so a bound on it
@@ -1844,21 +2023,27 @@ impl<'a> Analyzer<'a> {
                     if let Some(f) = api.body_field(op) {
                         let c = api.resolved_constraints(f);
                         if c.min_length.is_some() || c.max_length.is_some() {
-                            self.errors.push(CompileError::new(format!(
-                                "{name}: @length on `{}` cannot apply to a streamed body, \
+                            self.operation_error(
+                                &owner,
+                                format!(
+                                    "@length on `{}` cannot apply to a streamed body, \
                                  which is never read into the field; bound it in the service, \
                                  from `RawRequest::content_length` and what it reads",
-                                f.name
-                            )));
+                                    f.name
+                                ),
+                            );
                         }
                     }
                 }
 
                 if let (OperationKind::Subscription, [first, ..]) = (op.kind, bodies.as_slice()) {
-                    self.errors.push(CompileError::new(format!(
-                        "{name}: a subscription sends no body, so its input cannot carry the \
+                    self.operation_error(
+                        &owner,
+                        format!(
+                            "a subscription sends no body, so its input cannot carry the \
                          binary field `{first}`"
-                    )));
+                        ),
+                    );
                 }
             }
         }
@@ -1875,22 +2060,28 @@ impl<'a> Analyzer<'a> {
         for service in &api.services {
             for op in &service.operations {
                 let Some(http) = &op.http else { continue };
-                let name = format!("`{}.{}`", service.name, op.name);
+                let owner = format!("{}.{}", service.name, op.name);
                 let fields = api.input_fields(op);
 
                 if op.input.is_none() && !http.path_params.is_empty() {
-                    self.errors.push(CompileError::new(format!(
-                        "{name}: @http(path:) names `{{{}}}`, but the operation takes no input",
-                        http.path_params.join("}`, `{")
-                    )));
+                    self.operation_error(
+                        &owner,
+                        format!(
+                            "@http(path:) names `{{{}}}`, but the operation takes no input",
+                            http.path_params.join("}`, `{")
+                        ),
+                    );
                     continue;
                 }
 
                 for param in &http.path_params {
                     let Some(field) = fields.iter().find(|f| &f.name == param) else {
-                        self.errors.push(CompileError::new(format!(
-                            "{name}: @http(path:) names `{{{param}}}`, which is not a field of the input"
-                        )));
+                        self.operation_error(
+                            &owner,
+                            format!(
+                            "@http(path:) names `{{{param}}}`, which is not a field of the input"
+                        ),
+                        );
                         continue;
                     };
                     // A value read as JSON text — the `JSON` scalar — has no
@@ -1907,21 +2098,27 @@ impl<'a> Analyzer<'a> {
                         }
                     );
                     if !scalar_or_enum || !one_value {
-                        self.errors.push(CompileError::new(format!(
-                            "{name}: path parameter `{param}` must be a required scalar or enum \
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "path parameter `{param}` must be a required scalar or enum \
                              field with a text form — a string, number or boolean, not `JSON` — \
                              since it fills one path segment"
-                        )));
+                            ),
+                        );
                     }
                 }
 
                 for field in fields {
                     if api.is_binary(field.ty.base_name()) {
-                        self.errors.push(CompileError::new(format!(
-                            "{name}: input field `{}` is a binary scalar, which only a @raw \
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "input field `{}` is a binary scalar, which only a @raw \
                              operation carries",
-                            field.name
-                        )));
+                                field.name
+                            ),
+                        );
                     }
                 }
             }
@@ -2148,11 +2345,16 @@ impl<'a> Analyzer<'a> {
         for (role, juniors) in &inherits {
             let mut seen: BTreeSet<&str> = BTreeSet::new();
             for junior in juniors {
+                // Recorded whatever the checks below say: an unknown name or
+                // the role itself is reported on every mention by the
+                // not-a-value and itself checks, which come before `twice`,
+                // so recording it changes nothing.
+                let first = seen.insert(junior);
                 let problem = if !roles.contains(&junior.as_str()) {
                     Some("which is not one of its values")
                 } else if junior == role {
                     Some("which is itself")
-                } else if !seen.insert(junior) {
+                } else if !first {
                     Some("twice")
                 } else {
                     None
@@ -2174,7 +2376,8 @@ impl<'a> Analyzer<'a> {
             let mut reached: BTreeSet<&str> = BTreeSet::new();
             let mut pending: Vec<&str> = direct.get(role).cloned().unwrap_or_default();
             while let Some(next) = pending.pop() {
-                if reached.insert(next) {
+                let first = reached.insert(next);
+                if first {
                     pending.extend(direct.get(next).into_iter().flatten().copied());
                 }
             }
@@ -2238,20 +2441,22 @@ impl<'a> Analyzer<'a> {
                         api.permissions.as_ref().map(|p| p.enum_name.as_str()),
                     ),
                 };
+                let owner = format!("{}.{}", s.name, op.name);
                 match set {
-                    None => self.errors.push(CompileError::new(format!(
-                        "`{}.{}`: @auth({argument}: {value}) needs an enum marked @{marker} \
-                         listing it",
-                        s.name, op.name
-                    ))),
+                    None => self.operation_error(
+                        &owner,
+                        format!(
+                            "@auth({argument}: {value}) needs an enum marked @{marker} listing it"
+                        ),
+                    ),
                     Some(values) if !values.contains(value) => {
-                        self.errors.push(CompileError::new(format!(
-                            "`{}.{}`: @auth({argument}: {value}) is not a value of the @{marker} \
-                             enum `{}`",
-                            s.name,
-                            op.name,
-                            set_name.unwrap_or_default()
-                        )));
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@auth({argument}: {value}) is not a value of the @{marker} enum `{}`",
+                                set_name.unwrap_or_default()
+                            ),
+                        );
                     }
                     Some(_) => {}
                 }
@@ -2272,6 +2477,7 @@ impl<'a> Analyzer<'a> {
         owner: &str,
         d: &Directive<'static, String>,
     ) -> Vec<String> {
+        let codes_given = has_arg(d, "codes");
         let problem = match string_list_arg(d, "codes") {
             Some(codes) if codes.is_empty() => "lists no code",
             Some(codes) => {
@@ -2281,7 +2487,7 @@ impl<'a> Analyzer<'a> {
                 }
                 "lists a code twice"
             }
-            None if d.arguments.iter().all(|(n, _)| n != "codes") => "is missing",
+            None if !codes_given => "is missing",
             None => "must be a list of strings",
         };
         self.errors.push(CompileError::at(
@@ -2512,6 +2718,49 @@ impl<'a> Analyzer<'a> {
         self.errors.push(error);
     }
 
+    /// The services of `api` in the order the SDL declares them: by file, then
+    /// by position in it.
+    ///
+    /// The IR lists them sorted by name, and a check that refuses the second of
+    /// two clashing declarations must meet them in the reader's order to know
+    /// which one that is — `USERS` sorts before `Users` whichever came first.
+    fn services_in_order<'s>(&self, api: &'s Api) -> Vec<&'s Service> {
+        let mut services: Vec<&Service> = api.services.iter().collect();
+        services.sort_by_key(|s| {
+            self.declared
+                .get(&s.name)
+                .map(|(file, pos)| (file.clone(), pos.line, pos.column))
+        });
+        services
+    }
+
+    /// Every operation of `api` with its service, in the order the SDL
+    /// declares them (see [`Self::services_in_order`]).
+    fn operations_in_order<'s>(&self, api: &'s Api) -> Vec<(&'s Service, &'s Operation)> {
+        let mut operations: Vec<(&Service, &Operation)> = api
+            .services
+            .iter()
+            .flat_map(|s| s.operations.iter().map(move |op| (s, op)))
+            .collect();
+        operations.sort_by_key(|(s, op)| {
+            self.operation_sites
+                .get(&format!("{}.{}", s.name, op.name))
+                .map(|(file, pos)| (file.clone(), pos.line, pos.column))
+        });
+        operations
+    }
+
+    /// An error about the type `name`, or about a field or member of it,
+    /// reported where the type is declared: the IR keeps no positions of its
+    /// own, and the type's is the nearest one a check over the IR can name.
+    fn type_error(&mut self, name: &str, message: String) {
+        let location = self
+            .declared
+            .get(name)
+            .map(|(file, pos)| format!("{file}:{}:{}", pos.line, pos.column));
+        self.errors.push(CompileError { message, location });
+    }
+
     /// Reject two values of one enum that serialise to the same string.
     ///
     /// A tag that collides with another value's tag — or with a plain value's
@@ -2520,7 +2769,8 @@ impl<'a> Analyzer<'a> {
     fn check_enum_wire_names(&mut self, file: &Path, owner: &str, values: &[EnumValue], pos: Pos) {
         let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
         for v in values {
-            if let Some(other) = seen.insert(v.wire_name(), &v.name) {
+            let previous = seen.insert(v.wire_name(), &v.name);
+            if let Some(other) = previous {
                 self.errors.push(CompileError::at(
                     format!(
                         "enum `{owner}`: values `{other}` and `{}` both serialise to `{}`",
@@ -2647,7 +2897,8 @@ impl<'a> Analyzer<'a> {
                 )));
                 continue;
             };
-            if held_by.iter().any(|(_, name)| name != first) {
+            let disagree = held_by.iter().any(|(_, name)| name != first);
+            if disagree {
                 let sites = held_by
                     .iter()
                     .map(|(owner, name)| format!("`{owner}.{name}`"))
@@ -2676,7 +2927,8 @@ impl<'a> Analyzer<'a> {
                 if let Some(tag) = self.variant_tags.get(&member.name) {
                     member.tag = tag.clone();
                 }
-                if let Some(other) = tags.insert(member.tag.clone(), member.name.clone()) {
+                let previous = tags.insert(member.tag.clone(), member.name.clone());
+                if let Some(other) = previous {
                     self.errors.push(CompileError::new(format!(
                         "union `{}`: members `{other}` and `{}` share the tag `{}`",
                         u.name, member.name, member.tag
@@ -2842,7 +3094,8 @@ impl<'a> Analyzer<'a> {
             ));
             return false;
         }
-        if let Err(e) = regex::Regex::new(pattern) {
+        let compiled = regex::Regex::new(pattern);
+        if let Err(e) = compiled {
             self.errors.push(CompileError::at(
                 format!("@pattern `{pattern}` is not a valid regex: {e}"),
                 file,
@@ -2850,7 +3103,8 @@ impl<'a> Analyzer<'a> {
             ));
             return false;
         }
-        if let Some((construct, fix)) = js_incompatible(pattern) {
+        let incompatible = js_incompatible(pattern);
+        if let Some((construct, fix)) = incompatible {
             self.errors.push(CompileError::at(
                 format!(
                     "@pattern `{pattern}` uses `{construct}`, which the browser cannot read: the \
@@ -2913,8 +3167,12 @@ impl<'a> Analyzer<'a> {
                 // a compile error naming the directive, rather than a
                 // generated check that silently rejects everything.
                 "pattern" => match string_arg(d, "value") {
-                    Some(v) if self.check_pattern(file, d.position, &v) => c.pattern = Some(v),
-                    Some(_) => {}
+                    Some(v) => {
+                        let usable = self.check_pattern(file, d.position, &v);
+                        if usable {
+                            c.pattern = Some(v);
+                        }
+                    }
                     None => self.errors.push(CompileError::at(
                         "@pattern requires a string `value`",
                         file,
@@ -2952,7 +3210,8 @@ impl<'a> Analyzer<'a> {
                 ));
                 continue;
             }
-            if !seen.insert(d.name.as_str()) {
+            let first = seen.insert(d.name.as_str());
+            if !first {
                 self.errors.push(CompileError::at(
                     format!("directive `@{}` is repeated", d.name),
                     file,
@@ -2981,7 +3240,8 @@ impl<'a> Analyzer<'a> {
                         d.position,
                     ));
                 }
-                if !args.insert(name) {
+                let first = args.insert(name);
+                if !first {
                     self.errors.push(CompileError::at(
                         format!("directive `@{}`: argument `{name}` is repeated", d.name),
                         file,
@@ -3084,22 +3344,21 @@ impl<'a> Analyzer<'a> {
         // `GET /items/{id}` beside `DELETE /items/{id}`. `ANY` takes every
         // method, so it shares its path with nothing.
         let mut seen: BTreeMap<&str, Vec<(&'static str, String)>> = BTreeMap::new();
-        for s in &api.services {
-            for op in &s.operations {
-                let owner = format!("{}.{}", s.name, op.name);
-                let method = op.http_method();
-                let taken = seen.entry(&op.path).or_default();
-                let clash = taken
-                    .iter()
-                    .find(|(other, _)| *other == method || *other == "ANY" || method == "ANY");
-                if let Some((_, prev)) = clash {
-                    self.errors.push(CompileError::new(format!(
-                        "duplicate RPC path `{}`: used by `{prev}` and `{owner}`",
-                        op.path
-                    )));
-                }
-                taken.push((method, owner));
+        for (s, op) in self.operations_in_order(api) {
+            let owner = format!("{}.{}", s.name, op.name);
+            let method = op.http_method();
+            let taken = seen.entry(&op.path).or_default();
+            let clash = taken
+                .iter()
+                .find(|(other, _)| *other == method || *other == "ANY" || method == "ANY");
+            if let Some((_, prev)) = clash {
+                let message = format!(
+                    "duplicate RPC path `{}`: used by `{prev}` and `{owner}`",
+                    op.path
+                );
+                self.operation_error(&owner, message);
             }
+            taken.push((method, owner));
         }
     }
 
@@ -3114,28 +3373,26 @@ impl<'a> Analyzer<'a> {
     fn check_path_parameter_names(&mut self, api: &Api) {
         // Shape of the prefix up to a parameter -> the name and who used it.
         let mut seen: BTreeMap<String, (&str, String)> = BTreeMap::new();
-        for s in &api.services {
-            for op in &s.operations {
-                let owner = format!("{}.{}", s.name, op.name);
-                let mut shape = String::new();
-                for segment in op.path.split('/').skip(1) {
-                    shape.push('/');
-                    let name = segment.strip_prefix('{').and_then(|n| n.strip_suffix('}'));
-                    let Some(name) = name else {
-                        shape.push_str(segment);
-                        continue;
-                    };
-                    shape.push_str("{}");
-                    let (prev_name, prev) = seen
-                        .entry(shape.clone())
-                        .or_insert_with(|| (name, owner.clone()));
-                    if *prev_name != name {
-                        self.errors.push(CompileError::new(format!(
+        for (s, op) in self.operations_in_order(api) {
+            let owner = format!("{}.{}", s.name, op.name);
+            let mut shape = String::new();
+            for segment in op.path.split('/').skip(1) {
+                shape.push('/');
+                let name = segment.strip_prefix('{').and_then(|n| n.strip_suffix('}'));
+                let Some(name) = name else {
+                    shape.push_str(segment);
+                    continue;
+                };
+                shape.push_str("{}");
+                let (prev_name, prev) = seen
+                    .entry(shape.clone())
+                    .or_insert_with(|| (name, owner.clone()));
+                if *prev_name != name {
+                    self.errors.push(CompileError::new(format!(
                             "path parameter `{{{name}}}` of `{owner}` (`{}`) sits where `{prev}` names \
                              `{{{prev_name}}}`; one route cannot name it twice, so use one name",
                             op.path
                         )));
-                    }
                 }
             }
         }
@@ -3149,16 +3406,210 @@ impl<'a> Analyzer<'a> {
     /// a duplicate drops one of the two rather than failing.
     fn check_operation_ids(&mut self, api: &Api) {
         let mut seen: BTreeMap<&str, String> = BTreeMap::new();
+        for (s, op) in self.operations_in_order(api) {
+            let owner = format!("{}.{}", s.name, op.name);
+            let previous = seen.insert(&op.operation_id, owner.clone());
+            if let Some(prev) = previous {
+                let message = format!(
+                    "duplicate operationId `{}`: used by `{prev}` and `{owner}`",
+                    op.operation_id
+                );
+                self.operation_error(&owner, message);
+            }
+        }
+    }
+
+    /// An SDL type spelt like a Rust item the generated code declares itself,
+    /// or like a prelude name it writes unqualified.
+    ///
+    /// Every type the Rust targets emit is an item of the same name beside the
+    /// generator's own: the `Rt` alias, `Failure`, `FromRequestContext`,
+    /// `ApiClient`, the `operations` and `wire` modules, a service's
+    /// `<S>Service` trait and `<S>Operations` client group, an operation's
+    /// `<S><Op>Codes` set. A type of one of those names is a duplicate item in
+    /// the module declaring both, and in a module glob-importing the types it
+    /// is silently the generator's item instead of the SDL's. The prelude
+    /// names are the same hazard the other way round: an SDL `Result` would
+    /// take the prelude's place in every signature of the file. `From` is among
+    /// them because the derives the generated code applies write it unqualified
+    /// — `treat`'s `ApiErrorCode` and `error_set!` both — and `Into` because the
+    /// client's constructors take `impl Into<String>`.
+    ///
+    /// The runtime's items are not among these: the generated code names them
+    /// by their absolute paths and re-exports one only when no type is spelt
+    /// like it, so an input called `Request` or an object called `RawBody` is
+    /// fine. A scalar mapped to a Rust type declares nothing and is not
+    /// checked; a newtype scalar is.
+    fn check_rust_item_names(&mut self, api: &Api) {
+        let mut reserved: BTreeMap<String, String> = BTreeMap::new();
+        for (name, what) in [
+            ("Rt", "the server's runtime alias"),
+            ("Failure", "the types module's `Failure` alias"),
+            ("FromRequestContext", "the server's context trait"),
+            ("ApiClient", "the Rust client"),
+            ("operations", "the `operations` module"),
+            ("wire", "the `wire` module"),
+        ] {
+            reserved.insert(name.to_string(), what.to_string());
+        }
+        for name in [
+            "Option", "Some", "None", "Result", "Ok", "Err", "Vec", "Box", "String", "Clone",
+            "Send", "Sync", "Sized", "From", "Into",
+        ] {
+            reserved.insert(
+                name.to_string(),
+                format!("Rust's prelude `{name}`, which the generated code names"),
+            );
+        }
         for s in &api.services {
+            reserved.insert(
+                format!("{}Service", s.name),
+                format!("the trait of service `{}`", s.name),
+            );
+            reserved.insert(
+                format!("{}Operations", pascal_case(&s.name)),
+                format!("the Rust client's group for service `{}`", s.name),
+            );
             for op in &s.operations {
-                let owner = format!("{}.{}", s.name, op.name);
-                if let Some(prev) = seen.insert(&op.operation_id, owner.clone()) {
-                    self.errors.push(CompileError::new(format!(
-                        "duplicate operationId `{}`: used by `{prev}` and `{owner}`",
-                        op.operation_id
-                    )));
+                reserved.insert(
+                    codes_type_name(&s.name, &op.name),
+                    format!("the codes type of `{}.{}`", s.name, op.name),
+                );
+            }
+        }
+
+        for ty in &api.types {
+            let emitted = match ty {
+                ApiType::Scalar(s) => s.rust_newtype,
+                _ => true,
+            };
+            if !emitted {
+                continue;
+            }
+            let Some(what) = reserved.get(ty.name()) else {
+                continue;
+            };
+            let location = self
+                .declared
+                .get(ty.name())
+                .map(|(file, pos)| format!("{file}:{}:{}", pos.line, pos.column));
+            self.errors.push(CompileError {
+                message: format!(
+                    "type `{}` is spelt like {what}, which the generated Rust declares or \
+                     names itself; rename the type",
+                    ty.name()
+                ),
+                location,
+            });
+        }
+    }
+
+    /// Two services, or two operations, that the targets would give one name.
+    ///
+    /// Every target derives its identifiers by recasing the SDL names, and the
+    /// recasing loses what told them apart. `Users.getAll` and `UsersGet.all`
+    /// are both the server's handler `users_get_all`, both the `wire` statics
+    /// `USERS_GET_ALL_*` and both `UsersGetAllCodes`; `Users` and `USERS` are
+    /// both the Rust module and client accessor `users` and both the key
+    /// `users` of TypeScript's `createApi`. Rust refuses the duplicate item —
+    /// in generated code, where the author cannot fix it — and a TypeScript
+    /// object literal keeps the second entry and drops the first without a
+    /// word. Neither path, operationId nor type name catches this, since none
+    /// of those is recased the same way.
+    ///
+    /// Reported where the later of the two is declared, naming the earlier
+    /// one's declaration and every name the pair shares.
+    fn check_generated_names(&mut self, api: &Api) {
+        let mut taken: BTreeMap<(&'static str, String), Claimant> = BTreeMap::new();
+        for s in self.services_in_order(api) {
+            let claimant = Claimant {
+                label: format!("service `{}`", s.name),
+                site: self
+                    .declared
+                    .get(&s.name)
+                    .map(|(file, pos)| format!("{file}:{}:{}", pos.line, pos.column)),
+            };
+            let names = [
+                (
+                    "the Rust module and client accessor",
+                    snake_case_raw(&s.name),
+                ),
+                ("the TypeScript `createApi` key", s.name.to_lowercase()),
+                (
+                    "the Rust client type",
+                    format!("{}Operations", pascal_case(&s.name)),
+                ),
+            ];
+            self.refuse_shared_names(&mut taken, claimant, names);
+        }
+        for (s, op) in self.operations_in_order(api) {
+            let owner = format!("{}.{}", s.name, op.name);
+            let claimant = Claimant {
+                site: self
+                    .operation_sites
+                    .get(&owner)
+                    .map(|(file, pos)| format!("{}:{}:{}", file.display(), pos.line, pos.column)),
+                label: format!("`{owner}`"),
+            };
+            let names = [
+                (
+                    "the Rust handler",
+                    format!("{}_{}", snake_case_raw(&s.name), snake_case_raw(&op.name)),
+                ),
+                (
+                    "the `wire` statics",
+                    format!("{}_*", fields_static_name(&s.name, &op.name)),
+                ),
+                ("the codes type", codes_type_name(&s.name, &op.name)),
+            ];
+            self.refuse_shared_names(&mut taken, claimant, names);
+        }
+    }
+
+    /// Claim `names` for `claimant` in `taken`, and report one error per
+    /// earlier claimant already holding any of them, listing every name the two
+    /// share.
+    ///
+    /// Each name is keyed by what kind of name it is, so that a module and a
+    /// type that happen to be spelt alike are not taken for a clash.
+    fn refuse_shared_names<const N: usize>(
+        &mut self,
+        taken: &mut BTreeMap<(&'static str, String), Claimant>,
+        claimant: Claimant,
+        names: [(&'static str, String); N],
+    ) {
+        // The earlier claimant -> what this one shares with it, in `names` order.
+        let mut shared: BTreeMap<String, (Claimant, Vec<String>)> = BTreeMap::new();
+        for (kind, name) in names {
+            let shown = format!("{kind} `{name}`");
+            match taken.entry((kind, name)) {
+                Entry::Vacant(slot) => {
+                    slot.insert(claimant.clone());
+                }
+                Entry::Occupied(slot) => {
+                    let earlier = slot.get();
+                    shared
+                        .entry(earlier.label.clone())
+                        .or_insert_with(|| (earlier.clone(), Vec::new()))
+                        .1
+                        .push(shown);
                 }
             }
+        }
+        for (earlier, names) in shared.into_values() {
+            let earlier_at = earlier
+                .site
+                .map(|at| format!(" (declared at {at})"))
+                .unwrap_or_default();
+            self.errors.push(CompileError {
+                message: format!(
+                    "{} and {}{earlier_at} generate the same names — {}; rename one of them",
+                    claimant.label,
+                    earlier.label,
+                    names.join(", ")
+                ),
+                location: claimant.site.clone(),
+            });
         }
     }
 
@@ -3168,24 +3619,37 @@ impl<'a> Analyzer<'a> {
         let registry: Option<BTreeSet<&str>> = match api.find_type(ERROR_CODE_ENUM) {
             Some(ApiType::Enum(e)) => Some(e.values.iter().map(|v| v.name.as_str()).collect()),
             Some(_) => {
-                self.errors.push(CompileError::new(format!(
-                    "`{ERROR_CODE_ENUM}` must be an enum: it is the error code registry"
-                )));
+                self.type_error(
+                    ERROR_CODE_ENUM,
+                    format!("`{ERROR_CODE_ENUM}` must be an enum: it is the error code registry"),
+                );
                 return;
             }
             None => {
-                // Only demanded once an operation actually declares errors, so
-                // an API without any does not have to provide the registry.
-                if api
+                // Demanded as soon as there is an operation, `@throws` or not:
+                // every operation can answer `invalid_body` and
+                // `internal_error` on its own, the generated server and client
+                // are typed over the registry those codes belong to, and
+                // without it neither compiles. An API of types alone has no
+                // operation to fail and needs none.
+                let first = api
                     .services
                     .iter()
-                    .all(|s| s.operations.iter().all(|o| o.errors.is_empty()))
-                {
-                    return;
-                }
-                self.errors.push(CompileError::new(format!(
-                    "@throws requires an `{ERROR_CODE_ENUM}` enum listing every code"
-                )));
+                    .find_map(|s| s.operations.first().map(|op| (s, op)));
+                let Some((service, op)) = first else { return };
+                let listed = RUNTIME_ERROR_CODES
+                    .iter()
+                    .map(|code| format!("`{code}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                self.operation_error(
+                    &format!("{}.{}", service.name, op.name),
+                    format!(
+                        "an API with operations must declare `enum {ERROR_CODE_ENUM}`, the \
+                         error code registry, listing at least {listed} — the runtime \
+                         answers them for any operation — and every code @throws names"
+                    ),
+                );
                 return;
             }
         };
@@ -3193,9 +3657,10 @@ impl<'a> Analyzer<'a> {
 
         for value in &RUNTIME_ERROR_CODES {
             if !registry.contains(value) {
-                self.errors.push(CompileError::new(format!(
-                    "`{ERROR_CODE_ENUM}` must list `{value}`: the runtime emits it"
-                )));
+                self.type_error(
+                    ERROR_CODE_ENUM,
+                    format!("`{ERROR_CODE_ENUM}` must list `{value}`: the runtime emits it"),
+                );
             }
         }
     }
@@ -3215,31 +3680,34 @@ impl<'a> Analyzer<'a> {
         if let Some(permissions) = &api.permissions {
             for code in &permissions.codes {
                 if !registry.contains(code.as_str()) {
-                    self.errors.push(CompileError::new(format!(
-                        "enum `{}`: @permissions(codes:) names `{code}`, which is not listed in \
-                         `{ERROR_CODE_ENUM}`",
-                        permissions.enum_name
-                    )));
+                    self.type_error(
+                        &permissions.enum_name,
+                        format!(
+                            "enum `{}`: @permissions(codes:) names `{code}`, which is not listed \
+                             in `{ERROR_CODE_ENUM}`",
+                            permissions.enum_name
+                        ),
+                    );
                 }
             }
         }
 
         for s in &api.services {
             for op in &s.operations {
+                let owner = format!("{}.{}", s.name, op.name);
                 let mut seen: BTreeSet<&str> = BTreeSet::new();
                 for code in &op.errors {
-                    if !seen.insert(code) {
-                        self.errors.push(CompileError::new(format!(
-                            "`{}.{}`: @throws lists `{code}` twice",
-                            s.name, op.name
-                        )));
+                    let first = seen.insert(code);
+                    if !first {
+                        self.operation_error(&owner, format!("@throws lists `{code}` twice"));
                     }
                     if !registry.contains(code.as_str()) {
-                        self.errors.push(CompileError::new(format!(
-                            "`{}.{}`: @throws names `{code}`, which is not listed in \
-                             `{ERROR_CODE_ENUM}`",
-                            s.name, op.name
-                        )));
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@throws names `{code}`, which is not listed in `{ERROR_CODE_ENUM}`"
+                            ),
+                        );
                     }
                 }
 
@@ -3260,12 +3728,15 @@ impl<'a> Analyzer<'a> {
                     ),
                 };
                 for code in required {
-                    if !op.errors.iter().any(|c| c == code) {
-                        self.errors.push(CompileError::new(format!(
-                            "`{}.{}`: @auth({argument}:) is checked before the handler, so \
-                             @throws(codes:) must list `{code}`",
-                            s.name, op.name
-                        )));
+                    let listed = op.errors.iter().any(|c| c == code);
+                    if !listed {
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@auth({argument}:) is checked before the handler, so \
+                                 @throws(codes:) must list `{code}`"
+                            ),
+                        );
                     }
                 }
             }
@@ -3294,7 +3765,8 @@ impl<'a> Analyzer<'a> {
             let Some(ApiType::Object(o)) = api.find_type(member.name.as_str()) else {
                 continue;
             };
-            if o.fields.iter().any(|f| f.name == tag) {
+            let shadowed = o.fields.iter().any(|f| f.name == tag);
+            if shadowed {
                 // The IR keeps no field positions, but the union's own
                 // declaration site is where the discriminator was chosen.
                 let (site, pos) = self
@@ -3412,18 +3884,20 @@ impl<'a> Analyzer<'a> {
                 ApiType::InputObject(i) => {
                     for f in &i.fields {
                         match api.find_type(f.ty.base_name()) {
-                            Some(ApiType::Object(_)) => self.errors.push(CompileError::new(
+                            Some(ApiType::Object(_)) => self.type_error(
+                                &i.name,
                                 format!(
                                     "`{}.{}` references output object `{}`; inputs may only use input objects, enums and scalars",
                                     i.name, f.name, f.ty.base_name()
                                 ),
-                            )),
-                            Some(ApiType::Union(_)) => self.errors.push(CompileError::new(
+                            ),
+                            Some(ApiType::Union(_)) => self.type_error(
+                                &i.name,
                                 format!(
                                     "`{}.{}` references union `{}`; use an @oneOf input instead",
                                     i.name, f.name, f.ty.base_name()
                                 ),
-                            )),
+                            ),
                             _ => {}
                         }
                     }
@@ -3431,12 +3905,15 @@ impl<'a> Analyzer<'a> {
                 ApiType::Object(o) => {
                     for f in &o.fields {
                         if let Some(ApiType::InputObject(_)) = api.find_type(f.ty.base_name()) {
-                            self.errors.push(CompileError::new(format!(
-                                "`{}.{}` references input object `{}` in output position",
-                                o.name,
-                                f.name,
-                                f.ty.base_name()
-                            )));
+                            self.type_error(
+                                &o.name,
+                                format!(
+                                    "`{}.{}` references input object `{}` in output position",
+                                    o.name,
+                                    f.name,
+                                    f.ty.base_name()
+                                ),
+                            );
                         }
                     }
                 }
@@ -3446,23 +3923,26 @@ impl<'a> Analyzer<'a> {
 
         for s in &api.services {
             for op in &s.operations {
+                let owner = format!("{}.{}", s.name, op.name);
                 if let Some(input) = &op.input {
                     if let Some(ApiType::Object(_)) = api.find_type(input.base_name()) {
-                        self.errors.push(CompileError::new(format!(
-                            "`{}.{}`: input `{}` must be an input object, not an output type",
-                            s.name,
-                            op.name,
-                            input.base_name()
-                        )));
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "input `{}` must be an input object, not an output type",
+                                input.base_name()
+                            ),
+                        );
                     }
                 }
                 if let Some(ApiType::InputObject(_)) = api.find_type(op.output.base_name()) {
-                    self.errors.push(CompileError::new(format!(
-                        "`{}.{}`: output `{}` must not be an input object",
-                        s.name,
-                        op.name,
-                        op.output.base_name()
-                    )));
+                    self.operation_error(
+                        &owner,
+                        format!(
+                            "output `{}` must not be an input object",
+                            op.output.base_name()
+                        ),
+                    );
                 }
             }
         }
@@ -3560,7 +4040,8 @@ fn path_parameters(path: &str) -> Option<Vec<String>> {
         .split_last()
         .map(|(_, inner)| inner)
         .unwrap_or_default();
-    if inner.iter().any(|segment| segment.is_empty()) {
+    let empty_segment = inner.iter().any(|segment| segment.is_empty());
+    if empty_segment {
         return None;
     }
     for segment in segments {
@@ -3580,7 +4061,8 @@ fn path_parameters(path: &str) -> Option<Vec<String>> {
                 params.push(name.to_string());
             }
             None => {
-                if !is_route(&format!("/{segment}")) {
+                let route = is_route(&format!("/{segment}"));
+                if !route {
                     return None;
                 }
             }

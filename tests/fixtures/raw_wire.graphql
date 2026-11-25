@@ -1,0 +1,118 @@
+scalar UUID
+
+"An opaque body: bytes on the wire rather than a value in the JSON envelope."
+scalar Binary
+  @scalar(
+    rust: "Vec<u8>"
+    typescript: "Blob"
+    openapiType: "string"
+    openapiFormat: "binary"
+  )
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  not_found
+  role_required
+  "Declared by no operation, so every generated set keeps a reachable fallback."
+  database_error
+  "Tagged: the envelope must carry `files::gone`, not the identifier."
+  files__gone @variant(tag: "files::gone")
+}
+
+"A junior role and one inheriting it, so the guard below passes by inheritance."
+enum Role @roles {
+  files_read
+  files_write @inherits(roles: [files_read])
+}
+
+"What a token may do; one scope tagged, so its wire name is not its identifier."
+enum Scope @scopes(query: read) {
+  read
+  write
+  purge @variant(tag: "files.purge")
+}
+
+type Event { line: String! }
+
+input WatchInput { id: UUID! }
+
+input ReportInput {
+  id: UUID!
+  "A parameter of a raw-response call still travels as JSON."
+  rows: Int
+}
+
+input IngestInput {
+  id: UUID!
+  "A list repeats its key in the query string once the body is spent."
+  tags: [String!]
+  "The one binary field: this is the request body itself."
+  body: Binary!
+}
+
+input ConvertInput {
+  id: UUID!
+  body: Binary!
+}
+
+input UploadInput {
+  id: UUID!
+  "Left empty by the server: the payload reaches the service unread."
+  body: Binary!
+}
+
+type IngestResult { written: Int! }
+
+type UploadResult {
+  "Bytes the service read from the body."
+  received: Int!
+  "The `Content-Length` the request declared."
+  declared: Int
+  "Whether every byte read was the byte the test sent."
+  intact: Boolean!
+}
+
+type Files @service {
+  "A stream of events, sharing the runtime the raw forms emit."
+  watch(input: WatchInput!): Event! @subscription @rpc(path: "/watch")
+
+  "Bytes out, JSON in."
+  report(input: ReportInput!): Binary!
+    @query
+    @rpc(path: "/report")
+    @raw(response: ["text/csv"])
+    @throws(codes: ["not_found", "files__gone"])
+
+  "Bytes out, nothing in."
+  manifest: Binary!
+    @query
+    @rpc(path: "/manifest")
+    @raw(response: ["application/json"])
+
+  "Bytes in, JSON out."
+  ingest(input: IngestInput!): IngestResult!
+    @mutation
+    @rpc(path: "/ingest")
+    @raw(request: ["text/csv", "application/json"])
+
+  "Bytes in, bytes out."
+  convert(input: ConvertInput!): Binary!
+    @mutation
+    @rpc(path: "/convert")
+    @raw(request: ["text/csv"], response: ["application/json"])
+
+  "Bytes in unread, JSON out."
+  upload(input: UploadInput!): UploadResult!
+    @mutation
+    @rpc(path: "/upload")
+    @raw(request: ["application/octet-stream"], stream: true)
+
+  "Bytes in unread, bytes out, for a caller with a session: the one form with every extractor."
+  echo(input: ConvertInput!): Binary!
+    @mutation(scope: write)
+    @rpc(path: "/echo")
+    @raw(request: ["application/octet-stream"], response: ["application/octet-stream"], stream: true)
+    @auth(require: session, role: files_read)
+    @throws(codes: ["role_required"])
+}

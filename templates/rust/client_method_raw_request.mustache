@@ -1,6 +1,4 @@
-    pub async fn {{{method}}}(&self, input: &{{{input}}}, content_type: &str) -> ClientResult<{{{output}}}, {{{error}}}> {
+    pub async fn {{{method}}}({{{params}}}) -> ::treat::rpc::client::ClientResult<{{{success}}}, {{{error}}}> {
         let body = input.{{{body_field}}}.clone();
-        self.client
-            .raw_request_json("{{{path}}}", input, body, content_type)
-            .await
+        self.client.{{{client_call}}}({{{call_args}}}).await
     }

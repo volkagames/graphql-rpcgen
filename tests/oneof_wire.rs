@@ -12,22 +12,23 @@
 //! tag and the member land as two keys of the holder.
 //!
 //! The SDL also declares one service, so the emitted error vocabulary is
-//! compiled rather than assumed: an `error_set!` with members, and the
-//! `TryFrom` / `Undeclared` impls a `narrow` goes through. A set is macro
-//! input, so its syntax is only ever checked by compiling it — a snapshot
-//! that matches the emitted text says nothing about whether `error_set`
-//! accepts it.
+//! compiled rather than assumed: an `error_set!` with members deriving
+//! `ApiErrorCode` and `WireEnum`, which `treat::rpc::Narrow` reads a flat
+//! failure into the operation's set through. A set is macro input, so its
+//! syntax is only ever checked by compiling it — a snapshot that matches the
+//! emitted text says nothing about whether `error_set` accepts it.
 //!
-//! Every enum's `ALL`, `from_name` and `as_str` are run too: that `as_str` is
-//! exactly what serde writes, a `@variant(tag:)` included, can only be shown
-//! by serialising.
+//! Every enum's `ALL`, `from_name` and `as_str` (`treat::rpc::WireEnum`, as
+//! the generated module re-exports it) are run too: that `as_str` is exactly
+//! what serde writes, a `@variant(tag:)` included, can only be shown by
+//! serialising.
 //!
 //! The generated types get their own scratch cargo project: the project's
 //! target directory is stable under this crate's `target/`, so the
-//! dependencies compile once and later runs reuse them. The scratch project's
-//! lockfile is kept across runs and the build is offline, so nothing reaches
-//! the network and nothing drifts from the versions this crate's lockfile
-//! actually pins.
+//! dependencies compile once and later runs reuse them. The scratch project
+//! starts from this crate's lockfile on every run and the build is offline,
+//! so nothing reaches the network and nothing drifts from the versions this
+//! crate's lockfile actually pins.
 
 #![allow(
     clippy::panic_in_result_fn,
@@ -38,80 +39,24 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-use std::process::Command;
+mod common;
 
-const SDL: &str = r#"
-scalar UUID
+use common::Dependency;
 
-enum ErrorCode {
-  invalid_body
-  internal_error
-  bad_request
-  not_found
-}
-
-"A unix second count, 0 through 10 in the test below."
-scalar ZoroTime
-  @scalar(rust: "u32", typescript: "number", openapiType: "integer", openapiFormat: "int64", rustNewtype: true, rustCopy: true, rustRange: true)
-  @range(min: 0, max: 10)
-
-"A nickname, between one and twelve characters."
-scalar Nick @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true) @length(min: 1, max: 12)
-
-"A slug, inherited: lowercase letters, digits, dashes."
-scalar Slug @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true) @pattern(value: "^[a-z0-9-]+$")
-
-"""
-A money amount. The one newtype here over a floating-point representation,
-which is the case `Eq`, `Ord` and `Hash` cannot be derived for — and the case
-`rustRange` exists for, so the two have to hold at once.
-"""
-scalar Money
-  @scalar(rust: "f64", typescript: "number", openapiType: "number", rustNewtype: true, rustRange: true)
-  @range(min: 0)
-
-input CardInput { token: String! }
-input CryptoInput { coin: String! }
-
-type CardPayment @variant(tag: "card") { last4: String! }
-type CryptoPayment { network: String! }
-union PaymentMethod = CardPayment | CryptoPayment
-
-enum SettingKind { flag number }
-"One value whose wire name is not its identifier."
-enum Visibility { private public_link @variant(tag: "public-link") }
-type FlagSetting @variant(tag: "flag") { tribool: Boolean }
-type NumberSetting @variant(tag: "number") { min: Int }
-union Setting @discriminator(sibling: "kind") = FlagSetting | NumberSetting
-type Param { label: String! kind: SettingKind! settings: Setting! }
-
-input PaymentInput @oneOf {
-  card: CardInput
-  crypto: CryptoInput
-  nick: Nick
-  slug: Slug
-  tag: String @pattern(value: "^[a-z]+$")
-  exp: ZoroTime
-  amount: Money
-}
-
-"""
-An expression that describes itself. A `@oneOf` input is emitted as an enum,
-and an arm naming the enum has to be boxed or the type has no finite size.
-"""
-input ExprInput @oneOf {
-  negate: ExprInput
-  literal: Int
-}
-
-type Things @service {
-  get(input: CardInput!): CardPayment! @query @throws(codes: ["bad_request"])
-}
-"#;
+/// Every arm constraint, both union taggings and one service; `golden.rs`
+/// keeps what each target emits for it.
+const SDL: &str = include_str!("fixtures/oneof_wire.graphql");
 
 /// The driver: one wire-shape test and one arm-validation test per kind of
 /// constraint the emitter can attach to an arm.
 const DRIVER: &str = r##"
+//! The test driver. Not generated code, so the lints the generated module is
+//! held to are not this module's.
+#![allow(clippy::all, dead_code, unused_imports, reason = "a test driver, not generated code")]
+
+use crate::types::*;
+use validator::Validate;
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -332,99 +277,42 @@ fn generated_types() -> TestResult<String> {
         &graphql_rpcgen::config::Config::default(),
     )?)
 }
-
-/// The dependencies the generated types reach for, with this crate's lockfile
-/// as the source of truth for their versions. They are dev-dependencies here:
-/// the generator needs none of them, but the lockfile has to carry them for
-/// this test to resolve a version offline.
-const DEPENDENCIES: &[&str] = &[
-    "chrono",
-    "derive_more",
-    "error_set",
-    "regex",
-    "serde",
-    "serde_json",
-    "treat",
-    "uuid",
-    "validator",
-];
-
-/// Per-dependency features, exactly as the generated types need them.
-fn features_of(dep: &str) -> &'static str {
-    match dep {
-        "chrono" => r#"{ version = "{v}", features = ["serde"] }"#,
-        "derive_more" => r#"{ version = "{v}", features = ["from", "into", "display", "as_ref"] }"#,
-        "serde" => r#"{ version = "{v}", features = ["derive"] }"#,
-        "uuid" => r#"{ version = "{v}", features = ["serde"] }"#,
-        "validator" => r#"{ version = "{v}", features = ["derive"] }"#,
-        _ => r#""{v}""#, // a plain version requirement
-    }
-}
-
-fn manifest_for(root: &std::path::Path) -> TestResult<String> {
-    // Pinning to this crate's lockfile is what keeps this build hermetic
-    // and in sync: a version bump there lands here on the next run, and a
-    // version the lock does not contain is an error instead of a fetch.
-    let lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
-    let lock: toml::Table = toml::from_str(&lock)?;
-    let mut deps = Vec::new();
-    for dep in DEPENDENCIES {
-        let packages = lock["package"].as_array().ok_or("lockfile has packages")?;
-        let version = packages
-            .iter()
-            .find_map(|p| {
-                if p.get("name")?.as_str() == Some(*dep) {
-                    p.get("version")?.as_str().map(str::to_string)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                format!("`{dep}` is in the generated types' dependency set but not in Cargo.lock")
-            })?;
-        deps.push(format!(
-            "{dep} = {}",
-            features_of(dep).replacen("{v}", &version, 1)
-        ));
-    }
-    Ok(format!(
-        "[package]\nname = \"oneof_wire\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n{}\n\n[workspace]\n",
-        deps.join("\n")
-    ))
-}
+/// The scratch project, and the dependencies the generated types reach for:
+/// `treat` with `validator` for the `@pattern` checks, and no `regex` of the
+/// project's own — the patterns compile through `treat::rpc::validate`.
+/// They are dev-dependencies here: the generator needs none of them, but the
+/// lockfile has to carry them for this test to resolve a version offline.
+///
+/// No `--lib`: this project runs its doctests too.
+const PROJECT: common::ScratchProject = common::ScratchProject {
+    name: "oneof_wire",
+    dir: "oneof-test",
+    dependencies: &[
+        Dependency::with("chrono", &["serde"]),
+        Dependency::with("derive_more", &["from", "into", "display", "as_ref"]),
+        Dependency::plain("error_set"),
+        Dependency::with("serde", &["derive"]),
+        Dependency::plain("serde_json"),
+        Dependency::with("treat", &["validator"]),
+        Dependency::with("uuid", &["serde"]),
+        Dependency::with("validator", &["derive"]),
+    ],
+    test_args: &[],
+    target: None,
+    edition: "2021",
+};
 
 /// Compile the generated types plus the driver in a scratch cargo project and
 /// run the driver's tests.
-fn compile_and_run() -> TestResult {
-    let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))?;
-
-    // Stable locations: the project's lockfile and target directory survive
-    // across runs, so the dependency tree resolves once, offline, and later
-    // runs reuse it. Only the generated source is rewritten.
-    let project = root.join("target").join("oneof-test");
-    let project_target = root.join("target").join("oneof-test-target");
-    std::fs::create_dir_all(project.join("src"))?;
-
-    let lib = generated_types()? + "\n" + DRIVER;
-    std::fs::write(project.join("src").join("lib.rs"), lib)?;
-    std::fs::write(project.join("Cargo.toml"), manifest_for(&root)?)?;
-
-    let output = Command::new("cargo")
-        .args(["test", "--quiet", "--offline"])
-        .current_dir(&project)
-        .env("CARGO_TARGET_DIR", &project_target)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "the generated oneOf types must build and pass their wire tests:\n{stdout}\n{stderr}"
-    );
-    Ok(())
-}
-
 #[test]
 fn one_of_wire_shape_and_arm_validation() -> TestResult {
-    compile_and_run()?;
-    Ok(())
+    let types = generated_types()?;
+    PROJECT.check(
+        &[
+            ("types.rs", &types),
+            ("driver.rs", DRIVER),
+            ("lib.rs", "mod driver;\npub mod types;\n"),
+        ],
+        &["types.rs"],
+    )
 }

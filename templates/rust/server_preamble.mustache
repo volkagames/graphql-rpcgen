@@ -1,29 +1,21 @@
 
-#![allow(clippy::all, dead_code, unused_imports)]
-
-use axum::extract::State;
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::Router;
-use serde::{Deserialize, Serialize};
-use treat::extract_axum::ApiJson;
-use treat::prelude::*;
-
-/// The envelope and everything that builds one, re-exported so implementing a
-/// service trait takes a single import.
-pub use treat::{error, error_and_message, failure, success, ApiError, ApiResponse, ErrorMessage};
-{{{types_import}}}
-/// Reject a body that parsed but breaks a constraint the SDL declares.
+{{{types_import}}}{{#reexports}}// What implementing a service trait names — the envelope and everything that
+// builds one, the refusal, the context contract, the stream and body types —
+// re-exported so it takes a single import.
+{{{reexports}}}{{/reexports}}{{#operations}}
+/// The runtime's helpers — reading an input, answering with a result — for
+/// this API's registry: `treat::rpc::Runtime`, named once.
+type Rt = ::treat::rpc::Runtime<{{{error_code_enum}}}>;
+{{/operations}}{{#context_trait}}
+/// What the project's request context does beyond resolving the caller
+/// ([`treat::rpc::server::ResolveContext`]): the access checks this API's
+/// `@auth` declares.
 ///
-/// The code is rewritten to `{{{invalid_body_code}}}` so every code on the wire
-/// stays a registry value instead of leaking `validator`'s own rule names; the
-/// rule that was broken survives in `message`, and the RFC 6901 pointer says
-/// which field it was.
-fn invalid_input(violations: &validator::ValidationErrors) -> Response {
-    let mut messages = treat::validation_error_messages(violations);
-    for message in &mut messages {
-        message.code = {{{invalid_body_code}}}.to_string();
-    }
-    let response: ApiResponse<treat::NoData> = failure(messages);
-    response.into_response()
-}
+/// The generator names this contract and the project's own context type
+/// implements it, so resolving a session — the cookie, the exchange with
+/// whoever issues it, the user lookup — stays on the project's side: none of
+/// it is describable in a schema. Named for what it does rather than for what
+/// it holds, so it does not collide with the type that satisfies it, which is
+/// often called `RequestContext` itself.
+{{{context_trait}}}
+{{/context_trait}}

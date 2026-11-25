@@ -1,5 +1,0 @@
-    pub async fn {{{method}}}(&self, input: &{{{input}}}) -> ClientResult<{{{output}}}, {{{error}}}> {
-        self.client
-            .call_http(reqwest::Method::{{{http_method}}}, "{{{path}}}", &{{{path_fields}}}, input, HttpBodyKind::{{{http_body}}}, {{{envelope}}})
-            .await
-    }

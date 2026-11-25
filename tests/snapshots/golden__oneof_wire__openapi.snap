@@ -1,0 +1,517 @@
+---
+source: tests/golden.rs
+expression: output
+---
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RPC API",
+    "version": "0.1.0",
+    "description": "Generated from GraphQL SDL by graphql-rpcgen. All operations are POST + JSON."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Things"
+    }
+  ],
+  "paths": {
+    "/rpc/things/get": {
+      "post": {
+        "operationId": "things_get",
+        "tags": [
+          "Things"
+        ],
+        "summary": "Things.get",
+        "x-rpc-kind": "query",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CardInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/CardPayment"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "bad_request",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CardInput": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ]
+      },
+      "CardPayment": {
+        "type": "object",
+        "properties": {
+          "last4": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "last4"
+        ]
+      },
+      "CryptoInput": {
+        "type": "object",
+        "properties": {
+          "coin": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "coin"
+        ]
+      },
+      "CryptoPayment": {
+        "type": "object",
+        "properties": {
+          "network": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "network"
+        ]
+      },
+      "ErrorCode": {
+        "type": "string",
+        "enum": [
+          "invalid_body",
+          "internal_error",
+          "bad_request",
+          "not_found"
+        ]
+      },
+      "ExprInput": {
+        "description": "An expression that describes itself. A `@oneOf` input is emitted as an enum,\nand an arm naming the enum has to be boxed or the type has no finite size.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "negate": {
+                "$ref": "#/components/schemas/ExprInput"
+              }
+            },
+            "required": [
+              "negate"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "literal": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "literal"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "FlagSetting": {
+        "type": "object",
+        "properties": {
+          "tribool": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "NumberSetting": {
+        "type": "object",
+        "properties": {
+          "min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          }
+        }
+      },
+      "Param": {
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "label"
+            ]
+          },
+          {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "flag"
+                  },
+                  "settings": {
+                    "$ref": "#/components/schemas/FlagSetting"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "settings"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "number"
+                  },
+                  "settings": {
+                    "$ref": "#/components/schemas/NumberSetting"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "settings"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "PaymentInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "card": {
+                "$ref": "#/components/schemas/CardInput"
+              }
+            },
+            "required": [
+              "card"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "crypto": {
+                "$ref": "#/components/schemas/CryptoInput"
+              }
+            },
+            "required": [
+              "crypto"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "nick": {
+                "type": "string",
+                "description": "A nickname, between one and twelve characters.",
+                "minLength": 1,
+                "maxLength": 12
+              }
+            },
+            "required": [
+              "nick"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "slug": {
+                "type": "string",
+                "description": "A slug, inherited: lowercase letters, digits, dashes.",
+                "pattern": "^[a-z0-9-]+$"
+              }
+            },
+            "required": [
+              "slug"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "type": "string",
+                "pattern": "^[a-z]+$"
+              }
+            },
+            "required": [
+              "tag"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "exp": {
+                "type": "integer",
+                "format": "int64",
+                "description": "A unix second count, 0 through 10 in the test below.",
+                "minimum": 0.0,
+                "maximum": 10.0
+              }
+            },
+            "required": [
+              "exp"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number",
+                "description": "A money amount. The one newtype here over a floating-point representation,\nwhich is the case `Eq`, `Ord` and `Hash` cannot be derived for — and the case\n`rustRange` exists for, so the two have to hold at once.",
+                "minimum": 0.0
+              }
+            },
+            "required": [
+              "amount"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "PaymentMethod": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CardPayment_Tagged"
+          },
+          {
+            "$ref": "#/components/schemas/CryptoPayment_Tagged"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "card": "#/components/schemas/CardPayment_Tagged",
+            "CryptoPayment": "#/components/schemas/CryptoPayment_Tagged"
+          }
+        }
+      },
+      "CardPayment_Tagged": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CardPayment"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "card"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        ]
+      },
+      "CryptoPayment_Tagged": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CryptoPayment"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "CryptoPayment"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        ]
+      },
+      "Setting": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/FlagSetting"
+          },
+          {
+            "$ref": "#/components/schemas/NumberSetting"
+          }
+        ]
+      },
+      "SettingKind": {
+        "type": "string",
+        "enum": [
+          "flag",
+          "number"
+        ]
+      },
+      "Visibility": {
+        "description": "One value whose wire name is not its identifier.",
+        "type": "string",
+        "enum": [
+          "private",
+          "public-link"
+        ]
+      },
+      "RpcErrorItem": {
+        "type": "object",
+        "description": "One entry of `errors[]`, as produced by `treat::ErrorMessage`.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object",
+            "description": "Free-form context; its keys depend on the code."
+          },
+          "type": {
+            "type": "string",
+            "description": "RFC 9457 problem type URI."
+          },
+          "instance": {
+            "type": "string",
+            "description": "RFC 9457 occurrence id."
+          },
+          "source": {
+            "type": "object",
+            "description": "Locator for the offending input (JSON:API `source`).",
+            "properties": {
+              "pointer": {
+                "type": "string",
+                "description": "RFC 6901 JSON Pointer."
+              },
+              "parameter": {
+                "type": "string"
+              },
+              "header": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RpcErrorItem"
+            }
+          }
+        },
+        "required": [
+          "errors"
+        ]
+      }
+    },
+    "headers": {
+      "x-rpc-status": {
+        "description": "`ok` when `errors[]` is empty, `error` otherwise.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        }
+      }
+    }
+  }
+}

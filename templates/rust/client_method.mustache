@@ -1,3 +1,3 @@
-    pub async fn {{{method}}}(&self, input: &{{{input}}}) -> ClientResult<{{{output}}}, {{{error}}}> {
-        self.client.call("{{{path}}}", input).await
+    pub async fn {{{method}}}({{{params}}}) -> ::treat::rpc::client::ClientResult<{{{success}}}, {{{error}}}> {
+        self.client.{{{client_call}}}({{{call_args}}}).await
     }

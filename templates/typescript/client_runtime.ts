@@ -1,0 +1,639 @@
+// This runtime writes every global it uses — `Response`, `Headers`, `Promise`,
+// `Record`, `JSON`, … — as `globalThis.X`. The API's own types are declared in
+// this module, and a type declared in a module takes a global's place for every
+// bare reference in it: an SDL `type Response` would turn each `Response` here
+// into the API's object rather than fetch's. Through `globalThis` the name is
+// the global whatever the API declares.
+
+/**
+ * The response envelope, used for both success and failure.
+ *
+ * A successful call carries `data`; a failed one carries `errors`. Each field
+ * is omitted entirely when empty rather than sent as null.
+ */
+export interface RpcResponse<Output = unknown> {
+  data?: Output
+  meta?: globalThis.Record<string, unknown>
+  errors?: RpcErrorItem[]
+}
+
+/**
+ * Thrown whenever a response is a failure: with the response's `errors[]`, or
+ * with one synthetic entry for a failure that arrived without them. A call that
+ * fails before a response exists throws what failed instead: a rejected
+ * `fetch` (network, abort), the `validate` hook, or a `TypeError` for an input
+ * no URL can carry — a path parameter that is missing or would not stay one
+ * segment, a `null` item in a list field that is not JSON-typed.
+ *
+ * `status` is the status line. An RPC route — a `@raw` one included — leaves a
+ * failure at `200` unless the service gave it another, so `errors[]` decides
+ * the outcome. The runtime's own refusals there carry a status of their own:
+ * `415` for a body under a `Content-Type` the route does not read (an RPC body
+ * not declared JSON, a raw body of a type the operation does not list), `413`
+ * for a body past the limit, and `422` for an RPC body that is not JSON. An
+ * `@http` route's failures carry a status its callers read: the one the service
+ * set, else `400` for an input it cannot read (a JSON body, a query string, a
+ * form or a path) or one breaking a constraint, `413` for a body past the
+ * limit, `401` or `403` for a refused session or access, and `500` for a
+ * service failure of an `envelope: false` route that was left at a `2xx`
+ * status.
+ */
+export class RpcError extends globalThis.Error {
+  readonly status: number
+  readonly errors: RpcErrorItem[]
+
+  constructor(status: number, errors: RpcErrorItem[]) {
+    super(errors[0]?.message ?? `RPC request failed with status ${status}`)
+    this.name = 'RpcError'
+    this.status = status
+    this.errors = errors
+  }
+
+  /** Whether any entry carries `code`. */
+  is(code: RpcErrorCode): boolean {
+    return this.errors.some((e) => e.code === code)
+  }
+
+  /** First `meta` payload matching `code`, if present. */
+  metaFor(code: RpcErrorCode): globalThis.Record<string, unknown> | undefined {
+    return this.errors.find((e) => e.code === code)?.meta
+  }
+
+  /**
+   * JSON Pointer to the field that caused the failure, when the server
+   * located one — set for `invalid_body` rejections.
+   */
+  get pointer(): string | undefined {
+    return this.errors.find((e) => e.source?.pointer)?.source?.pointer
+  }
+}
+
+export interface RpcClientOptions {
+  baseUrl?: string
+  /**
+   * Extra headers merged into every request.
+   *
+   * Except `Content-Type` on a request with a body, which says what the body
+   * is and so is the client's to write: `application/json` for a JSON body —
+   * the one type an RPC route reads one under — a form's type for a form, and
+   * for a raw body the type `RpcCallOptions.contentType` or the operation
+   * names.
+   */
+  headers?: globalThis.Record<string, string>
+  fetch?: typeof globalThis.fetch
+  /**
+   * Called with every request before it is sent, and expected to throw when the
+   * input breaks a constraint the SDL declares.
+   *
+   * The generated zod target exports a `validateInput` with exactly this shape,
+   * so wiring it is `new RpcClient({ validate: validateInput })`. It is a hook
+   * rather than a built-in import so a client that does not want a validation
+   * library in its bundle still has no dependencies. The server checks the same
+   * rules regardless — this only moves the rejection off the network.
+   *
+   * `route` is the operation's path, or `METHOD path` for an `@http` operation,
+   * since two of those may share a path.
+   */
+  validate?: (route: string, input: unknown) => void
+}
+
+export interface RpcCallOptions {
+  signal?: globalThis.AbortSignal
+  /**
+   * `Content-Type` for a raw request body, overriding the operation's first
+   * declared media type.
+   *
+   * An operation accepting several is asking the caller to pick: an import
+   * taking JSON or CSV cannot be sent as both, and only the caller knows which
+   * file it holds. The server reads the body only under a type the operation
+   * declares, and refuses any other at `415`.
+   */
+  contentType?: string
+}
+
+/**
+ * Minimal typed wrapper over fetch. An RPC operation is `POST` + JSON; a
+ * subscription is a `GET` over Server-Sent Events, a `@raw` body is bytes
+ * rather than JSON, and an operation bound to HTTP by `@http` goes through
+ * `http()` with its own method, path and body.
+ */
+export class RpcClient {
+  /**
+   * The most bytes of a raw answer declared `application/json` read to tell a
+   * refusal from the operation's own JSON: 64 KiB, as the Rust client.
+   *
+   * A refusal is a short envelope, so an answer longer than this is the
+   * operation's own and is returned without being parsed.
+   */
+  static readonly RAW_PEEK_LIMIT = 64 << 10
+
+  private readonly baseUrl: string
+  private readonly headers: globalThis.Record<string, string>
+  private readonly fetchImpl: typeof globalThis.fetch
+  private readonly validate?: (route: string, input: unknown) => void
+
+  constructor(options: RpcClientOptions = {}) {
+    // Paths from the IR are absolute (/rpc/...), so the base URL only
+    // contributes an origin or prefix.
+    this.baseUrl = (options.baseUrl ?? '').replace(/\/$/, '')
+    this.headers = options.headers ?? {}
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
+    this.validate = options.validate
+  }
+
+  /**
+   * One RPC call: `POST` with the input as a JSON body, sent as
+   * `Content-Type: application/json` (the server refuses any other at `415`),
+   * and the envelope unwrapped.
+   */
+  async call<Output>(path: string, input: unknown, options: RpcCallOptions = {}): globalThis.Promise<Output> {
+    // Throws before the request is built, so an input the server would reject
+    // costs no round trip.
+    this.validate?.(path, input)
+
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: this.requestHeaders('application/json'),
+      body: globalThis.JSON.stringify(input),
+      signal: options.signal,
+    })
+
+    let body: RpcResponse<Output> | undefined
+    try {
+      body = (await response.json()) as RpcResponse<Output>
+    } catch {
+      // Non-JSON body; handled below.
+    }
+
+    // `errors[]` decides the outcome, not the status line, which an RPC route
+    // leaves at 200 for a failure unless the service gave it another. The
+    // `x-rpc-status` header carries the same signal out of band.
+    if (body?.errors?.length) {
+      throw new RpcError(response.status, body.errors)
+    }
+    if (!response.ok || body === undefined) {
+      throw new RpcError(response.status, [syntheticError(response.status)])
+    }
+    return body.data as Output
+  }
+
+  /**
+   * An operation whose request or response body is not the JSON envelope.
+   *
+   * With `spec.bodyField`, that field is the request body, sent under
+   * `options.contentType` or else `spec.requestType`, and the other fields
+   * travel in the query string as `spec.fields` spells them. Without one, the
+   * input is a JSON body, as for `call`.
+   *
+   * Returns the `Response` rather than a parsed value: a raw body is bytes, and
+   * the headers that come with it — `Content-Disposition`, `Content-Type` — are
+   * part of the answer for a download.
+   *
+   * A failure still arrives as the envelope, and for an operation answering
+   * bytes (`spec.rawResponse`) it is told from them as the server writes it:
+   *
+   * - any status other than `2xx` is a failure;
+   * - an `x-rpc-status` header decides when present (`error` a failure, `ok`
+   *   the bytes), which a server with `treat`'s `rpc-status-header` sets;
+   * - without one, an answer whose media type is exactly `application/json`
+   *   (any case, any parameters; not `application/jsonl`) is read — through a
+   *   clone, up to `RAW_PEEK_LIMIT` bytes — and is a failure if it is an
+   *   envelope with a non-empty `errors[]`; for an operation whose own answer is
+   *   JSON this is the only way to tell. A longer one, or one declaring a
+   *   longer `Content-Length`, is the operation's own.
+   *
+   * Anything else is returned as it arrived, its body unread.
+   */
+  async raw(
+    path: string,
+    input: object | undefined,
+    spec: RpcRawSpec,
+    options: RpcCallOptions = {},
+  ): globalThis.Promise<globalThis.Response> {
+    const response = await this.sendRaw(path, input, spec, options)
+    if (!response.ok) throw await refusal(response)
+    if (!spec.rawResponse) return response
+
+    const declared = rpcStatus(response)
+    if (declared === 'error') throw await refusal(response)
+    if (declared === 'ok') return response
+    if (!hasMediaType(response, 'application/json')) return response
+    // JSON, and nothing but the body says whose.
+    const errors = await peekErrors(response, RpcClient.RAW_PEEK_LIMIT)
+    if (errors) throw new RpcError(response.status, errors)
+    return response
+  }
+
+  /** A raw request with an ordinary JSON answer — an upload reporting a result. */
+  async rawJson<Output>(
+    path: string,
+    input: object | undefined,
+    spec: RpcRawSpec,
+    options: RpcCallOptions = {},
+  ): globalThis.Promise<Output> {
+    const response = await this.raw(path, input, spec, options)
+    const body = (await response.json().catch(() => undefined)) as RpcResponse<Output> | undefined
+    if (body?.errors?.length) throw new RpcError(response.status, body.errors)
+    if (body === undefined) throw new RpcError(response.status, [syntheticError(response.status)])
+    return body.data as Output
+  }
+
+  /** Send a raw operation's request and return whatever answered, unread. */
+  private async sendRaw(
+    path: string,
+    input: object | undefined,
+    spec: RpcRawSpec,
+    options: RpcCallOptions,
+  ): globalThis.Promise<globalThis.Response> {
+    this.validate?.(path, input ?? {})
+
+    if (!spec.bodyField) {
+      return this.fetchImpl(`${this.baseUrl}${path}`, {
+        method: 'POST',
+        headers: this.requestHeaders('application/json'),
+        body: globalThis.JSON.stringify(input ?? {}),
+        signal: options.signal,
+      })
+    }
+
+    // With the one body taken by the payload, the other fields have nowhere
+    // left to go but the URL.
+    const { [spec.bodyField]: body, ...params } = inputFields(input)
+    const query = toQuery(params, spec.fields)
+    return this.fetchImpl(`${this.baseUrl}${path}${query}`, {
+      method: 'POST',
+      headers: this.requestHeaders(options.contentType ?? spec.requestType),
+      body: body as globalThis.BodyInit,
+      signal: options.signal,
+    })
+  }
+
+  /**
+   * An operation bound to HTTP by `@http`: its own method and path, its path
+   * parameters filled from the input, the other fields in the query string or
+   * in a JSON or form body, and a success that is the envelope or, with
+   * `envelope` false, the value itself. A failure is the envelope either way.
+   *
+   * `spec.fields` says how a field is spelled in the path, the query string or
+   * the form, as for `raw`. A path parameter that is missing or `null`, or
+   * whose text is empty, `.` or `..` — which no URL carries as a segment — is a
+   * `TypeError`, and nothing is sent.
+   */
+  async http<Output>(
+    path: string,
+    input: object | undefined,
+    spec: RpcHttpSpec,
+    options: RpcCallOptions = {},
+  ): globalThis.Promise<Output> {
+    // Keyed by method and path: two `@http` operations may share a path.
+    this.validate?.(`${spec.method} ${path}`, input ?? {})
+    const fields = inputFields(input)
+    const route = fillPath(path, spec.pathFields, fields, spec.fields)
+    let url = `${this.baseUrl}${route}`
+    let headers: globalThis.Headers
+    let body: string | undefined
+    if (spec.body === 'json') {
+      headers = this.requestHeaders('application/json')
+      body = globalThis.JSON.stringify(fields)
+    } else if (spec.body === 'form') {
+      headers = this.requestHeaders('application/x-www-form-urlencoded')
+      body = searchParams(fields, spec.fields).toString()
+    } else {
+      headers = this.requestHeaders(undefined)
+      url += toQuery(fields, spec.fields)
+    }
+    const response = await this.fetchImpl(url, {
+      method: spec.method,
+      headers,
+      body,
+      signal: options.signal,
+    })
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      // Non-JSON body; handled below.
+    }
+    const envelope = parsed as RpcResponse<Output> | undefined
+    if (!response.ok) {
+      throw new RpcError(
+        response.status,
+        envelope?.errors?.length ? envelope.errors : [syntheticError(response.status)],
+      )
+    }
+    if (!spec.envelope) {
+      if (parsed === undefined) throw new RpcError(response.status, [syntheticError(response.status)])
+      return parsed as Output
+    }
+    if (envelope?.errors?.length) throw new RpcError(response.status, envelope.errors)
+    if (envelope === undefined) throw new RpcError(response.status, [syntheticError(response.status)])
+    return envelope.data as Output
+  }
+
+  /**
+   * Open a subscription over Server-Sent Events.
+   *
+   * `EventSource` can only GET, so the input travels in the query string,
+   * spelled as `fields` says (see `RpcFieldTable`). Each `data:` frame is one
+   * JSON event of the declared type; the connection is closed by calling
+   * `close()` on what this returns.
+   */
+  subscribe<Event>(
+    path: string,
+    input: object | undefined,
+    handlers: RpcEventHandlers<Event>,
+    fields?: RpcFieldTable,
+  ): RpcSubscription {
+    this.validate?.(path, input ?? {})
+
+    const query = toQuery(inputFields(input), fields)
+    const source = new globalThis.EventSource(`${this.baseUrl}${path}${query}`)
+    source.onmessage = (message) => {
+      // A frame that is not the declared event is a server bug, and swallowing
+      // it would present a stalled stream as a quiet one.
+      handlers.onEvent(globalThis.JSON.parse(message.data) as Event)
+    }
+    if (handlers.onOpen) source.onopen = () => handlers.onOpen?.()
+    // `EventSource` reconnects on its own; the handler is for reporting, not
+    // for retrying.
+    if (handlers.onError) source.onerror = (event) => handlers.onError?.(event)
+    return { close: () => source.close() }
+  }
+
+  /**
+   * The caller's headers, with `Content-Type` set to `contentType` when there
+   * is one.
+   *
+   * Set after the caller's are merged, and through `Headers`, whose names are
+   * case-insensitive: a `content-type` among the defaults is replaced rather
+   * than sent beside it, which a server reads as a type it does not accept.
+   */
+  private requestHeaders(contentType: string | undefined): globalThis.Headers {
+    const headers = new globalThis.Headers(this.headers)
+    if (contentType !== undefined) headers.set('Content-Type', contentType)
+    return headers
+  }
+}
+
+/** How an `@http` operation sits on HTTP. */
+export interface RpcHttpSpec {
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  /** Input fields filling the path's `{name}` segments. */
+  pathFields: readonly string[]
+  /** Where the other fields travel: the query string, a JSON body or a form body. */
+  body: 'none' | 'json' | 'form'
+  /** Whether a success is the `{ data }` envelope rather than the value itself. */
+  envelope: boolean
+  /** How the fields are spelled in the path, the query string or the form. */
+  fields?: RpcFieldTable
+}
+
+/** How an operation's non-JSON bodies are carried. */
+export interface RpcRawSpec {
+  /** Input field holding the request body; the rest become query parameters. */
+  bodyField?: string
+  /** `Content-Type` for that body. */
+  requestType?: string
+  /** Whether the response body is opaque bytes rather than the envelope. */
+  rawResponse?: boolean
+  /** How the query parameters are spelled. */
+  fields?: RpcFieldTable
+}
+
+/**
+ * How one input field's value is written as text in a query string, a form
+ * body or a path segment, as the server reads it back: the field's type in the
+ * schema, since the text alone cannot say whether `2` is a number or a string.
+ *
+ * `json` is always JSON text, a string included — `abc` travels as `"abc"` —
+ * since the server parses the parameter as JSON. The others write a string as
+ * itself and any other value as its JSON text.
+ */
+export type RpcQueryKind = 'str' | 'int' | 'float' | 'bool' | 'json'
+
+/**
+ * An operation's field table: per input field, its `RpcQueryKind`, with a `[]`
+ * suffix for a list — the same table the server reads the request with.
+ *
+ * Only a list repeats its key, one parameter per item; an array in a field
+ * that is not one travels under its key once, as JSON text. A list that is not
+ * `json` cannot spell a `null` item, which is a `TypeError`. A field the table
+ * leaves out is written as a `str` field that is not a list, which is also how
+ * every `int`, `float` and `bool` field is written — so a generated operation
+ * whose fields are all of those carries no table.
+ */
+export type RpcFieldTable = globalThis.Readonly<globalThis.Record<string, RpcQueryKind | `${RpcQueryKind}[]`>>
+
+export interface RpcEventHandlers<Event> {
+  onEvent: (event: Event) => void
+  onOpen?: () => void
+  onError?: (event: globalThis.Event) => void
+}
+
+export interface RpcSubscription {
+  close(): void
+}
+
+/**
+ * An input's fields, as a copy the caller's object is not changed through.
+ *
+ * Generated input types are interfaces, which have no index signature, so the
+ * widening happens here rather than at every call site. An input that is not
+ * an object has no fields.
+ */
+function inputFields(input: object | undefined): globalThis.Record<string, unknown> {
+  if (typeof input !== 'object' || input === null || globalThis.Array.isArray(input)) return {}
+  return { ...(input as globalThis.Record<string, unknown>) }
+}
+
+/**
+ * `path` with each `{name}` in `pathFields` replaced by that field, which is
+ * removed from `fields`: a path parameter travels in the path only. Its text is
+ * the one a query parameter of its kind would have, which is how the server
+ * reads it back.
+ */
+function fillPath(
+  path: string,
+  pathFields: readonly string[],
+  fields: globalThis.Record<string, unknown>,
+  table: RpcFieldTable | undefined,
+): string {
+  let route = path
+  for (const name of pathFields) {
+    const value = fields[name]
+    if (value === undefined || value === null) {
+      throw new globalThis.TypeError(`path parameter \`${name}\` is missing`)
+    }
+    const text = paramText(fieldKind(table, name).json, value)
+    // URL parsing removes a `.` or `..` segment, escaped or not, so the
+    // request would reach another route; an empty one reaches none.
+    if (text === '' || text === '.' || text === '..') {
+      throw new globalThis.TypeError(`path parameter \`${name}\` cannot be \`${text}\`: no URL carries it as a segment`)
+    }
+    route = route.replace(`{${name}}`, encodeURIComponent(text))
+    delete fields[name]
+  }
+  return route
+}
+
+/** An input's fields as a query string, `?` included; `''` when none is left. */
+function toQuery(fields: globalThis.Record<string, unknown>, table: RpcFieldTable | undefined): string {
+  const query = searchParams(fields, table).toString()
+  return query ? `?${query}` : ''
+}
+
+/**
+ * An input's fields as parameters: a query string without its `?`, and the
+ * body of an `application/x-www-form-urlencoded` request.
+ *
+ * Absent values are omitted rather than sent empty, so an optional parameter
+ * left out reaches the server as absent and takes its default.
+ */
+function searchParams(fields: globalThis.Record<string, unknown>, table: RpcFieldTable | undefined): globalThis.URLSearchParams {
+  const params = new globalThis.URLSearchParams()
+  for (const [key, value] of globalThis.Object.entries(fields)) {
+    for (const text of paramTexts(key, value, table)) params.append(key, text)
+  }
+  return params
+}
+
+/** The texts one field's value travels as: none for `null`, one per item for a list, else one. */
+function paramTexts(key: string, value: unknown, table: RpcFieldTable | undefined): string[] {
+  if (value === undefined || value === null) return []
+  const kind = fieldKind(table, key)
+  if (!kind.list || !globalThis.Array.isArray(value)) return [paramText(kind.json, value)]
+  return value.map((item: unknown) => {
+    // Only JSON text spells `null`; as the text `null` it would reach the
+    // server as a string, or not read at all.
+    if ((item === undefined || item === null) && !kind.json) {
+      throw new globalThis.TypeError(`list field \`${key}\` has a \`null\` item, which no query parameter spells`)
+    }
+    return paramText(kind.json, item)
+  })
+}
+
+/**
+ * One parameter's text: JSON text for a `json` field, a string as itself for
+ * any other, and anything else as its JSON text — a number or a boolean is its
+ * own spelling, and an object or an array has no other.
+ */
+function paramText(json: boolean, value: unknown): string {
+  if (!json && typeof value === 'string') return value
+  // `undefined` — a list item left out — is JSON's `null`, as in an array.
+  const text = globalThis.JSON.stringify(value) ?? 'null'
+  // A value whose JSON is a string (a `Date`, through `toJSON`) is that string.
+  if (!json && text.startsWith('"')) return globalThis.JSON.parse(text) as string
+  return text
+}
+
+/** How a field is written: JSON text or not, and whether it repeats its key. */
+function fieldKind(table: RpcFieldTable | undefined, key: string): { json: boolean; list: boolean } {
+  // Own keys only: an input field named like an `Object.prototype` member is
+  // not described by it.
+  const listed = table !== undefined && globalThis.Object.prototype.hasOwnProperty.call(table, key)
+  const entry = listed ? table[key] : undefined
+  return {
+    json: entry === 'json' || entry === 'json[]',
+    list: entry?.endsWith('[]') ?? false,
+  }
+}
+
+/** The outcome an `x-rpc-status` header declares, if it declares one this client knows. */
+function rpcStatus(response: globalThis.Response): 'ok' | 'error' | undefined {
+  const value = response.headers.get('x-rpc-status')?.trim().toLowerCase()
+  return value === 'ok' || value === 'error' ? value : undefined
+}
+
+/**
+ * Whether a response's `Content-Type` is `expected`: its media type alone,
+ * before any `;` parameter, without regard to case. Exact, so
+ * `application/jsonl` is not `application/json`.
+ */
+function hasMediaType(response: globalThis.Response, expected: string): boolean {
+  const contentType = response.headers.get('content-type') ?? ''
+  const essence = contentType.split(';')[0] ?? ''
+  return essence.trim().toLowerCase() === expected
+}
+
+/**
+ * The failure a raw answer's body carries, read through a clone so the
+ * response is returned with its body intact; `undefined` when it carries none.
+ *
+ * At most `limit` bytes are read: a refusal is a short envelope, so a body
+ * declaring or reaching more is the operation's own, and the clone is
+ * cancelled — the response keeps only what was read, not the whole body.
+ */
+async function peekErrors(response: globalThis.Response, limit: number): globalThis.Promise<RpcErrorItem[] | undefined> {
+  const declared = globalThis.Number(response.headers.get('content-length') ?? '')
+  if (declared > limit) return undefined
+  const reader = response.clone().body?.getReader()
+  if (reader === undefined) return undefined
+
+  const chunks: globalThis.Uint8Array[] = []
+  let size = 0
+  let ended = false
+  while (!ended && size <= limit) {
+    const chunk = await reader.read()
+    if (chunk.done) {
+      ended = true
+    } else {
+      chunks.push(chunk.value)
+      size += chunk.value.byteLength
+    }
+  }
+  if (!ended) {
+    await reader.cancel().catch(() => undefined)
+    return undefined
+  }
+  if (size > limit) return undefined
+
+  const bytes = new globalThis.Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  let parsed: unknown
+  try {
+    parsed = globalThis.JSON.parse(new globalThis.TextDecoder().decode(bytes))
+  } catch {
+    return undefined
+  }
+  return envelopeErrors(parsed)
+}
+
+/**
+ * The `errors[]` of an envelope: a non-empty array of entries each carrying a
+ * string `code`. `undefined` for any other value — an envelope carrying
+ * `data`, or JSON that is no envelope at all.
+ */
+function envelopeErrors(body: unknown): RpcErrorItem[] | undefined {
+  if (typeof body !== 'object' || body === null || globalThis.Array.isArray(body)) return undefined
+  const errors: unknown = (body as { errors?: unknown }).errors
+  if (!globalThis.Array.isArray(errors) || errors.length === 0) return undefined
+  const entries = errors.every(
+    (item: unknown) =>
+      typeof item === 'object' && item !== null && typeof (item as { code?: unknown }).code === 'string',
+  )
+  return entries ? (errors as RpcErrorItem[]) : undefined
+}
+
+/**
+ * The failure an answer carries, read whole: its `errors[]`, or one synthetic
+ * entry when it has none.
+ */
+async function refusal(response: globalThis.Response): globalThis.Promise<RpcError> {
+  const body = (await response.json().catch(() => undefined)) as RpcResponse<unknown> | undefined
+  return new RpcError(
+    response.status,
+    body?.errors?.length ? body.errors : [syntheticError(response.status)],
+  )
+}
+
+/** Stands in when a failure carries no usable envelope. */
+function syntheticError(status: number): RpcErrorItem {
+  return {
+    code: 'INTERNAL_ERROR_PLACEHOLDER',
+    message: `RPC request failed with status ${status}`,
+  } as RpcErrorItem
+}

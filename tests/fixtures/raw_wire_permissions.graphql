@@ -1,0 +1,72 @@
+scalar UUID
+
+scalar Binary
+  @scalar(
+    rust: "Vec<u8>"
+    typescript: "Blob"
+    openapiType: "string"
+    openapiFormat: "binary"
+  )
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+  permission_required
+  "Declared by no operation, so every generated set keeps a reachable fallback."
+  database_error
+}
+
+"Permission ids are not GraphQL identifiers, so each travels by its tag."
+enum Permission @permissions(codes: ["permission_required"]) {
+  files_purge @variant(tag: "files.purge")
+  files_wipe @variant(tag: "files.wipe")
+}
+
+type Event { line: String! }
+
+input WatchInput { id: UUID! }
+
+input IngestInput { id: UUID! body: Binary! }
+
+type IngestResult { written: Int! }
+
+type Admin @service @auth(require: session, permission: files_purge) {
+  "Inherits a permission the caller holds, so the call reaches the service."
+  purge(input: WatchInput!): IngestResult!
+    @mutation
+    @rpc(path: "/purge")
+    @throws(codes: ["permission_required"])
+
+  "A permission the caller lacks, so the call is refused before the service."
+  wipe(input: WatchInput!): IngestResult!
+    @mutation
+    @rpc(path: "/wipe")
+    @auth(require: session, permission: files_wipe)
+    @throws(codes: ["permission_required"])
+
+  "The same refusal in every other handler form, each of which reads its request its own way."
+  wipe_all: IngestResult!
+    @mutation @rpc(path: "/admin/no_input")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  watch(input: WatchInput!): Event!
+    @subscription @rpc(path: "/admin/watch")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  watch_all: Event!
+    @subscription @rpc(path: "/admin/watch_all")
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  report(input: WatchInput!): Binary!
+    @query @rpc(path: "/admin/report") @raw(response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  manifest: Binary!
+    @query @rpc(path: "/admin/manifest") @raw(response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  ingest(input: IngestInput!): IngestResult!
+    @mutation @rpc(path: "/admin/ingest") @raw(request: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  convert(input: IngestInput!): Binary!
+    @mutation @rpc(path: "/admin/convert") @raw(request: ["text/csv"], response: ["text/csv"])
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+  upload(input: IngestInput!): IngestResult!
+    @mutation @rpc(path: "/admin/upload") @raw(request: ["application/octet-stream"], stream: true)
+    @auth(permission: files_wipe) @throws(codes: ["permission_required"])
+}

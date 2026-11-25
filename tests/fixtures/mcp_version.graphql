@@ -1,0 +1,34 @@
+scalar UUID
+
+enum ErrorCode {
+  invalid_body
+  internal_error
+}
+
+input GetInput { id: UUID! }
+input RenameInput { id: UUID! name: String! }
+type Thing { id: UUID! name: String! }
+
+"""
+Exposed to MCP as a whole and mounted under `/v1`: every operation inherits
+both unless it restates one.
+"""
+type Catalog @service @mcp @version(n: 1) {
+  "Inherits both: a tool, at `/v1/rpc/catalog/get`."
+  get(input: GetInput!): Thing! @query
+
+  "A pinned path still takes the service's prefix: `/v1/catalog_find`."
+  find(input: GetInput!): Thing! @query @rpc(path: "/catalog_find")
+
+  "Carved out of the service's exposure, and moved to `/v2` on its own."
+  rename(input: RenameInput!): Thing! @mutation @mcp(expose: false) @version(n: 2)
+}
+
+"Neither exposed nor versioned unless an operation says so."
+type Admin @service {
+  "Exposed on its own, against an unannotated service, under `/v3`."
+  purge(input: GetInput!): Thing! @mutation @mcp @version(n: 3)
+
+  "Unannotated: no tool, no prefix."
+  list(input: GetInput!): Thing! @query
+}

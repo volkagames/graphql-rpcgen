@@ -15,7 +15,7 @@ api/**/*.graphql
  graphql-rpcgen
        │
        ├── Rust wire types            ─┬─►  service traits + Axum bindings
-       │                               └─►  Rust client (reqwest)
+       │                               └─►  Rust client (treat::rpc RpcClient)
        ├── OpenAPI 3.1  ──►  Swagger UI
        ├── TypeScript client + TanStack Query helpers
        └── zod schemas for the inputs
@@ -37,7 +37,7 @@ As a build-time or dev dependency:
 
 ```toml
 [dependencies]
-graphql-rpcgen = "0.7"
+graphql-rpcgen = "0.15"
 ```
 
 ## CLI
@@ -57,6 +57,40 @@ graphql-rpcgen generate --api api --root . --config rpcgen.toml
 `check` exits non-zero when generated files differ from what the current SDL
 produces, which makes it usable as a CI gate.
 
+Both commands pass every Rust target through `rustfmt` before writing or
+comparing it: the emitters write plain code — one statement per line, a
+signature or a derive list on one line however long — and the layout is
+`rustfmt`'s. It is the `rustfmt` named by `$RUSTFMT`, else the one on `PATH`,
+run from the directory each file is written to (or the nearest one that
+exists), so the project's `rustfmt.toml` or `.rustfmt.toml` applies exactly as
+it does to `cargo fmt`. Keep one in the project — an empty file will do —
+since without it `rustfmt` falls back to the developer's own
+`~/.config/rustfmt/rustfmt.toml`, and two machines would write two layouts.
+
+`--edition` is the one `cargo fmt` passes for the file: `[rust] edition` when
+the settings name one, else the `package.edition` of the nearest `Cargo.toml`
+above the file (`workspace.package.edition` when the package says
+`edition.workspace = true`), else 2021. It decides more than parsing:
+`rustfmt` derives its style edition from it unless `rustfmt.toml` sets
+`style_edition`, and the 2024 style sorts `use` lists and breaks lines
+differently, so a 2024 crate gets files its own `cargo fmt --check` keeps.
+Name the edition in the settings when the files land outside the crate that
+compiles them.
+
+A `rustfmt` that is missing or fails stops the run, naming the target — a
+rustup toolchain without the `rustfmt` component is named as such, with the
+`rustup component add rustfmt` that fixes it; `[rust] format = false` writes
+the plain output instead (see
+[What the generated Rust needs](#what-the-generated-rust-needs-on-the-other-side)).
+
+Both commands compare text, not line endings: a file that differs from the
+output only in `\r\n` against `\n` is up to date, and `generate` leaves it
+alone. A checkout with `core.autocrlf` (Git for Windows' default) rewrites
+every line ending, and without this every file would be stale there. The
+generator writes `\n`, except where a `rustfmt.toml` sets `newline_style`
+(`"Windows"`, or `"Native"` on Windows), which applies to the Rust targets
+only.
+
 A run that would write nothing is a failure rather than a quiet success. The
 settings file is optional, but the defaults name no target, so a project
 without one — or with a `--root` pointing a directory too high — configures no
@@ -64,7 +98,8 @@ output at all. Left as a warning that case made `check` report "up to date"
 after reading nothing, which is the one answer a CI gate must never give
 wrongly.
 
-Generation is deterministic: the same SDL always yields byte-identical output,
+Generation is deterministic: the output is byte-identical for the same SDL,
+generator version and `rustfmt` (its version and the configuration it finds),
 with types, services, operations and OpenAPI components sorted stably. No
 timestamps, and no network access at generation time.
 
@@ -111,6 +146,13 @@ The check runs when the file is read, so it also guards a library caller going
 through `Config::from_toml_file`. A `Config` built in Rust carries no
 requirement and is not checked — cargo already pinned the version there.
 
+**Raise it when you upgrade.** The check refuses only a generator older than
+the requirement, never a newer one, so it protects the output only if the
+requirement moves with it. Set `rpcgen_version` to the version you regenerated
+with, in the same change: left at the old one, a teammate or a CI job still on
+the old generator runs `generate` and writes the old output over the new, or
+runs `check` and calls the new output stale, instead of refusing the settings.
+
 Beyond that key, everything is optional: the built-in treat + axum templates
 apply and nothing is written until an `[output]` path says so.
 
@@ -129,6 +171,10 @@ openapi = "docs/openapi.json"
 title = "Billing API"
 version = "3.2.1"
 servers = ["https://api.example.com"]
+
+[rust]
+format = true                         # pass the Rust targets through rustfmt (see CLI)
+edition = "2024"                      # rustfmt's --edition; default: the crate's own
 ```
 
 ### The three Rust targets
@@ -152,27 +198,87 @@ it (`pub use`), so `use my_api::generated::*` still brings both the types and
 the traits into scope — splitting the crate is not a breaking change for
 callers.
 
+What each target holds:
+
+- **`rust_types`** — the SDL's types with their `validator` rules, the
+  `ErrorCode` registry and one code set per operation, the
+  [`operations`](#the-operation-table) table, and `wire`: the `static`s both
+  ends read an operation off — a subscription's or a raw request's query table
+  (`<OP>_FIELDS`), an `@http` operation's `treat::rpc::HttpSpec`
+  (`<OP>_HTTP`), a raw request's accepted media types (`<OP>_TYPES`). It
+  re-exports `treat::rpc::{WireEnum, Narrow, Undeclared, UNDECLARED_CODE_META}`,
+  so a glob import of it reaches `Role::from_name` and `.narrow()`.
+- **`rust_server`** — a service trait and an axum router per service, a handler
+  per operation (`type Rt = ::treat::rpc::Runtime<ErrorCode>;` and a few
+  `Rt::…` calls each), and `FromRequestContext`, the access checks a session's
+  context adds to `treat`'s `ResolveContext`. It re-exports what an
+  implementation names: the envelope builders, `Refusal`, `ResolveContext`,
+  `EventStream`, `event_stream`, `RawBody`, `RawRequest`, `RAW_BODY_LIMIT`, as
+  the API uses them.
+- **`rust_client`** — `ApiClient`, a newtype over `treat::rpc::client::RpcClient`
+  with an accessor per service, each method one call.
+
+The generated code itself imports no name beside the API's types: it writes
+`::treat::rpc::server::Refusal`, `::axum::extract::Request`,
+`::serde::Serialize` and the rest by their absolute paths, so an SDL type may be
+spelt like any of them — an `input Request`, a `type Response`, an
+`enum WireEnum` — and is the only item of that name in the module. A re-export
+is left out where the API declares a type of the same name; reach that item by
+its `treat` path. The few names the generator declares itself, and the prelude
+names it writes unqualified, are refused as type names (see
+[Names the targets have to be able to spell](#names-the-targets-have-to-be-able-to-spell)).
+
 Omitting `types_path` keeps everything in one file: the server target then emits
-the types itself, which is the single-file layout.
+the types itself, which is the single-file layout — the types preamble, then
+the server's, exactly what the two files of the split layout start with.
 
 #### What the generated Rust needs on the other side
 
 The generator itself depends on almost nothing, but the code it writes does, and
 a missing crate surfaces as a compile error in the consumer rather than here.
-`rust_server` and `rust_client` each pull in the `rust_types` row as well; they
-do not pull in each other, so a client-only consumer needs no web framework:
+None of it is a runtime pasted into the output: everything that does not depend
+on the schema — reading an input, refusing a request, answering with the
+envelope, bytes or Server-Sent Events, sending a call and reading its answer —
+is [`treat::rpc`](https://github.com/volkagames/treat/blob/main/docs/rpc.md),
+which the generated files call. `rust_server` and `rust_client` each pull in the
+`rust_types` row as well; they do not pull in each other, so a client-only
+consumer needs no web framework:
 
 | Target | Crates |
 | --- | --- |
-| `rust_types` | `serde`, `serde_json`, `derive_more`, `treat`, `regex`, `validator`, `error_set`, plus whatever each `@scalar(rust:)` names — typically `uuid` and `chrono` |
-| `rust_server` | `axum`, `async-trait`, and `treat` with its `axum` and `validator-extract` features |
-| `rust_client` | `reqwest` with its `json` feature; `treat` for the envelope and its error entries, no features needed |
+| `rust_types` | `serde`, `serde_json`, `treat` (default features; its `validator` feature with any `@pattern`), `validator`, `error_set`; `derive_more` with any newtype `@scalar`; plus whatever each `@scalar(rust:)` names — typically `uuid` and `chrono` |
+| `rust_server` | `axum`, `async-trait`, and `treat` with its `rpc-server` feature |
+| `rust_client` | `treat` with its `rpc-client` feature, which brings `reqwest` — without TLS: see below |
+
+An API declaring a `@subscription` or a `@raw` body needs `treat`'s
+**`rpc-stream`** feature as well, on the server and on the client: it adds
+Server-Sent Events and raw byte bodies to whichever of the two is on, and the
+generated code then names `EventStream`, `RawBody` and `RawRequest`. A plain
+JSON or `@http` API compiles none of it. No `futures-*`, `bytes` or `regex`
+dependency of the project's own is needed: `treat::rpc` re-exports what a
+service implementation reaches for (`treat::rpc::futures_util` to read a
+`RawRequest`, say).
+
+`treat` builds `reqwest` without its default features — TLS, HTTP/2 and system
+proxies among them — so an `https` base URL compiles and then fails at the
+first request, as `ClientError::Transport`, unless TLS comes from somewhere.
+Turn on `treat`'s **`rpc-client-rustls`**, or depend on `reqwest` yourself with
+the TLS feature you want — plus `http2` or `system-proxy` if you relied on
+`reqwest`'s defaults — which Cargo unifies with `treat`'s, or hand
+`ApiClient::with_http` a client configured your way. A project that depended
+on `reqwest` for the generated client up to 0.15 had its defaults, TLS
+included: keep that dependency, with its features, rather than dropping it.
+
+```toml
+# A server, and a client of another service over https.
+treat = { version = "0.27", features = ["rpc-server", "rpc-client-rustls", "rpc-stream", "rpc-status-header"] }
+```
 
 Those are the features the generated code needs to *compile*. The OpenAPI
 document additionally describes an `x-rpc-status` header on every response,
-which no generated handler writes: it comes from `treat`'s middleware, so a
-server meant to honour that document also needs `treat`'s `rpc-status-header`
-feature.
+which no generated handler writes: it comes from `treat`'s `rpc-status-header`
+feature, which a server meant to honour that document needs. With it a client
+also tells a raw or streamed answer from a refusal by the header.
 
 Span traces are the other feature nothing here needs to compile, and the one
 easiest to forget. Without them an internal error logs as `connection lost`
@@ -182,7 +288,7 @@ in its subscriber; with the feature alone the trace is printed empty, and
 nothing warns about it:
 
 ```toml
-treat = { version = "0.23", features = ["axum", "validator-extract", "rpc-status-header", "spantrace"] }
+treat = { version = "0.27", features = ["rpc-server", "rpc-status-header", "spantrace"] }
 tracing-error = "0.2"
 ```
 
@@ -199,21 +305,25 @@ The details, including why a trace can go missing, are in `treat`'s
 [span traces](https://github.com/volkagames/treat/blob/main/docs/errors.md#span-traces)
 section.
 
-An API declaring a `@subscription` or a `@raw` body emits a streaming runtime on
-top of that, which a plain JSON API never compiles:
+The generator needs one more tool where it runs: `rustfmt`, which lays out the
+Rust targets as they are generated (see [CLI](#cli)). The files are then what
+formatting the project's tree writes, under its own `rustfmt.toml`, and carry no
+blanket `allow`: a project that formats its tree, checks it in CI, or denies
+clippy's warnings does not have to exclude them. On a machine without
+`rustfmt`, turn the step off and get the plain output, which compiles the same:
 
-| Target | Additional crates |
-| --- | --- |
-| `rust_server` | `futures-core`, `futures-util` |
-| `rust_client` | `futures-core`, `futures-util`, `bytes`, and the **`stream` feature** on `reqwest` |
+```toml
+[rust]
+format = false      # write the Rust targets unformatted; needs no rustfmt
+```
 
-The `stream` feature is easy to miss because nothing needs it until the first
-`@raw` or `@subscription` operation: the client reads a raw response back as a byte
-stream.
+A project that runs `cargo fmt --check` then excludes the generated module
+from it, since `rustfmt` would rewrite it:
 
-A `@raw(request:, stream: true)` operation adds one more to `rust_server`: the
-**`io` feature** on `futures-util`, which `RawRequest::into_reader` needs. An API
-without a streamed request does not emit `RawRequest` and needs no such feature.
+```rust
+#[rustfmt::skip]
+mod api;
+```
 
 The generated client groups operations by service, matching the TypeScript one:
 
@@ -223,15 +333,27 @@ match api.clans().create(&input).await {
     Ok(response) => { /* ... */ }
     // The outcome travels in the envelope, so a rejected call is an `Api`
     // error carrying codes — not a transport failure.
-    Err(ClientError::Api(errors)) if errors.is(ClansCreateError::clan_already_exist) => { /* ... */ }
+    // `ClansCreateCodes` is the set `Clans.create` may answer with.
+    Err(ClientError::Api(errors)) if errors.is(ClansCreateCodes::ClanAlreadyExist) => { /* ... */ }
     Err(e) => return Err(e.into()),
 }
 ```
 
 `ClientError` separates what the server said (`Api`) from what never reached it
-(`Transport`, `Decode`, `Status`), because only the first carries a code worth
-branching on. `ApiClient::with_http` takes a configured `reqwest::Client`, which
+(`Encode`, nothing sent; `Transport`; `Decode`; `Status`), because only the
+first carries a code worth branching on. It is `treat`'s, re-exported from the
+client module with `ApiErrors`, `ClientResult`, `ApiResponse`, `ErrorMessage`,
+`ErrorSource` and, with `rpc-stream`, `EventStream` and `StreamError`, and it is
+`#[non_exhaustive]`: a `match` ends in a catch-all. `errors.code::<ErrorCode>()`
+reads the first code against the registry. `ApiClient::with_http` takes a configured `reqwest::Client`, which
 is where timeouts, proxies and default headers go.
+
+`api.rpc()` is the `treat::rpc::client::RpcClient` underneath (`into_inner()`
+by value), for a call no generated method makes:
+`api.rpc().call::<_, Output, Codes>("/path", &input)`. `subscribe`,
+`raw_request` and `raw_request_json` take the operation's query table after the
+path (`&wire::<OP>_FIELDS`), and `call_http` an `@http` operation's
+`&wire::<OP>_HTTP`.
 
 ### Library use
 
@@ -241,8 +363,18 @@ API — a project embedding the generator builds one directly and skips the file
 ```rust
 let api = graphql_rpcgen::compile(Path::new("api"))?;                     // scalars come from the SDL
 let config = Config::from_toml_file(Path::new("rpcgen.toml"))?;   // or built by hand
-for file in graphql_rpcgen::generate_all(&api, &config)? { /* write file.path */ }
+let mut files = graphql_rpcgen::generate_all(&api, &config)?;      // pure: the plain output
+graphql_rpcgen::format_outputs(&mut files, Path::new("."), &config)?;   // rustfmt, as the CLI does
+for file in files { /* write file.path, relative to that root */ }
 ```
+
+`generate_all` is a pure function of the IR and the settings, and returns the
+Rust targets plain — what the golden tests pin. `format_outputs` is the CLI's
+formatting step: it passes each Rust target (`file.target.is_rust()`) through
+`rustfmt` from the directory under the given root the file is headed for, for
+the edition `format::edition_for` finds there, and does nothing when
+`[rust] format = false`. A caller that formats its own way, or not at all,
+skips it; `format::rustfmt(source, dir, edition)` formats one string.
 
 `compile_str` takes SDL as a string, for a caller that does not have it on disk.
 
@@ -252,6 +384,24 @@ Every operation is `POST /rpc/{service}/{operation}` with a JSON body, except a
 `@subscription` (a `GET` returning SSE), a `@raw` body and an `@http` binding.
 `@query` and `@mutation` describe TanStack semantics only; they do not change
 the verb.
+
+The JSON body must be declared JSON: `Content-Type: application/json` (or a
+`+json` type), else the server refuses it at `415` with `invalid_body` before
+reading it. A browser posts a form or plain text across origins without a CORS
+preflight, so a server that read JSON under any type would run such a request
+with the visitor's cookies. The generated clients send the header; a caller of
+its own — a script, a probe, a test — must too:
+
+```bash
+curl -X POST https://api.example.com/rpc/users/get \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "u1"}'
+```
+
+A body that is declared JSON and does not parse is `invalid_body` at `422`,
+with `source.pointer` at the offending field. A `@raw(request:)` body is read
+only under one of the types its directive lists, and is refused at `415`
+otherwise and at `413` past `RAW_BODY_LIMIT`.
 
 `@rpc(path:)` overrides the derived path; `@version(n:)` mounts it under a
 `/v{n}` prefix.
@@ -279,20 +429,20 @@ type Users @service @auth(require: token) {
 | --- | --- |
 | `method:` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, or `ANY` for an endpoint that never checked its method |
 | `path:` | the route; a `{name}` segment is filled by the required scalar or enum input field of that name |
-| `body:` | where the other fields travel: `NONE` (the query string; the default for `GET`, `DELETE` and `ANY`), `JSON` (the input object; the default for `POST`, `PUT`, `PATCH`) or `FORM` (an `application/x-www-form-urlencoded` body read over the query string, the body winning per field) |
+| `body:` | where the other fields travel: `NONE` (the query string; the default for `GET`, `DELETE` and `ANY`), `JSON` (the input object; the default for `POST`, `PUT`, `PATCH`) or `FORM` (an `application/x-www-form-urlencoded` body read over the query string, the body winning per field); a `JSON` route answering `GET`, `DELETE` or `ANY` that is called without a body reads the query string instead |
 | `envelope:` | `false` answers a success with the output value itself rather than `{"data": …}`; default `true` |
 
 A path parameter always wins over a field of the same name in the query string
 or the body: it is what the route matched. A failure is the envelope whatever
 `envelope:` says, under the status the error carries (`ApiError::with_status`),
-so a caller reads failures one way. An input the generated runtime cannot read
+so a caller reads failures one way. An input the runtime cannot read
 answers `400` — and a body it cannot read at all the status of that refusal,
 `413` for one past the body limit — rather than the `200` the envelope uses
 elsewhere: a caller of a route fixed elsewhere reads the status line. For the
 same reason a refused session answers `401` and a denied role or permission
-`403` — when the context left its refusal at `200`, so a `from_parts` failing
+`403` — when the context left its refusal at a `2xx` status, so a `ResolveContext::from_parts` failing
 for a reason not the caller's (an unreachable session store) gives it its own
-status, `503` say, or the caller reads it as a sign-out — and with `envelope: false` a service failure left at `200` answers
+status, `503` say, or the caller reads it as a sign-out — and with `envelope: false` a service failure left at any `2xx` status answers
 `500`, since a bare success is told from a failure by its status alone. `ANY` reads the same input for every method
 — a `GET` simply has no body — and clients send it as `GET`, or as `POST` with
 `body: FORM`; OpenAPI describes it under that method with `x-rpc-any-method`.
@@ -316,9 +466,24 @@ version belongs in the path `@http` spells out.
 scalars, enums and lists of them; an object travels there as JSON text, as it
 does for a subscription.
 
+Both clients write a field in a URL or a form from the table the server reads
+it with — Rust from the types module's `wire` statics, TypeScript from the
+`fields` its spec carries (`{ tags: 'str[]', filter: 'json' }`, left out when
+every field is written as plain text anyway): a field of an object or `JSON`
+type is JSON text, a string quoted; only a list repeats its key, and an array
+in any other field is one JSON value; a list that is not JSON-typed cannot carry
+`null`, so one is refused before sending (`Encode` in Rust, a `TypeError` in
+TypeScript).
+
 Responses carry a `{"data": …}` / `{"errors": […]}` envelope. Errors are
 `{code, message, source}` where `source.pointer` is an RFC 6901 pointer to the
 offending field. All errors in one response share one HTTP status.
+
+An API with any operation declares `enum ErrorCode`, the registry every code
+comes from, listing at least `invalid_body` and `internal_error`: the runtime
+answers those for any operation, `@throws` or not, and the generated server
+and client are typed over the registry. Only an SDL of types alone may leave it
+out.
 
 `code` is the `ErrorCode` value's wire name: its SDL spelling, or its
 `@variant(tag:)` when the wire carries something that is not a GraphQL
@@ -332,7 +497,7 @@ reads `portal_db::clan_not_found`.
 The pipeline has a deliberate seam in the middle:
 
 ```text
-GraphQL SDL → AST → semantic validation → IR → generators
+GraphQL SDL → AST → semantic validation → IR → generators → rustfmt (Rust targets)
 ```
 
 Generators never see the GraphQL AST — they read only `ir::Api`, which knows
@@ -343,12 +508,17 @@ adding one emitter, not touching the front end.
 src/parser.rs                SDL discovery + parsing (graphql-parser)
 src/ir.rs                    semantic IR — the model every generator reads
 src/semantic.rs              AST -> IR, all validation
-src/config.rs                settings: outputs, OpenAPI metadata, templates
+src/config.rs                settings: outputs, OpenAPI metadata, templates, formatting
 src/version.rs               the required `rpcgen_version` and how it is compared
 src/template.rs              mustache rendering + variable validation
-templates/rust/              built-in treat + axum + reqwest templates
+src/naming.rs                identifier casing shared by the generators
+src/error.rs                 compile diagnostics, each naming its SDL file and position
+src/emit_common.rs           helpers every emitter shares: header, doc comments, type names, re-exports
+src/format.rs                the formatting step: each Rust target through rustfmt, from where it is written
+templates/rust/              built-in templates over treat::rpc + axum: preambles, router, handlers, client methods
+templates/typescript/        the static fetch client every api.ts carries
 src/generate_rust.rs         Rust wire types, traits, Axum bindings
-src/generate_rust_client.rs  Rust client over reqwest
+src/generate_rust_client.rs  Rust client over treat::rpc's RpcClient (reqwest underneath)
 src/generate_typescript.rs   TS types, fetch client, TanStack helpers
 src/generate_zod.rs          zod schemas for the input types
 src/generate_openapi.rs      OpenAPI 3.1
@@ -422,8 +592,8 @@ conversions through `derive_more`:
 ```rust
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-    Serialize, Deserialize,
-    AsRef, Display, From, Into,
+    ::serde::Serialize, ::serde::Deserialize,
+    ::derive_more::AsRef, ::derive_more::Display, ::derive_more::From, ::derive_more::Into,
 )]
 #[serde(transparent)]
 pub struct ClanId(pub uuid::Uuid);
@@ -447,7 +617,10 @@ and its wire names in both directions:
 enum Visibility { private public_link @variant(tag: "public-link") }
 ```
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash,
+    ::serde::Serialize, ::serde::Deserialize, ::treat::rpc::WireEnum,
+)]
 pub enum Visibility {
     #[serde(rename = "private")]
     Private,
@@ -455,14 +628,15 @@ pub enum Visibility {
     PublicLink,
 }
 
-impl Visibility {
-    pub const ALL: &[Self] = &[Self::Private, Self::PublicLink]; // one per line, in SDL order
-    pub fn from_name(name: &str) -> Option<Self> { /* "public-link" => Some(Self::PublicLink), … */ }
-    pub fn as_str(self) -> &'static str { /* Self::PublicLink => "public-link", … */ }
-}
+// From `treat::rpc::WireEnum`, which the types module re-exports:
+Visibility::ALL;                           // &[Private, PublicLink], in SDL order
+Visibility::from_name("public-link");      // Some(Visibility::PublicLink)
+Visibility::PublicLink.as_str();           // "public-link"
 ```
 
-`as_str` is exactly what serde writes — the `@variant(tag:)` when a value has
+`ALL`, `from_name` and `as_str` are the items of `treat::rpc::WireEnum`, which
+reads the wire names from the renames: a caller needs the trait in scope, and a
+glob import of the generated types module brings it. `as_str` is exactly what serde writes — the `@variant(tag:)` when a value has
 one — and `from_name` reads only that, so the GraphQL identifier
 `public_link` is `None`. A project storing a value as text, filtering a query
 by it or listing the choices on a screen reads them here instead of keeping an
@@ -471,14 +645,23 @@ drift from the SDL without a word: a new value missing from the array, an
 edited tag leaving the old string behind. `Hash` lets a value key a set or a
 map.
 
-The registry's variants keep their SDL spelling, so a code named `ALL`,
-`from_name` or `as_str` would shadow the generated item and is refused.
+The registry's variants keep their SDL spelling, and its derive also writes
+`#[code("…")]` for a tagged value, which is what `Display` — and so the
+envelope — spells it by. A code named `ALL`, `from_name` or `as_str` is
+refused.
 
-**Upgrading from 0.14.** A project's own inherent `as_str`, `from_name` or
-`ALL` on a generated enum, or its own `impl Hash`, now collides with the
-generated one: delete it. An inherent method of the same name that spells a
-value differently from the wire was a second vocabulary; keep it under another
-name if the difference is intended.
+**Upgrading from 0.15.** The three are trait items now: import
+`treat::rpc::WireEnum` (or glob-import the types module) where they are called.
+An inherent `ALL`, `from_name` or `as_str` of a project's own — which 0.15
+refused as a duplicate — compiles again, and shadows the trait's item wherever
+both are in reach: keep one only if it is meant to differ.
+
+**Upgrading from 0.14.** A project's own `impl Hash` for a generated enum
+collides with the derived one: delete it. Its own inherent `as_str`,
+`from_name` or `ALL` does not collide — the generated ones are trait items —
+but is what a call resolves to, ahead of the trait's: delete it too, unless it
+spells a value differently from the wire on purpose, in which case give it
+another name so the two vocabularies cannot be mistaken for each other.
 
 ### Unions and `@oneOf`
 
@@ -594,9 +777,44 @@ overlap — the Rust method is their `snake_case` and the `operationId` is their
 lowercase — so `getById` beside `get_by_id` and `getById` beside `getbyid` are
 both refused, the second even when `@rpc(path:)` gives them different routes.
 
-Most Rust keywords survive as `r#type`; `self`, `crate` and `super` do not exist
-in that form, so a field or operation named after one is refused rather than
-renamed behind the author's back.
+Across services the recased names meet too. `Users.getAll` and `UsersGet.all`
+are two routes and two `operationId`s, but one server handler
+`users_get_all`, one set of `wire::USERS_GET_ALL_*` statics and one
+`UsersGetAllCodes`; `Users` and `USERS` are one Rust module and client accessor
+`users` and one key of TypeScript's `createApi`. Either pair is refused where
+the second is declared, naming the first and every name the two share.
+
+A type is a Rust item beside the ones the generator declares itself, so it may
+not be spelt like one of those: `Rt`, `Failure`, `FromRequestContext`,
+`ApiClient`, the `operations` and `wire` modules, a service's `<S>Service`
+trait and `<S>Operations` client group, an operation's `<S><Op>Codes` set. Nor
+like a prelude name the generated code writes unqualified — `Option`, `Some`,
+`None`, `Result`, `Ok`, `Err`, `Vec`, `Box`, `String`, `Clone`, `Send`, `Sync`,
+`Sized`, `From`, `Into` — which it would take the place of (`From` because
+`treat`'s `ApiErrorCode` derive and `error_set!` write it unqualified too). A scalar mapped to a Rust type
+declares no item and is exempt; a `rustNewtype` scalar is not.
+
+Free to reuse, by target:
+
+- **Rust** — the runtime's items (`Request`, `Response`, `Refusal`,
+  `RpcClient`, `WireEnum`, …): the generated code names them by their absolute
+  paths.
+- **TypeScript** — the globals the client runtime in `api.ts` uses
+  (`Response`, `Headers`, `Promise`, `Record`, `Readonly`, `AbortSignal`,
+  `URLSearchParams`, `Uint8Array`, `Error`, …): it writes each as
+  `globalThis.X`, so a type the API declares in that module does not take its
+  place. The names `api.ts` declares itself are not free: `RpcClient`,
+  `RpcError`, `RpcResponse`, `RpcErrorItem`, `RpcErrorCode`, the other `Rpc…`
+  types, `QueryOptionsResult`, `MutationOptionsResult`, `Api` and a service's
+  `<S>Operations`. The compiler does not refuse them, since an SDL generated
+  for Rust alone may use them; an SDL with a TypeScript target must not — an
+  interface merges with the class or interface of the same name, and a type
+  alias collides with it.
+
+Most Rust keywords survive as `r#type` — `gen`, reserved by the 2024 edition,
+as `r#gen`, which every edition accepts; `self`, `crate` and `super` do not
+exist in that form, so a field or operation named after one is refused rather
+than renamed behind the author's back.
 
 Two strings arrive as SDL arguments rather than as GraphQL names, and each is
 checked for what it becomes. `@discriminator(field:)` and `(sibling:)` are emitted as a bare key
@@ -694,16 +912,15 @@ request included.
 
 ```rust
 async fn documents_revert<S: DocumentsService>(
-    State(service): State<S>,
-    Ctx(ctx): Ctx<RequestContext>,
-    request: axum::extract::Request,
-) -> Response {
-    let access = ctx.require_role(Role::ContentAdmin);
-    if let Err(response) = access {
-        return response;
-    }
-    let body = <ApiJson<RevertInput> as axum::extract::FromRequest<()>>::from_request(request, &()).await;
-    ...
+    ::axum::extract::State(service): ::axum::extract::State<S>,
+    ::treat::rpc::server::Ctx(ctx): ::treat::rpc::server::Ctx<S::Ctx>,
+    request: ::axum::extract::Request,
+) -> Result<::axum::response::Response, ::treat::rpc::server::Refusal> {
+    ctx.require_role(Role::ContentAdmin)?;
+    let input = Rt::json_input(request).await?;
+    let result = service.revert(&ctx, input).await;
+    Ok(Rt::respond(result))
+}
 ```
 
 A declaration the implementation could forget to apply would be a comment, so
@@ -719,11 +936,11 @@ one no client expects.
 [Permissions](#permissions-permissions) — and is enforced the same way, awaited:
 
 ```rust
-    let access = ctx.require_permission(Permission::UsersWrite).await;
-    if let Err(response) = access {
-        return response;
-    }
+    ctx.require_permission(Permission::UsersWrite).await?;
 ```
+
+An `@http` handler gives either refusal the status its callers read, `403`
+unless it carries its own: `Rt::http_access(access)?`.
 
 An operation names a role or a permission, never both.
 
@@ -778,17 +995,47 @@ pub trait DocumentsService: Clone + Send + Sync + 'static {
 }
 ```
 
-`FromRequestContext` is generated beside the extractor. It asks for the caller,
-and, in an API with a `@roles` enum, for the role check, and in one with a
-`@permissions` enum, for the permission check:
+Resolving the caller is `treat`'s contract, `treat::rpc::server::ResolveContext`,
+which the `Ctx` extractor reads it with. `FromRequestContext` is generated on
+top of it with the checks the schema asks for: in an API with a `@roles` enum,
+the role check, and in one with a `@permissions` enum, the permission check.
+Every refusal is a `Refusal` — a whole response, built from an `ApiError` or a
+`Response` with `.into()`:
 
 ```rust
-pub trait FromRequestContext: Sized + Send + Sync + 'static {
+// treat's
+pub trait ResolveContext: Sized + Send + Sync + 'static {
     fn from_parts(parts: &mut Parts)
-        -> impl Future<Output = Result<Self, Response>> + Send;
-    fn require_role(&self, role: Role) -> Result<(), Response>;
-    fn require_permission(&self, permission: Permission)
-        -> impl Future<Output = Result<(), Response>> + Send;
+        -> impl Future<Output = Result<Self, Refusal>> + Send;
+}
+
+// generated, naming `treat`'s items by their paths
+pub trait FromRequestContext: ::treat::rpc::server::ResolveContext {
+    fn require_role(&self, role: Role) -> Result<(), ::treat::rpc::server::Refusal>;
+    fn require_permission(
+        &self,
+        permission: Permission,
+    ) -> impl ::std::future::Future<Output = Result<(), ::treat::rpc::server::Refusal>> + Send;
+}
+```
+
+A project implements both for its context type:
+
+```rust
+impl ResolveContext for RequestContext {
+    async fn from_parts(parts: &mut Parts) -> Result<Self, Refusal> {
+        let session = read_session(parts).await;
+        session.ok_or_else(|| error(ErrorCode::unauthenticated).into())
+    }
+}
+
+impl FromRequestContext for RequestContext {
+    fn require_role(&self, role: Role) -> Result<(), Refusal> {
+        match self.roles.iter().any(|held| held.authorizes(role)) {
+            true => Ok(()),
+            false => Err(error(ErrorCode::role_required).into()),
+        }
+    }
 }
 ```
 
@@ -1196,7 +1443,8 @@ pub mod operations {
     }
 
     pub const ALL: &[Operation] = &[ /* sorted by path, then method */ ];
-    pub fn by_route(method: &str, path: &str) -> Option<&'static Operation>;
+    impl treat::rpc::route::RouteRow for Operation { /* method, path */ }
+    pub fn by_route(method: &str, path: &str) -> Option<&'static Operation>;  // treat::rpc::route::by_route
     pub fn by_id(id: &str) -> Option<&'static Operation>;
 }
 ```
@@ -1216,7 +1464,9 @@ as the `GET`. `path` is the request's (`/api/user/u1`) or the route's
 takes any one segment, and the route is picked as the router picks it, a fixed
 segment before a parameter, before the method is matched. A path some row
 spells exactly is a binary search over `ALL`; only one no row spells scans the
-rows with a parameter. `by_id` is a scan. The table checks nothing by itself: a caller that skips it runs
+rows with a parameter. The search is `treat::rpc::route::by_route`, which trusts
+the table's order; `treat::rpc::route::check_table(operations::ALL)` checks it,
+once, in a test. `by_id` is a scan. The table checks nothing by itself: a caller that skips it runs
 unchecked.
 
 ### `@mcp`
@@ -1256,7 +1506,8 @@ type Files @service {
 
 ```rust
 /// The request body arrives unread as `body`; `input.body` is always empty.
-/// No size limit is applied to it: this method must bound it — see [`RawRequest`].
+/// No size limit is applied to it: this method must bound it — see
+/// [`treat::rpc::server::RawRequest`].
 async fn upload(&self, input: UploadInput, body: RawRequest)
     -> Result<ApiResponse<UploadResult>, ApiError<FilesUploadCodes>>;
 ```
@@ -1265,7 +1516,10 @@ The input is read from the query string and validated exactly as for a
 buffered request, and the service then gets the rest of the request as a
 `RawRequest`: `headers()`, `extensions()` (`ConnectInfo`, when the router is
 served with it), `content_length()`, `content_type()`, and the body through
-`into_body()` or `into_reader()`, a `futures_util::io::AsyncRead`.
+`into_body()` or `into_reader()`, a `futures_util::io::AsyncRead` (re-exported
+as `treat::rpc::futures_util`). The handler checks the `Content-Type` against
+the `@raw(request:)` list before the service gets the request (`415`
+otherwise), as it does for a buffered body.
 
 **No size limit is applied — the service method owns it.** Nothing in the
 generated router bounds a streamed body: `RAW_BODY_LIMIT` covers buffered ones
@@ -1407,10 +1661,11 @@ operation silently stops matching; through `operationKeys` it is a compile error
 
 ## Retargeting the Rust output
 
-The preamble, router and handler come from mustache templates. The built-ins
-target `treat` + `axum` for the server and `reqwest` for the client, and are
-compiled into the binary, so the default path needs no template files on disk.
-Point at your own to generate for another stack:
+The preambles, router, handlers and client methods come from mustache
+templates. The built-ins target `treat::rpc` + `axum` for the server and
+`treat::rpc`'s `RpcClient` for the client, and are compiled into the binary, so
+the default path needs no template files on disk. Point at your own to generate
+for another stack:
 
 ```toml
 [rust]
@@ -1425,17 +1680,34 @@ Template paths resolve relative to the config file that names them.
 
 | Section | Template | Variables |
 |---|---|---|
-| `[rust]` | preamble | `error_code_enum`, `types_import` |
-| `[rust]` | router | `service`, `module`, `trait_name`, `routes` |
-| `[rust]` | handler | `handler`, `trait_name`, `input`, `output`, `method`, `path`, `query_fields`, `body_field`, `context_extractor`, `context_arg`, `access_guard` |
-| `[rust]` | handler_no_input | same, with `input` empty |
-| `[rust_client]` | preamble | `error_code_enum`, `types_import`, `client_name` |
-| `[rust_client]` | method | `method`, `input`, `output`, `path`, `operation_id` |
-| `[rust_client]` | method_no_input | same, with `input` empty |
+| `[rust]` | `types_preamble` | `error_code_enum`, `reexports`, `registry` |
+| `[rust]` | `preamble` (the server's) | `error_code_enum`, `types_import`, `reexports`, `operations`, `context_trait` |
+| `[rust]` | `router` | `service`, `module`, `trait_name`, `routes` |
+| `[rust]` | `handler` | `handler`, `trait_name`, `input`, `output`, `method`, `path`, `fields`, `spec`, `types`, `body_field`, `context`, `call_args`, `params`, `access_guard`, `read_input`, `read_body`, `respond` |
+| `[rust_client]` | `preamble` | `error_code_enum`, `types_import`, `client_name`, `reexports` |
+| `[rust_client]` | `method` | `method`, `input`, `output`, `path`, `operation_id`, `error`, `body_field`, `fields`, `spec`, `params`, `success`, `client_call`, `call_args` |
 
-The `_no_input` forms serve operations declaring no `input` argument. They are
-separate templates rather than a conditional, because a flat mustache context
-has nothing to branch on.
+One template serves an operation with an input and one without: `input` is
+empty for the second, and a variable doubles as a flag — `{{#input}}…{{/input}}`
+renders when it is set, `{{^input}}…{{/input}}` when it is not. A section's name
+is checked like any other variable. `handler` serves every form but a buffered
+`@raw(request:)` (`handler_raw_request`, built in), and `method` every form but
+a `@raw(request:)` (`client_method_raw_request`, built in); the variables say
+which form it is (`fields`, `spec`, `types` are empty where the form has none).
+
+A template writes plain text and need not lay anything out: the Rust targets
+go through `rustfmt` after rendering (see [CLI](#cli)), so a signature may sit
+on one line however long. What differs between the forms is computed for the
+template as plain text, one statement per line: the handler's `params` (its
+extractors, comma-separated, in the order axum takes them), `access_guard`,
+`read_input` and `read_body` (statements, each line indented and ending in a
+newline) and `respond` (the expression answering with `result`); the client
+method's `params` (`&self` first), `success` (what its `ClientResult` holds),
+`client_call` (the `RpcClient` method) and `call_args`; the `reexports` lines,
+which leave out a name the API declares a type of; the router's `routes`, one
+`.route(..)` per line. The built-in templates name every other item of `axum`
+and `treat` by its absolute path, as a project's own should, so that no SDL
+type can shadow it.
 
 Anything in `template_vars` is added to every template in its section.
 
@@ -1449,6 +1721,43 @@ both:
   emit `async fn <S: …>`. Every referenced variable is checked against the
   declared set, so a typo fails generation instead.
 
+**Upgrading from 0.15.** The template set follows the runtime's move into
+`treat::rpc`: a handler is a few `Rt::…` calls and a client method one
+`RpcClient` call, and the variables now spell those calls' arguments rather
+than code a template laid out. From 0.15.0's variables to these:
+
+- `handler_no_input_template` and `method_no_input_template` are gone, and a
+  config naming one is refused: the one template is rendered with `input`
+  empty.
+- `handler` — 0.15: `handler`, `trait_name`, `input`, `output`, `method`,
+  `path`, `query_fields`, `body_field`, `context_extractor`, `context_arg`,
+  `access_guard`. The first six, `body_field` and `access_guard` remain.
+  `query_fields`, a `[QueryField; N]` literal, became `fields`, the name of
+  the operation's `wire` static. `context_extractor` and `context_arg` became
+  `context` (set for a session-guarded operation), `params` (every extractor,
+  comma-separated) and `call_args` (what the service call takes). New:
+  `spec`, `types`, `read_input`, `read_body` and `respond`. The per-form
+  built-ins — `handler_subscription`, `handler_raw_response`,
+  `handler_raw_request_stream` and the rest — are this one template now,
+  except a buffered `@raw(request:)`'s, which stays built in.
+- `preamble` — 0.15: `error_code_enum`, `invalid_body_code`, `types_import`.
+  `invalid_body_code` is gone: the registry implements
+  `treat::rpc::RuntimeCodes`, which is where the runtime finds the code. New:
+  `reexports`, `operations`, `context_trait`. `preamble_template` replaces the
+  server preamble only, in both layouts; the types preamble is
+  `types_preamble_template` (`error_code_enum`, `reexports`, `registry`), and
+  the single-file layout renders both.
+- `router` — unchanged: `service`, `module`, `trait_name`, `routes`.
+- Client `preamble` — 0.15: `error_code_enum`, `types_import`, `client_name`;
+  `reexports` is new. Client `method` — 0.15: `method`, `input`, `output`,
+  `path`, `operation_id`, `error`, `body_field`; `fields`, `spec`, `params`,
+  `success`, `client_call` and `call_args` are new. It serves every form but
+  a raw request, whose template stays built in.
+- The runtime 0.15's templates sat beside — the built-in `rpc_runtime`,
+  `context_runtime`, `stream_runtime` and `client_runtime` — is
+  `treat::rpc`; a template names its items, and `axum`'s, by their absolute
+  paths.
+
 ## Tests
 
 ```bash
@@ -1457,20 +1766,31 @@ just test-one registry     # by test name
 just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
-254 tests, none of which need a network:
+316 tests. None needs a network; `ts_check`, the two `#[ignore]`d, needs the
+TypeScript compiler `just check-ts` installs from npm (and `node`) and runs
+only with `-- --ignored`:
 
-- **semantic** (98) — every validation rule, the error-code registry, path
-  versioning, union tags, which constraint may sit on which type, plus
-  nullability/list conversion
+- **semantic** (118) — every validation rule, the error-code registry (and that
+  an API with operations declares one), path versioning, union tags, which
+  constraint may sit on which type, two services or operations whose generated
+  names collide (refused where the second is declared), a type spelt like an
+  item the generated Rust declares or a prelude name it writes (and one spelt
+  like a runtime item, which is fine), the positions of the errors found over
+  the IR, plus nullability/list conversion
 - **reuse** (21) — the generator is project-agnostic: a default config
   generates, SDL scalars reach all three targets and can override a built-in,
   unmapped scalars fail, outputs are selectable, the types target carries no web
   framework, the server re-exports the types rather than duplicating them, the
   client emits a method per operation, custom templates replace the built-ins,
   and a typo or an escaping tag in a template fails generation
-- **unit** (34) — config defaults and TOML rejection, the `rpcgen_version`
-  requirement and every way it can fail, template variable validation,
-  identifier casing
+- **unit** (46) — config defaults and TOML rejection (a key removed after 0.15
+  named with where its setting went, `[rust] format` on unless turned off,
+  `[rust] edition` one `rustfmt` knows), the edition read off a package's or
+  its workspace's `Cargo.toml`,
+  the `rpcgen_version` requirement and every way it can fail, template
+  variable and section validation (the implicit iterator `{{{.}}}` allowed),
+  identifier casing (`gen` escaped as a 2024 keyword), and the TypeScript
+  runtime naming its placeholder once
 - **auth** (28) — `@auth` on the trait signature, the handler's extractors, the
   role guard ahead of the body, the client's per-operation `role` field, the
   `@roles` set, its `@inherits` closure on both sides and its column of the
@@ -1490,42 +1810,105 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
   and the rejections of shapes a tool call cannot honour
 - **streaming** (10) — `@subscription` and `@raw` on both sides: the signature,
   the route verb, and where the input is read from
-- **snapshots** (7) — Rust, TypeScript (its TanStack keys included), zod and OpenAPI output, determinism, and
+- **snapshots** (11) — Rust, TypeScript (its TanStack keys included), zod and OpenAPI output, determinism, the
+  TypeScript field tables against the Rust server's `wire` tables, and
   a pass over the whole OpenAPI document for the breaks a per-path assertion
   cannot see: a dangling `$ref`, a duplicated `operationId`, an operation with
   no response
-- **cli** (15) — the binary itself: `generate` writes what `[output]` names and
+- **golden** (2) — one test runs every fixture under `tests/fixtures/` (seven,
+  `mcp_version` with its OpenAPI metadata among them) through every target:
+  Rust types, server and client in the split layout the wire tests compile,
+  the server once more as a single file with its types inline, TypeScript, zod
+  and OpenAPI. Each output is kept whole in `tests/snapshots/`, so any change
+  to what is generated shows as a diff; the Rust is the plain output
+  `generate_all` returns, before `rustfmt`, so the files depend on the
+  generator alone. The other checks that
+  `tests/common/fixtures.rs` lists exactly the SDL files in that directory,
+  each with its own file's text. `INSTA_UPDATE=always cargo test --test golden`
+  rewrites the snapshots when the change is meant; `INSTA_FORCE_PASS=1` lists
+  every mismatching file instead of stopping at the first
+- **cli** (26) — the binary itself: `generate` writes what `[output]` names and
   rewrites nothing unchanged, `check` exits non-zero on drift or a missing file
   and names it without repairing it, `--root` is what output paths resolve
   against, `--version` prints the package version, and a bad command or a
-  `--config` that does not exist fails instead of falling back
+  `--config` that does not exist fails instead of falling back; and the
+  formatting step: `generate` writes each Rust target as `rustfmt` formats the
+  plain output, `check` compares the formatted files (the plain output in
+  their place is stale), `[rust] format = false` writes the plain output with
+  no `rustfmt` at all, a missing `$RUSTFMT` fails naming the target and the
+  setting, a rustup toolchain without the component is named as such, a
+  project `rustfmt.toml` (`hard_tabs`, `max_width`) applies, a 2024 package
+  (its own edition or its workspace's) gets 2024-style files that pass
+  `rustfmt --edition 2024 --check` and fail the 2021 one, `[rust] edition`
+  overrides the package's, and a file with `\r\n` line endings is up to date
 - **oneof_wire** (1) — the generated `@oneOf` types compiled and run in a
   scratch cargo project, pinning the wire shape and the arm constraints at
-  runtime rather than in emitted text, and every enum's `ALL`, `from_name` and
-  `as_str` against what serde writes
+  runtime rather than in emitted text, every enum's `ALL`, `from_name` and
+  `as_str` against what serde writes, and a failure narrowed into an
+  operation's set
 - **raw_wire** (1) — all three Rust targets compiled for an SDL reaching every
   `@raw` form, a `@subscription`, a role reached through `@inherits`, a
   `@variant(tag:)` error code, a scope set and the operation table's lookups,
   and for a second API a permission held and one refused in every handler
   form, which is the only thing that
-  checks the emitted handlers, client methods and streaming runtime against
-  rustc rather than against a `contains`; the router is then served on a local
-  port and a streamed body larger than `RAW_BODY_LIMIT` is sent through it, and
-  the tagged code is checked to reach the envelope by its tag
+  checks the emitted handlers and client methods against rustc rather than
+  against a `contains`; the router is then served on a local port, the
+  generated client calls every form through it (the plain RPC ones through a
+  client of the second API), a streamed body larger than `RAW_BODY_LIMIT` is
+  sent, a body of an undeclared type is refused `415`, and the tagged code is
+  checked to reach the envelope by its tag
+- **http_wire** (1) — the `@http` server and client built from one SDL and
+  served on a local port: hand-written requests pin the format (methods, path
+  parameters, a query string, a form body, a bare JSON answer, the `400`,
+  `401`, `403`, `413` and `500` a failure carries) and the generated client's
+  pin that the two sides agree
+- **fixture_builds** (5) — the Rust of the fixtures no wire test builds
+  (`snapshots`, `snapshots_http`, `mcp_version`): types, server and client in
+  one scratch crate each, held to `rustfmt --check` and `cargo clippy -D
+  warnings`, so what `golden` pins as text is also what rustc accepts; and an
+  API whose types are spelt like the runtime's items (`Request`, `State`,
+  `Ctx`, `Refusal`, `RawBody`, `RawRequest`, `EventStream`, `RpcClient`,
+  `NoInput`, `ClientError`, `ApiErrors`, `Router`, `Response`, `Serialize`,
+  `WireEnum`, `Validate`, …, `tests/sdl/runtime_names.graphql`), built in both
+  layouts, once in a 2021 crate and once in a 2024 one, formatted for that
+  edition and with a field, an input field and an operation named `gen`.
+  Nothing runs; the five share `raw_wire`'s target directory and
+  dependency set, so each compiles only its own crate
+- **harness** (5) — the scratch-project setup the wire tests share, on
+  synthetic manifests and lockfiles: every dependency asks for the version the
+  lockfile carries for it, whatever its source; a crate the lockfile lacks, or
+  carries at two versions, is an error; the root manifest's `[patch.*]` tables
+  are copied, a relative `path` made absolute against the crate root and a git
+  source kept as written; and a root without `[patch]` writes none
+- **ts_check** (2, ignored) — the generated TypeScript and zod for every
+  fixture, and for `tests/sdl/runtime_names.graphql` with its types spelt like
+  the globals the client runtime uses (`Response`, `Headers`, `Promise`,
+  `Record`, …), through `tsc --strict`; and the generated client run under node
+  against a recording `fetch` (`tests/ts/client_runtime.test.ts`): each field
+  kind in a query string, a form body and a path, the `Content-Type` each body
+  goes with whatever the default headers hold, and a refusal told from a raw
+  answer
 
-`oneof_wire` and `raw_wire` build generated code against the versions in this
-repo's `Cargo.lock`, offline. Those crates (`treat`, `axum`, `reqwest`,
-`futures-util`, …) are dev-dependencies here for exactly that reason: the
-generator itself needs none of them, but the lockfile has to carry them for the
-tests to resolve a version without reaching the network.
+`oneof_wire`, `raw_wire`, `http_wire` and `fixture_builds` build generated code
+against the versions in this repo's `Cargo.lock`, offline: the lockfile is copied into each
+scratch project, and this crate's `[patch.*]` tables into its manifest. Before
+its tests run, each project writes the generated files through the generator's
+formatting step, as the CLI does, and is held to `rustfmt --check` on them and
+`cargo clippy --lib -- -D warnings`, so the output is formatted and
+warning-free as written; each also checks its operation table with
+`treat::rpc::route::check_table`. Those
+crates (`treat`, `axum`, `reqwest`, …) are dev-dependencies here
+for exactly that reason: the generator itself needs none of them, but the
+lockfile has to carry them for the tests to resolve a version without reaching
+the network.
 
-That is also what keeps the dependency table above honest. A crate the emitted
-code reaches for is easy to leave undocumented, because nothing notices until a
-consumer writes their first `@raw` operation — `reqwest`'s `stream` feature was
-exactly that, and so was the URL decoding crate the runtime used before it
-decoded query strings itself. Dropping the feature from `raw_wire`'s
-dependency set now fails the test with the same error the consumer would have
-seen.
+That is also what keeps the dependency table above honest. A crate or a feature
+the emitted code reaches for is easy to leave undocumented, because nothing
+notices until a consumer writes their first `@raw` operation — `reqwest`'s
+`stream` feature was exactly that, before the runtime moved into `treat`. Each
+scratch project lists the crates and `treat` features the table names for what
+it compiles, so dropping one fails the test with the error the consumer would
+have seen.
 
 ## Out of scope
 

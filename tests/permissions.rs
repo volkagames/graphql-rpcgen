@@ -15,6 +15,8 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod common;
+
 use graphql_rpcgen::config::Config;
 use graphql_rpcgen::{generate_openapi, generate_rust, generate_typescript};
 
@@ -93,9 +95,13 @@ fn handler<'a>(out: &'a str, name: &str) -> TestResult<&'a str> {
 }
 
 /// One operation's entry in `createApi`, from its key to its closing brace.
+///
+/// Read from the object `createApi` returns, past the `ops` and `keys` it
+/// builds first, whose per-service blocks open the same way.
 fn api_entry<'a>(out: &'a str, service: &str, op: &str) -> TestResult<&'a str> {
     out.split("export function createApi(")
         .nth(1)
+        .and_then(|s| s.split("\n  return {").nth(1))
         .and_then(|s| s.split(&format!("\n    {service}: {{\n")).nth(1))
         .and_then(|s| s.split("\n    },\n").next())
         .and_then(|s| s.split(&format!("      {op}: {{\n")).nth(1))
@@ -113,17 +119,12 @@ fn a_permission_is_checked_before_the_method_runs() -> TestResult {
 
     for (name, variant) in [("users_list", "UsersRead"), ("users_delete", "UsersWrite")] {
         let body = handler(&out, name)?;
-        let guard = format!(
-            "    let access = ctx.require_permission(Permission::{variant}).await;\n    \
-             if let Err(response) = access {{\n        \
-             return response;\n    }}\n"
-        );
+        // The context's refusal answered as it is, by `?`.
+        let guard = format!("    ctx.require_permission(Permission::{variant}).await?;\n");
         let guard_at = body
             .find(&guard)
             .ok_or(format!("{name} must check: {body}"))?;
-        let validate_at = body
-            .find("FromRequest<()>>::from_request(request")
-            .ok_or("no body read")?;
+        let validate_at = body.find("Rt::json_input(request)").ok_or("no body read")?;
         let call_at = body.find("service.").ok_or("no call")?;
         assert!(
             guard_at < validate_at && validate_at < call_at,
@@ -198,14 +199,15 @@ type Admin @service @auth(require: session, explicit: true) {
 fn every_handler_form_checks_before_reading_the_request() -> TestResult {
     let api = graphql_rpcgen::compile_str(EVERY_FORM)?;
     let out = generate_rust::generate(&api, &Config::default())?;
-    let guard = "    let access = ctx.require_permission(Permission::FilesWipe).await;\n    \
-                 if let Err(response) = access {\n        return response;\n    }\n";
+    let guard = "    ctx.require_permission(Permission::FilesWipe).await?;\n";
     // What a handler does with the request once the guard has let it through.
     let reads = [
-        "from_request(",
-        "input_from_query(",
-        "into_parts()",
-        "raw_body(",
+        "Rt::json_input(",
+        "Rt::no_input(",
+        "Rt::query_input(",
+        "Rt::input_from_query(",
+        "Rt::require_content_type(",
+        "Rt::raw_body(",
         "service.",
     ];
 
@@ -246,8 +248,8 @@ fn the_permission_check_is_part_of_the_context_trait_only_with_a_set() -> TestRe
     let out = generate_rust::generate(&api()?, &Config::default())?;
     assert!(
         out.contains(
-            "    fn require_permission(\n        &self,\n        permission: Permission,\n    \
-             ) -> impl std::future::Future<Output = Result<(), Response>> + Send;\n"
+            "    fn require_permission(&self, permission: Permission) -> impl \
+             ::std::future::Future<Output = Result<(), ::treat::rpc::server::Refusal>> + Send;\n"
         ),
         "{out}"
     );
@@ -275,13 +277,20 @@ type Open @service @auth(require: session) {{
 #[test]
 fn the_rust_permission_set_reads_and_spells_ids() -> TestResult {
     let out = generate_rust::generate_types(&api()?, &Config::default())?;
+    // `WireEnum` reads each name from the rename serde writes.
     assert!(
-        out.contains("            \"admin.users.read\" => Some(Self::UsersRead),\n"),
+        out.contains(
+            "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize, ::treat::rpc::WireEnum)]\n\
+             pub enum Permission {"
+        ),
         "{out}"
     );
-    assert!(out.contains("            _ => None,\n"), "{out}");
     assert!(
-        out.contains("            Self::UsersWrite => \"admin.users.write\",\n"),
+        out.contains("    #[serde(rename = \"admin.users.read\")]\n    UsersRead,\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("    #[serde(rename = \"admin.users.write\")]\n    UsersWrite,\n"),
         "{out}"
     );
     assert!(
@@ -298,21 +307,22 @@ fn the_rust_permission_set_reads_and_spells_ids() -> TestResult {
 #[test]
 fn the_operation_table_carries_each_operations_permission() -> TestResult {
     let out = generate_rust::generate_types(&api()?, &Config::default())?;
-    let table = out
-        .split("pub const ALL: &[Operation] = &[\n")
-        .nth(1)
-        .and_then(|s| s.split("    ];\n").next())
-        .ok_or_else(|| format!("the operation table must be emitted: {out}"))?;
+    let table = common::flat(
+        out.split("pub const ALL: &[Operation] = &[\n")
+            .nth(1)
+            .and_then(|s| s.split("    ];\n").next())
+            .ok_or_else(|| format!("the operation table must be emitted: {out}"))?,
+    );
     assert_eq!(
         table,
-        "        Operation { id: \"users_delete\", method: \"POST\", path: \"/users/delete\", \
-         kind: Kind::Mutation, auth: Auth::Session, permission: Some(super::Permission::UsersWrite) },\n        \
+        "Operation { id: \"users_delete\", method: \"POST\", path: \"/users/delete\", \
+         kind: Kind::Mutation, auth: Auth::Session, permission: Some(super::Permission::UsersWrite) }, \
          Operation { id: \"users_list\", method: \"POST\", path: \"/users/list\", \
-         kind: Kind::Query, auth: Auth::Session, permission: Some(super::Permission::UsersRead) },\n        \
+         kind: Kind::Query, auth: Auth::Session, permission: Some(super::Permission::UsersRead) }, \
          Operation { id: \"users_me\", method: \"POST\", path: \"/users/me\", \
-         kind: Kind::Query, auth: Auth::Session, permission: None },\n        \
+         kind: Kind::Query, auth: Auth::Session, permission: None }, \
          Operation { id: \"users_ping\", method: \"POST\", path: \"/users/ping\", \
-         kind: Kind::Query, auth: Auth::Public, permission: None },\n"
+         kind: Kind::Query, auth: Auth::Public, permission: None },"
     );
     Ok(())
 }

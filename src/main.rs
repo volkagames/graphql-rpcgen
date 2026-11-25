@@ -1,7 +1,9 @@
 //! graphql-rpcgen CLI.
 //!
 //! `generate` writes the artifacts; `check` verifies the checked-in files match
-//! what the current SDL would produce, and exits non-zero on drift.
+//! what the current SDL would produce, and exits non-zero on drift. Both pass
+//! the Rust targets through `rustfmt` first, unless `[rust] format = false`,
+//! and both read a file that differs only in its line endings as unchanged.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -135,7 +137,9 @@ fn parse_args() -> erris::Result<Parsed> {
 fn run(args: &Args) -> erris::Result<ExitCode> {
     let config = load_config(args)?;
     let api = graphql_rpcgen::compile(&args.api_dir)?;
-    let files = graphql_rpcgen::generate_all(&api, &config)?;
+    let mut files = graphql_rpcgen::generate_all(&api, &config)?;
+    // Both commands format: `check` compares what `generate` would write.
+    graphql_rpcgen::format_outputs(&mut files, &args.root, &config)?;
 
     // A run producing nothing is a misconfiguration, not a quiet success. It is
     // the shape a missing settings file takes — `load_config` falls back to the
@@ -180,7 +184,8 @@ fn run(args: &Args) -> erris::Result<ExitCode> {
                             .wrap_report(format_args!("cannot read {}", target.display()));
                     }
                 };
-                if current != file.contents {
+                let fresh = same_text(&current, &file.contents);
+                if !fresh {
                     stale.push(file.path.display().to_string());
                 }
             }
@@ -220,16 +225,35 @@ fn load_config(args: &Args) -> erris::Result<graphql_rpcgen::config::Config> {
 }
 
 /// Skip rewriting unchanged files so build systems watching mtimes stay quiet.
+/// A file that differs only in its line endings is unchanged too (see
+/// [`same_text`]).
 fn write_if_changed(path: &Path, contents: &str) -> erris::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .wrap_report(format_args!("cannot create {}", parent.display()))?;
     }
     let existing = std::fs::read_to_string(path);
-    if existing.is_ok_and(|existing| existing == contents) {
+    let unchanged = existing.is_ok_and(|existing| same_text(&existing, contents));
+    if unchanged {
         return Ok(());
     }
     std::fs::write(path, contents).wrap_report(format_args!("cannot write {}", path.display()))?;
     println!("  wrote {}", path.display());
     Ok(())
+}
+
+/// Whether `a` and `b` are the same text once every `\r\n` is read as `\n`.
+///
+/// What `check` compares and what `generate` leaves alone: a checkout with
+/// `core.autocrlf` (Git for Windows' default) turns the committed files'
+/// line endings into `\r\n`, and the generator writes `\n` — or, for a Rust
+/// target, whatever `rustfmt`'s `newline_style` makes of it — so comparing
+/// bytes would call every file stale on such a machine, and `generate` would
+/// rewrite every one. Line endings are the checkout's business; the text is
+/// the generator's.
+fn same_text(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
 }

@@ -1,0 +1,157 @@
+scalar UUID
+scalar Binary
+  @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+"A newtype spelt like `derive_more`'s derive, with a pattern: `LazyLock`, `Regex`."
+scalar Display
+  @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true)
+  @pattern(value: "^[a-z]+$")
+
+enum ErrorCode { invalid_body internal_error not_found role_required }
+enum Role @roles { reader }
+"Spelt like the code trait every enum derives."
+enum WireEnum { one two }
+enum Narrow { wide }
+
+input Request { id: UUID! name: Display! }
+"""
+`gen` is reserved in the 2024 edition: an input field, an output field and an
+operation named so reach Rust as `r#gen`.
+"""
+input State { id: UUID! gen: Int }
+input Ctx { id: UUID! }
+input NoInput { id: UUID! }
+input RawQuery { id: UUID! tags: [String!] }
+input RawRequest { id: UUID! body: Binary! }
+input RawBody { id: UUID! body: Binary! }
+input HttpSpec { id: String! verbose: Boolean }
+input QueryField { name: Display! }
+"An `@oneOf` input, spelt like the trait its impl is of."
+input Validate @oneOf { name: Display nested: QueryField }
+
+type Response { id: UUID! }
+type Refusal { reason: String! }
+type EventStream { line: String! }
+type RpcClient { id: UUID! }
+type ClientError { message: String! }
+type ApiErrors { count: Int! }
+type Router { id: UUID! }
+type ApiResponse { ok: Boolean! }
+type ApiError { code: String! }
+type ErrorMessage { text: String! }
+type ClientResult { value: Int! }
+type ErrorSource { pointer: String! }
+type StreamError { line: String! }
+type ResolveContext { user: String! }
+type Undeclared { code: String! }
+type Serialize { a: Int! }
+type Deserialize { b: Int! }
+type LazyLock { c: Int! }
+type Regex { d: Int! }
+type Runtime { e: Int! }
+type Everything {
+  refusal: Refusal!
+  message: ErrorMessage!
+  result: ClientResult!
+  source: ErrorSource!
+  stream: StreamError!
+  context: ResolveContext!
+  undeclared: Undeclared!
+  serialize: Serialize!
+  deserialize: Deserialize!
+  lazy: LazyLock!
+  regex: Regex!
+  runtime: Runtime!
+  kind: WireEnum!
+  narrow: Narrow!
+  display: Display!
+  gen: Int!
+}
+
+type Files @service {
+  get(input: Request!): Response!
+    @query
+    @rpc(path: "/get")
+    @auth(require: session, role: reader)
+    @throws(codes: ["role_required"])
+  state(input: State!): Everything! @query @rpc(path: "/state")
+  gen(input: State!): Response! @query @rpc(path: "/gen")
+  ctx(input: Ctx!): RpcClient! @mutation @rpc(path: "/ctx")
+  nothing: ApiError! @query @rpc(path: "/nothing")
+  export(input: NoInput!): Binary! @query @rpc(path: "/export") @raw(response: ["text/csv"])
+  watch(input: RawQuery!): EventStream! @subscription @rpc(path: "/watch")
+  upload(input: RawRequest!): ClientError!
+    @mutation
+    @rpc(path: "/upload")
+    @raw(request: ["application/octet-stream"], stream: true)
+  ingest(input: RawBody!): ApiErrors! @mutation @rpc(path: "/ingest") @raw(request: ["text/csv"])
+  route(input: HttpSpec!): Router!
+    @query
+    @http(method: GET, path: "/route/{id}", envelope: false)
+  choose(input: Validate!): ApiResponse! @mutation @rpc(path: "/choose")
+}
+
+"Prelude and `std` trait names the generated code reaches only by method or derive."
+type Traits {
+  to_string: ToString!
+  as_ref: AsRef!
+  debug: Debug!
+  partial_eq: PartialEq!
+  copy: Copy!
+  hash: Hash!
+  default: Default!
+  eq: Eq!
+  iterator: Iterator!
+  future: Future!
+  error: Error!
+}
+type ToString { a: Int! }
+type AsRef { a: Int! }
+type Debug { a: Int! }
+type PartialEq { a: Int! }
+type Copy { a: Int! }
+type Hash { a: Int! }
+type Default { a: Int! }
+type Eq { a: Int! }
+type Iterator { a: Int! }
+type Future { a: Int! }
+type Error { a: Int! }
+
+"""
+Globals the TypeScript client runtime names, and the generated `api.ts` around
+it: declared in that module, each would take the global's place in a bare
+reference, so the runtime writes every one as `globalThis.X`.
+"""
+type Globals {
+  headers: Headers!
+  bytes: Uint8Array!
+  params: URLSearchParams!
+  readonly: Readonly!
+  signal: AbortSignal!
+  promise: Promise!
+  record: Record!
+  body: BodyInit!
+  typeError: TypeError!
+  events: EventSource!
+  decoder: TextDecoder!
+  object: Object!
+  array: Array!
+  number: Number!
+  returnType: ReturnType!
+  event: Event!
+}
+type Headers { a: Int! }
+type Uint8Array { a: Int! }
+type URLSearchParams { a: Int! }
+type Readonly { a: Int! }
+type AbortSignal { a: Int! }
+type Promise { a: Int! }
+type Record { a: Int! }
+type BodyInit { a: Int! }
+type TypeError { a: Int! }
+type EventSource { a: Int! }
+type TextDecoder { a: Int! }
+type Object { a: Int! }
+type Array { a: Int! }
+type Number { a: Int! }
+type ReturnType { a: Int! }
+type Event { a: Int! }

@@ -1,0 +1,818 @@
+---
+source: tests/golden.rs
+expression: output
+---
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RPC API",
+    "version": "0.1.0",
+    "description": "Generated from GraphQL SDL by graphql-rpcgen. All operations are POST + JSON."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Admin"
+    }
+  ],
+  "paths": {
+    "/admin/convert": {
+      "post": {
+        "operationId": "admin_convert",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.convert",
+        "x-rpc-kind": "mutation",
+        "x-permission": "files.wipe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "text/csv": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/ingest": {
+      "post": {
+        "operationId": "admin_ingest",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.ingest",
+        "x-rpc-kind": "mutation",
+        "x-permission": "files.wipe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "text/csv": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/IngestResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "permission_required",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/manifest": {
+      "post": {
+        "operationId": "admin_manifest",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.manifest",
+        "x-rpc-kind": "query",
+        "x-permission": "files.wipe",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "This operation takes no arguments; send an empty object."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/purge": {
+      "post": {
+        "operationId": "admin_purge",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.purge",
+        "description": "Inherits a permission the caller holds, so the call reaches the service.",
+        "x-rpc-kind": "mutation",
+        "x-permission": "files.purge",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/IngestResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "permission_required",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/report": {
+      "post": {
+        "operationId": "admin_report",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.report",
+        "x-rpc-kind": "query",
+        "x-permission": "files.wipe",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/upload": {
+      "post": {
+        "operationId": "admin_upload",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.upload",
+        "x-rpc-kind": "mutation",
+        "x-permission": "files.wipe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/IngestResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "permission_required",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/watch": {
+      "get": {
+        "operationId": "admin_watch",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.watch",
+        "x-rpc-kind": "subscription",
+        "x-permission": "files.wipe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "An open event stream. Each `data:` frame is one JSON event of the declared type.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Event"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/watch_all": {
+      "get": {
+        "operationId": "admin_watch_all",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.watch_all",
+        "x-rpc-kind": "subscription",
+        "x-permission": "files.wipe",
+        "responses": {
+          "200": {
+            "description": "An open event stream. Each `data:` frame is one JSON event of the declared type.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Event"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/wipe": {
+      "post": {
+        "operationId": "admin_wipe",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.wipe",
+        "description": "A permission the caller lacks, so the call is refused before the service.",
+        "x-rpc-kind": "mutation",
+        "x-permission": "files.wipe",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/IngestResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "permission_required",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/no_input": {
+      "post": {
+        "operationId": "admin_wipe_all",
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Admin.wipe_all",
+        "description": "The same refusal in every other handler form, each of which reads its request its own way.",
+        "x-rpc-kind": "mutation",
+        "x-permission": "files.wipe",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "This operation takes no arguments; send an empty object."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/IngestResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "permission_required",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorCode": {
+        "type": "string",
+        "enum": [
+          "invalid_body",
+          "internal_error",
+          "permission_required",
+          "database_error"
+        ]
+      },
+      "Event": {
+        "type": "object",
+        "properties": {
+          "line": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "line"
+        ]
+      },
+      "IngestInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "body": {
+            "type": "string",
+            "format": "binary"
+          }
+        },
+        "required": [
+          "id",
+          "body"
+        ]
+      },
+      "IngestResult": {
+        "type": "object",
+        "properties": {
+          "written": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "required": [
+          "written"
+        ]
+      },
+      "Permission": {
+        "description": "Permission ids are not GraphQL identifiers, so each travels by its tag.",
+        "type": "string",
+        "enum": [
+          "files.purge",
+          "files.wipe"
+        ]
+      },
+      "WatchInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "RpcErrorItem": {
+        "type": "object",
+        "description": "One entry of `errors[]`, as produced by `treat::ErrorMessage`.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object",
+            "description": "Free-form context; its keys depend on the code."
+          },
+          "type": {
+            "type": "string",
+            "description": "RFC 9457 problem type URI."
+          },
+          "instance": {
+            "type": "string",
+            "description": "RFC 9457 occurrence id."
+          },
+          "source": {
+            "type": "object",
+            "description": "Locator for the offending input (JSON:API `source`).",
+            "properties": {
+              "pointer": {
+                "type": "string",
+                "description": "RFC 6901 JSON Pointer."
+              },
+              "parameter": {
+                "type": "string"
+              },
+              "header": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RpcErrorItem"
+            }
+          }
+        },
+        "required": [
+          "errors"
+        ]
+      }
+    },
+    "headers": {
+      "x-rpc-status": {
+        "description": "`ok` when `errors[]` is empty, `error` otherwise.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -14,8 +14,20 @@
 //!
 //! A missing key renders as empty rather than failing, so a typo like
 //! `{{{handlr}}}` would silently emit `async fn <S: …>`. [`Template::compile`]
-//! therefore checks every referenced variable against the names the caller
-//! declares, turning a typo into a generation-time error.
+//! therefore checks every referenced variable — and every section name —
+//! against the names the caller declares, turning a typo into a
+//! generation-time error.
+//!
+//! # Sections
+//!
+//! A variable doubles as a flag: `{{#input}}…{{/input}}` renders its body when
+//! `input` is not empty, `{{^input}}…{{/input}}` when it is. That is what lets
+//! one template serve an operation with an input and one without. Inside the
+//! section, `{{{.}}}` — the implicit iterator — is that same value, and names no
+//! variable the check would look up. An empty
+//! value is left out of the render context altogether, because `mustache`
+//! treats an empty *string* as present, and an inverted section over one would
+//! never render.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -54,7 +66,8 @@ impl Template {
             }
         }
 
-        if let Some(name) = escaping_tag(source) {
+        let escaping = escaping_tag(source);
+        if let Some(name) = escaping {
             return Err(report!(
                 "{origin}: `{{{{{name}}}}}` HTML-escapes its value, which corrupts Rust \
                  syntax such as `Vec<T>`. Use `{{{{{{{name}}}}}}}` instead."
@@ -77,10 +90,17 @@ impl Template {
         Template::compile(&source, &path.display().to_string(), allowed)
     }
 
+    /// Render with `vars`, an empty value counting as absent (see the module
+    /// documentation on sections).
     pub fn render(&self, vars: &Vars) -> erris::Result<String> {
+        let present: Vars = vars
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         let mut out = Vec::new();
         self.compiled
-            .render(&mut out, vars)
+            .render(&mut out, &present)
             .wrap_report(format_args!("{}", self.origin))?;
         String::from_utf8(out)
             .wrap_report_with(|| report!("{}: the template produced non-UTF-8", self.origin))
@@ -100,11 +120,13 @@ impl std::fmt::Debug for Template {
     }
 }
 
-/// Variable names referenced by `{{name}}`, `{{{name}}}` or `{{&name}}`.
+/// Variable names referenced by `{{name}}`, `{{{name}}}` or `{{&name}}`, and
+/// the names sections test with `{{#name}}`, `{{^name}}` and `{{/name}}`.
 ///
-/// Section tags (`{{#x}}`, `{{/x}}`, `{{^x}}`), comments and partials are
-/// skipped: the emitter supplies a flat string map, so sections have nothing
-/// to iterate and are not part of the contract.
+/// A section's name is a variable like any other — the flag it tests is one
+/// of the declared values — so a misspelt one is caught the same way rather
+/// than leaving its body never (or always) rendered. Comments, partials and
+/// delimiter changes are skipped.
 fn referenced_variables(source: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = source;
@@ -120,12 +142,19 @@ fn referenced_variables(source: &str) -> Vec<String> {
         let tag = tag.trim().trim_start_matches('{').trim_end_matches('}');
         let tag = tag.trim();
 
-        // Sections, comments, partials and delimiter changes carry a sigil.
-        if tag.starts_with(['#', '/', '^', '!', '>', '=', '<']) {
+        // Comments, partials and delimiter changes carry a sigil of their own;
+        // a section's sigil is dropped and its name checked.
+        if tag.starts_with(['!', '>', '=', '<']) {
             continue;
         }
-        let name = tag.trim_start_matches('&').trim();
-        if !name.is_empty() && !names.iter().any(|n| n == name) {
+        let name = tag.trim_start_matches(['&', '#', '^', '/']).trim();
+        // `.` is the implicit iterator — the value the enclosing section is
+        // over — and names no variable of its own.
+        if name == "." {
+            continue;
+        }
+        let seen = names.iter().any(|n| n == name);
+        if !name.is_empty() && !seen {
             names.push(name.to_string());
         }
     }
@@ -237,10 +266,48 @@ mod tests {
     }
 
     #[test]
-    fn section_and_comment_tags_are_not_treated_as_variables() -> TestResult {
-        let source = "{{! a note }}{{#items}}x{{/items}}{{{name}}}";
+    fn comment_tags_are_not_treated_as_variables() -> TestResult {
+        let source = "{{! a note }}{{{name}}}";
         let t = Template::compile(source, "<test>", &["name"])?;
         assert_eq!(t.render(&vars(&[("name", "ok")]))?, "ok");
+        Ok(())
+    }
+
+    /// A section tests a declared variable: a misspelt one is refused like a
+    /// misspelt substitution.
+    #[test]
+    fn a_misspelled_section_is_an_error() -> TestResult {
+        let message = refusal("{{#inptu}}x{{/inptu}}", &["input"])?.to_string();
+        assert!(message.contains("inptu"), "got: {message}");
+        Ok(())
+    }
+
+    /// A non-empty value renders `{{#x}}` and an empty one `{{^x}}`, so one
+    /// template serves an operation with an input and one without.
+    #[test]
+    fn a_variable_is_a_flag_for_sections() -> TestResult {
+        let source =
+            "{{#input}}take {{{input}}}\n{{/input}}{{^input}}take nothing\n{{/input}}done\n";
+        let t = Template::compile(source, "<test>", &["input"])?;
+        assert_eq!(
+            t.render(&vars(&[("input", "Rename")]))?,
+            "take Rename\ndone\n"
+        );
+        assert_eq!(t.render(&vars(&[("input", "")]))?, "take nothing\ndone\n");
+        assert_eq!(t.render(&vars(&[]))?, "take nothing\ndone\n");
+        Ok(())
+    }
+
+    /// `{{{.}}}` is the value the section is over, not a variable named `.`, so
+    /// the check must not refuse it.
+    #[test]
+    fn the_implicit_iterator_is_accepted() -> TestResult {
+        assert_eq!(
+            referenced_variables("{{#input}}{{{.}}}{{/input}}"),
+            vec!["input".to_string()]
+        );
+        let t = Template::compile("{{#input}}take {{{.}}}{{/input}}", "<test>", &["input"])?;
+        assert_eq!(t.render(&vars(&[("input", "Vec<T>")]))?, "take Vec<T>");
         Ok(())
     }
 

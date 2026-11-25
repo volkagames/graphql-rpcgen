@@ -1448,6 +1448,82 @@ type Users @service {
     Ok(())
 }
 
+/// Recasing loses what told two names apart: `Users.getAll` and `UsersGet.all`
+/// are two paths and two operationIds, yet one handler, one set of `wire`
+/// statics and one codes type. Reported where the later one is declared,
+/// naming the earlier one's declaration.
+#[test]
+fn two_operations_deriving_one_generated_name_are_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+type Users @service {
+  getAll: String! @query
+}
+type UsersGet @service {
+  all: String! @query
+}
+"#,
+    )?;
+    assert!(
+        e.contains("`UsersGet.all` and `Users.getAll` (declared at <memory>:"),
+        "{e}"
+    );
+    assert!(e.contains("the Rust handler `users_get_all`"), "{e}");
+    assert!(e.contains("the `wire` statics `USERS_GET_ALL_*`"), "{e}");
+    assert!(e.contains("the codes type `UsersGetAllCodes`"), "{e}");
+    assert!(e.contains("  - <memory>:"), "positioned: {e}");
+    Ok(())
+}
+
+/// A service is a Rust module, a client accessor and a key of TypeScript's
+/// `createApi`, all recased: `Users` and `USERS` are one of each.
+#[test]
+fn two_services_deriving_one_generated_name_are_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+type Users @service { a: String! @query }
+type USERS @service { b: String! @query }
+"#,
+    )?;
+    // Refused where the second is declared, naming the first.
+    assert!(
+        e.contains(
+            "<memory>:15:1: service `USERS` and service `Users` (declared at <memory>:14:1)"
+        ),
+        "{e}"
+    );
+    assert!(e.contains("the TypeScript `createApi` key `users`"), "{e}");
+    assert!(
+        e.contains("the Rust module and client accessor `users`"),
+        "{e}"
+    );
+    Ok(())
+}
+
+/// Every operation can answer the runtime's own codes, and the generated server
+/// and client are typed over the registry they belong to — an operation without
+/// `@throws` needs it as much as one with.
+#[test]
+fn operations_without_a_registry_are_rejected() -> TestResult {
+    let sdl = "type Users @service { get: String! @query }";
+    let Err(e) = graphql_rpcgen::compile_str(sdl).map_err(|e| e.to_string()) else {
+        return Err("operations without `ErrorCode` must fail".into());
+    };
+    assert!(
+        e.contains("`Users.get`: an API with operations must declare `enum ErrorCode`"),
+        "{e}"
+    );
+    assert!(e.contains("`invalid_body` and `internal_error`"), "{e}");
+    Ok(())
+}
+
+/// An API of types alone has nothing to fail, and so no registry to declare.
+#[test]
+fn types_without_operations_need_no_registry() -> TestResult {
+    graphql_rpcgen::compile_str("type User { name: String! }")?;
+    Ok(())
+}
+
 /// The discriminator is the one wire name that arrives as a directive argument
 /// rather than as a GraphQL name, and TypeScript spells it as a bare key.
 #[test]
@@ -1987,5 +2063,125 @@ type S @service { op(input: I!): R! @query }
 "#,
     )?;
     assert!(e.contains("explicitNulls"), "{e}");
+    Ok(())
+}
+
+/// A type spelt like an item the generated Rust declares itself, or like a
+/// prelude name it writes unqualified, is refused: the generated module would
+/// declare it twice, or read the SDL's type where it means its own. Each is
+/// refused with what it collides with.
+#[test]
+fn a_type_spelt_like_a_generated_item_is_rejected() -> TestResult {
+    for (name, what) in [
+        ("Rt", "the server's runtime alias"),
+        ("Failure", "the types module's `Failure` alias"),
+        ("FromRequestContext", "the server's context trait"),
+        ("ApiClient", "the Rust client"),
+        ("UsersService", "the trait of service `Users`"),
+        (
+            "UsersOperations",
+            "the Rust client's group for service `Users`",
+        ),
+        ("UsersGetCodes", "the codes type of `Users.get`"),
+        ("Result", "Rust's prelude `Result`"),
+        ("Vec", "Rust's prelude `Vec`"),
+        ("From", "Rust's prelude `From`"),
+    ] {
+        let e = expect_error(&format!(
+            r#"
+input I {{ id: UUID! }}
+type {name} {{ id: UUID! }}
+type Users @service {{
+  get(input: I!): {name}! @query
+}}
+"#
+        ))?;
+        assert!(
+            e.contains(&format!("type `{name}` is spelt like {what}")),
+            "{name}: {e}"
+        );
+    }
+    Ok(())
+}
+
+/// A newtype scalar is a Rust item and is held to the same names; a scalar
+/// mapped to a Rust type declares none, and is not.
+#[test]
+fn only_a_newtype_scalar_is_held_to_the_generated_names() -> TestResult {
+    let e = expect_error(
+        r#"
+scalar Box @scalar(rust: "String", typescript: "string", openapiType: "string", rustNewtype: true)
+type T { b: Box! }
+"#,
+    )?;
+    assert!(
+        e.contains("type `Box` is spelt like Rust's prelude `Box`"),
+        "{e}"
+    );
+
+    compile(
+        r#"
+scalar Rt @scalar(rust: "String", typescript: "string", openapiType: "string")
+type T { r: Rt! }
+"#,
+    )?;
+    Ok(())
+}
+
+/// Runtime items are not reserved: the generated code names them by path, so
+/// a type spelt like one compiles (`fixture_builds` builds such an API).
+#[test]
+fn a_type_spelt_like_a_runtime_item_compiles() -> TestResult {
+    compile(
+        r#"
+input Request { id: UUID! }
+type Response { id: UUID! }
+type Refusal { id: UUID! }
+type Users @service {
+  get(input: Request!): Response! @query
+}
+"#,
+    )?;
+    Ok(())
+}
+
+/// The checks that run over the IR, which keeps no positions, still report
+/// where the SDL declares what they refuse: the operation, for an `@http`
+/// binding, a missing `@throws` code or a path used twice — the second of the
+/// two — and the registry enum for a runtime code it does not list.
+#[test]
+fn checks_over_the_ir_are_positioned() -> TestResult {
+    let e = expect_error(
+        r#"
+enum Role @roles { reader }
+input I { id: UUID! }
+type O { id: UUID! }
+type Users @service {
+  first(input: I!): O! @query @rpc(path: "/same")
+  second(input: I!): O! @query @rpc(path: "/same")
+  guarded(input: I!): O! @query @rpc(path: "/guarded") @auth(require: session, role: reader)
+  bound(input: I!): O! @query @http(method: GET, path: "/bound/{nope}")
+}
+"#,
+    )?;
+    for expected in [
+        "<memory>:19:3: `Users.second`: duplicate RPC path `/same`",
+        "<memory>:20:3: `Users.guarded`: @auth(role:) is checked before the handler, so \
+         @throws(codes:) must list `role_required`",
+        "<memory>:21:3: `Users.bound`: @http(path:) names `{nope}`, which is not a field of the input",
+    ] {
+        assert!(e.contains(expected), "`{expected}` in {e}");
+    }
+    // Without the prelude, whose registry lists every runtime code.
+    let e = match graphql_rpcgen::compile_str(
+        "enum ErrorCode { invalid_body }\ntype S @service { a: String! @query }",
+    ) {
+        Ok(_) => return Err("a registry missing a runtime code must be refused".into()),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains("<memory>:1:1: `ErrorCode` must list `internal_error`"),
+        "{e}"
+    );
     Ok(())
 }

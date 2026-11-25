@@ -1,10 +1,19 @@
 //! GraphQL SDL -> RPC API compiler.
 //!
-//! Pipeline: SDL -> AST -> semantic validation -> IR -> generators.
+//! Pipeline: SDL -> AST -> semantic validation -> IR -> generators, then the
+//! formatting step for the Rust targets.
 //! Generators never see the AST; they read only [`ir::Api`].
+//!
+//! [`generate_all`] is a pure function of the IR and the settings: the Rust it
+//! returns is plain, one statement per line with no attempt at a layout.
+//! [`format_outputs`] is the step the CLI takes next, passing every Rust
+//! target through `rustfmt` so the files are what formatting the project's
+//! tree writes — see [`format`].
 
 pub mod config;
+mod emit_common;
 pub mod error;
+pub mod format;
 pub mod generate_openapi;
 pub mod generate_rust;
 pub mod generate_rust_client;
@@ -23,6 +32,8 @@ use erris::prelude::*;
 
 use config::Config;
 use ir::Api;
+
+pub use format::format_outputs;
 
 /// Default name of the settings file, looked up beside the SDL directory.
 pub const CONFIG_FILE: &str = "rpcgen.toml";
@@ -47,55 +58,83 @@ pub fn compile_str(sdl: &str) -> erris::Result<Api> {
     semantic::build(&files)
 }
 
-/// One generated file: a project-relative path and its full contents.
+/// Which of the configured outputs a [`GeneratedFile`] is: one per path of
+/// [`config::Output`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    RustTypes,
+    RustServer,
+    RustClient,
+    TypeScript,
+    TypeScriptZod,
+    OpenApi,
+}
+
+impl Target {
+    /// Whether the target is Rust source, which [`format_outputs`] formats.
+    pub fn is_rust(self) -> bool {
+        matches!(self, Self::RustTypes | Self::RustServer | Self::RustClient)
+    }
+
+    /// The target's key under `[output]`, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RustTypes => "rust_types",
+            Self::RustServer => "rust_server",
+            Self::RustClient => "rust_client",
+            Self::TypeScript => "typescript",
+            Self::TypeScriptZod => "typescript_zod",
+            Self::OpenApi => "openapi",
+        }
+    }
+}
+
+/// One generated file: what it is, a project-relative path and its full
+/// contents.
 pub struct GeneratedFile {
+    pub target: Target,
     pub path: PathBuf,
     pub contents: String,
 }
 
-/// Produce every configured artifact. Deterministic for a given input.
+/// Produce every configured artifact. Deterministic for a given input: the
+/// same `api` and `config` give byte-identical files.
+///
+/// The Rust targets come back plain — one statement per line, nothing laid
+/// out — and [`format_outputs`] is the step that formats them, as the CLI
+/// does before writing or comparing.
 ///
 /// A target with no path in [`config::Output`] is skipped, so a project
 /// generating only a server or only a client gets exactly what it asked for.
 pub fn generate_all(api: &Api, config: &Config) -> erris::Result<Vec<GeneratedFile>> {
+    let output = &config.output;
+    let targets = [
+        (Target::RustTypes, &output.rust_types),
+        (Target::RustServer, &output.rust_server),
+        (Target::RustClient, &output.rust_client),
+        (Target::TypeScript, &output.typescript),
+        (Target::TypeScriptZod, &output.typescript_zod),
+        (Target::OpenApi, &output.openapi),
+    ];
+
     let mut files = Vec::new();
-
-    if let Some(path) = &config.output.rust_types {
+    for (target, path) in targets {
+        let Some(path) = path else {
+            continue;
+        };
+        let contents = match target {
+            Target::RustTypes => generate_rust::generate_types(api, config)?,
+            Target::RustServer => generate_rust::generate(api, config)?,
+            Target::RustClient => generate_rust_client::generate(api, config)?,
+            Target::TypeScript => generate_typescript::generate(api),
+            Target::TypeScriptZod => generate_zod::generate(api),
+            Target::OpenApi => generate_openapi::generate(api, config)?,
+        };
         files.push(GeneratedFile {
+            target,
             path: path.clone(),
-            contents: generate_rust::generate_types(api, config)?,
+            contents,
         });
     }
-    if let Some(path) = &config.output.rust_server {
-        files.push(GeneratedFile {
-            path: path.clone(),
-            contents: generate_rust::generate(api, config)?,
-        });
-    }
-    if let Some(path) = &config.output.rust_client {
-        files.push(GeneratedFile {
-            path: path.clone(),
-            contents: generate_rust_client::generate(api, config)?,
-        });
-    }
-    if let Some(path) = &config.output.typescript {
-        files.push(GeneratedFile {
-            path: path.clone(),
-            contents: generate_typescript::generate(api),
-        });
-    }
-    if let Some(path) = &config.output.typescript_zod {
-        files.push(GeneratedFile {
-            path: path.clone(),
-            contents: generate_zod::generate(api),
-        });
-    }
-    if let Some(path) = &config.output.openapi {
-        files.push(GeneratedFile {
-            path: path.clone(),
-            contents: generate_openapi::generate(api, config)?,
-        });
-    }
-
     Ok(files)
 }

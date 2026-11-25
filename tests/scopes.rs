@@ -17,6 +17,9 @@
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod common;
+
+use common::{flat, operation_row};
 use graphql_rpcgen::config::Config;
 use graphql_rpcgen::{generate_openapi, generate_rust, generate_typescript};
 
@@ -97,10 +100,13 @@ fn expect_error(body: &str) -> TestResult<String> {
 }
 
 /// The table's rows, from the line after its head to the line before its end.
-fn table(out: &str) -> TestResult<&str> {
-    out.split("pub const ALL: &[Operation] = &[\n")
+/// The rows of `operations::ALL`, flattened: `Operation { .. }, Operation { .. }`.
+fn table(out: &str) -> TestResult<String> {
+    flat(out)
+        .split("pub const ALL: &[Operation] = &[")
         .nth(1)
-        .and_then(|s| s.split("    ];\n").next())
+        .and_then(|s| s.split("];").next())
+        .map(str::to_string)
         .ok_or_else(|| format!("the operation table must be emitted: {out}").into())
 }
 
@@ -146,8 +152,8 @@ fn the_operation_table_lists_every_operation_as_mounted() -> TestResult {
                permission: &str,
                scope: &str| {
         format!(
-            "        Operation {{ id: \"{id}\", method: \"{method}\", path: \"{path}\", kind: Kind::{kind}, \
-             auth: Auth::{auth}, permission: {permission}, scope: {scope} }},\n"
+            "Operation {{ id: \"{id}\", method: \"{method}\", path: \"{path}\", kind: Kind::{kind}, \
+             auth: Auth::{auth}, permission: {permission}, scope: {scope} }}"
         )
     };
     let expected = [
@@ -225,7 +231,7 @@ fn the_operation_table_lists_every_operation_as_mounted() -> TestResult {
             "None",
         ),
     ]
-    .concat();
+    .join(", ");
     assert_eq!(table(&out)?, expected);
 
     // The lookups the table is for, by route and by id; a role column only
@@ -268,7 +274,7 @@ type Open @service @auth(require: session) {{
     let out = generate_rust::generate_types(&api, &Config::default())?;
     assert!(!out.contains("pub scope:"), "{out}");
     assert!(
-        table(&out)?.ends_with("auth: Auth::Session, permission: None },\n"),
+        table(&out)?.ends_with("auth: Auth::Session, permission: None }"),
         "{out}"
     );
 
@@ -285,12 +291,13 @@ type Open @service @auth(require: session) {{
 #[test]
 fn the_rust_scope_set_reads_and_spells_names() -> TestResult {
     let out = generate_rust::generate_types(&api()?, &Config::default())?;
+    // `WireEnum` reads the name from the rename serde writes.
     assert!(
-        out.contains("            \"files.purge\" => Some(Self::Purge),\n"),
+        out.contains("    #[serde(rename = \"files.purge\")]\n    Purge,\n"),
         "{out}"
     );
     assert!(
-        out.contains("            Self::Purge => \"files.purge\",\n"),
+        out.contains("::serde::Serialize, ::serde::Deserialize, ::treat::rpc::WireEnum)]\npub enum TokenScope {"),
         "{out}"
     );
     Ok(())
@@ -329,8 +336,11 @@ fn the_typescript_api_carries_each_operations_scope() -> TestResult {
         "{out}"
     );
     let entry = |op: &str| -> TestResult<&str> {
+        // Past the `ops` and `keys` locals, whose per-service blocks would
+        // otherwise be found first.
         out.split("export function createApi(")
             .nth(1)
+            .and_then(|s| s.split("\n  return {").nth(1))
             .and_then(|s| s.split(&format!("      {op}: {{\n")).nth(1))
             .and_then(|s| s.split("\n      },").next())
             .ok_or_else(|| format!("createApi must carry {op}").into())
@@ -444,21 +454,17 @@ type Admin @service @auth(require: session, permission: files_admin) {{
     ))?;
     let out = generate_rust::generate_types(&api, &Config::default())?;
     let row = |id: &str| -> TestResult<String> {
-        Ok(out
-            .lines()
-            .find(|line| line.contains(&format!("Operation {{ id: \"{id}\", ")))
-            .ok_or_else(|| format!("no row for {id}"))?
-            .to_string())
+        Ok(operation_row(&out, id).ok_or_else(|| format!("no row for {id}"))?)
     };
     let permission = "permission: Some(super::Permission::FilesAdmin)";
     assert!(row("admin_wipe")?.ends_with(&format!(
-        "{permission}, scope: Some(super::TokenScope::Purge) }},"
+        "{permission}, scope: Some(super::TokenScope::Purge) }}"
     )));
     assert!(row("admin_audit")?.ends_with(&format!(
-        "{permission}, scope: Some(super::TokenScope::Read) }},"
+        "{permission}, scope: Some(super::TokenScope::Read) }}"
     )));
-    assert!(row("admin_stats")?.ends_with(&format!("{permission}, scope: None }},")));
-    assert!(row("admin_reset")?.ends_with(&format!("{permission}, scope: None }},")));
+    assert!(row("admin_stats")?.ends_with(&format!("{permission}, scope: None }}")));
+    assert!(row("admin_reset")?.ends_with(&format!("{permission}, scope: None }}")));
     // The duty that comes with leaving it out is said where the column is.
     assert!(
         out.contains("`require_permission` must refuse a credential not allowed it"),

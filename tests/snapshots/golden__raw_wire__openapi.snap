@@ -1,0 +1,716 @@
+---
+source: tests/golden.rs
+expression: output
+---
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RPC API",
+    "version": "0.1.0",
+    "description": "Generated from GraphQL SDL by graphql-rpcgen. All operations are POST + JSON."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Files"
+    }
+  ],
+  "paths": {
+    "/convert": {
+      "post": {
+        "operationId": "files_convert",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.convert",
+        "description": "Bytes in, bytes out.",
+        "x-rpc-kind": "mutation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "text/csv": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/echo": {
+      "post": {
+        "operationId": "files_echo",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.echo",
+        "description": "Bytes in unread, bytes out, for a caller with a session: the one form with every extractor.",
+        "x-rpc-kind": "mutation",
+        "x-role": "files_read",
+        "x-scope": "write",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ingest": {
+      "post": {
+        "operationId": "files_ingest",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.ingest",
+        "description": "Bytes in, JSON out.",
+        "x-rpc-kind": "mutation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "A list repeats its key in the query string once the body is spent."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "text/csv": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/IngestResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manifest": {
+      "post": {
+        "operationId": "files_manifest",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.manifest",
+        "description": "Bytes out, nothing in.",
+        "x-rpc-kind": "query",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "This operation takes no arguments; send an empty object."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report": {
+      "post": {
+        "operationId": "files_report",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.report",
+        "description": "Bytes out, JSON in.",
+        "x-rpc-kind": "query",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body itself, not the JSON envelope.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure, which is still the JSON envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RpcErrorItem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/upload": {
+      "post": {
+        "operationId": "files_upload",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.upload",
+        "description": "Bytes in unread, JSON out.",
+        "x-rpc-kind": "mutation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/UploadResult"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/watch": {
+      "get": {
+        "operationId": "files_watch",
+        "tags": [
+          "Files"
+        ],
+        "summary": "Files.watch",
+        "description": "A stream of events, sharing the runtime the raw forms emit.",
+        "x-rpc-kind": "subscription",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "An open event stream. Each `data:` frame is one JSON event of the declared type.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Event"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ConvertInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "body": {
+            "type": "string",
+            "format": "binary",
+            "description": "An opaque body: bytes on the wire rather than a value in the JSON envelope."
+          }
+        },
+        "required": [
+          "id",
+          "body"
+        ]
+      },
+      "ErrorCode": {
+        "type": "string",
+        "enum": [
+          "invalid_body",
+          "internal_error",
+          "not_found",
+          "role_required",
+          "database_error",
+          "files::gone"
+        ]
+      },
+      "Event": {
+        "type": "object",
+        "properties": {
+          "line": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "line"
+        ]
+      },
+      "IngestInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "A list repeats its key in the query string once the body is spent."
+          },
+          "body": {
+            "type": "string",
+            "format": "binary",
+            "description": "The one binary field: this is the request body itself."
+          }
+        },
+        "required": [
+          "id",
+          "body"
+        ]
+      },
+      "IngestResult": {
+        "type": "object",
+        "properties": {
+          "written": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "required": [
+          "written"
+        ]
+      },
+      "ReportInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "rows": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "A parameter of a raw-response call still travels as JSON."
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "Role": {
+        "description": "A junior role and one inheriting it, so the guard below passes by inheritance.",
+        "type": "string",
+        "enum": [
+          "files_read",
+          "files_write"
+        ]
+      },
+      "Scope": {
+        "description": "What a token may do; one scope tagged, so its wire name is not its identifier.",
+        "type": "string",
+        "enum": [
+          "read",
+          "write",
+          "files.purge"
+        ]
+      },
+      "UploadInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "body": {
+            "type": "string",
+            "format": "binary",
+            "description": "Left empty by the server: the payload reaches the service unread."
+          }
+        },
+        "required": [
+          "id",
+          "body"
+        ]
+      },
+      "UploadResult": {
+        "type": "object",
+        "properties": {
+          "received": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Bytes the service read from the body."
+          },
+          "declared": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The `Content-Length` the request declared."
+          },
+          "intact": {
+            "type": "boolean",
+            "description": "Whether every byte read was the byte the test sent."
+          }
+        },
+        "required": [
+          "received",
+          "intact"
+        ]
+      },
+      "WatchInput": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "RpcErrorItem": {
+        "type": "object",
+        "description": "One entry of `errors[]`, as produced by `treat::ErrorMessage`.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object",
+            "description": "Free-form context; its keys depend on the code."
+          },
+          "type": {
+            "type": "string",
+            "description": "RFC 9457 problem type URI."
+          },
+          "instance": {
+            "type": "string",
+            "description": "RFC 9457 occurrence id."
+          },
+          "source": {
+            "type": "object",
+            "description": "Locator for the offending input (JSON:API `source`).",
+            "properties": {
+              "pointer": {
+                "type": "string",
+                "description": "RFC 6901 JSON Pointer."
+              },
+              "parameter": {
+                "type": "string"
+              },
+              "header": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RpcErrorItem"
+            }
+          }
+        },
+        "required": [
+          "errors"
+        ]
+      }
+    },
+    "headers": {
+      "x-rpc-status": {
+        "description": "`ok` when `errors[]` is empty, `error` otherwise.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        }
+      }
+    }
+  }
+}
