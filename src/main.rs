@@ -6,6 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use erris::prelude::*;
+use erris::report;
+
 const DEFAULT_SDL_DIR: &str = "api";
 const USAGE: &str = "\
 graphql-rpcgen - GraphQL SDL -> Rust / TypeScript / OpenAPI
@@ -61,19 +64,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // The whole chain, not `Display`: a report's `Display` is its outermost
+    // message alone, and the cause under it — the TOML or SDL syntax error,
+    // the I/O failure — is what the user has to read.
     match run(&args) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", graphql_rpcgen::error::describe(&e));
             ExitCode::FAILURE
         }
     }
 }
 
-fn parse_args() -> Result<Parsed, String> {
+fn parse_args() -> erris::Result<Parsed> {
     let mut argv = std::env::args().skip(1);
     let Some(command) = argv.next() else {
-        return Err("missing command".to_string());
+        return Err(report!("missing command"));
     };
 
     match command.as_str() {
@@ -85,7 +91,7 @@ fn parse_args() -> Result<Parsed, String> {
     let command = match command.as_str() {
         "generate" => Command::Generate,
         "check" => Command::Check,
-        other => return Err(format!("unknown command `{other}`")),
+        other => return Err(report!("unknown command `{other}`")),
     };
 
     let mut api_dir = PathBuf::from(DEFAULT_SDL_DIR);
@@ -94,17 +100,27 @@ fn parse_args() -> Result<Parsed, String> {
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--api" => {
-                api_dir = argv.next().ok_or("`--api` requires a directory")?.into();
+                api_dir = argv
+                    .next()
+                    .ok_or_report("`--api` requires a directory")?
+                    .into();
             }
             "--root" => {
-                root = argv.next().ok_or("`--root` requires a directory")?.into();
+                root = argv
+                    .next()
+                    .ok_or_report("`--root` requires a directory")?
+                    .into();
             }
             "--config" => {
-                config = Some(argv.next().ok_or("`--config` requires a file")?.into());
+                config = Some(
+                    argv.next()
+                        .ok_or_report("`--config` requires a file")?
+                        .into(),
+                );
             }
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
-            other => return Err(format!("unknown option `{other}`")),
+            other => return Err(report!("unknown option `{other}`")),
         }
     }
 
@@ -126,7 +142,7 @@ fn run(args: &Args) -> erris::Result<ExitCode> {
     // defaults, which name no target — and left as a warning it made `check`
     // print "up to date" and exit zero without reading a single file.
     if files.is_empty() {
-        return Err(erris::report!(
+        return Err(report!(
             "no outputs configured, so nothing was {}: name at least one target in an \
              [output] section of {}",
             match args.command {
@@ -159,7 +175,10 @@ fn run(args: &Args) -> erris::Result<ExitCode> {
                 let current = match std::fs::read_to_string(&target) {
                     Ok(current) => current,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(e) => return Err(erris::report!("{}: {e}", target.display())),
+                    Err(e) => {
+                        return Err(e)
+                            .wrap_report(format_args!("cannot read {}", target.display()));
+                    }
                 };
                 if current != file.contents {
                     stale.push(file.path.display().to_string());
@@ -193,8 +212,9 @@ fn config_path(args: &Args) -> PathBuf {
 /// is optional, so a project with no custom scalars needs no file at all.
 fn load_config(args: &Args) -> erris::Result<graphql_rpcgen::config::Config> {
     let path = config_path(args);
-    if args.config.is_some() || path.exists() {
-        return Ok(graphql_rpcgen::config::Config::from_toml_file(&path)?);
+    let exists = path.exists();
+    if args.config.is_some() || exists {
+        return graphql_rpcgen::config::Config::from_toml_file(&path).track();
     }
     Ok(graphql_rpcgen::config::Config::default())
 }
@@ -202,12 +222,14 @@ fn load_config(args: &Args) -> erris::Result<graphql_rpcgen::config::Config> {
 /// Skip rewriting unchanged files so build systems watching mtimes stay quiet.
 fn write_if_changed(path: &Path, contents: &str) -> erris::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .wrap_report(format_args!("cannot create {}", parent.display()))?;
     }
-    if std::fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+    let existing = std::fs::read_to_string(path);
+    if existing.is_ok_and(|existing| existing == contents) {
         return Ok(());
     }
-    std::fs::write(path, contents)?;
+    std::fs::write(path, contents).wrap_report(format_args!("cannot write {}", path.display()))?;
     println!("  wrote {}", path.display());
     Ok(())
 }

@@ -4,6 +4,11 @@
 //! without editing it: its own scalars, its own output paths, its own
 //! templates.
 
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;

@@ -14,12 +14,15 @@ pub enum HttpBodyKind {
     Form,
 }
 
-/// Give a failure the runtime built the status an `@http` caller reads.
+/// Give a failure the status an `@http` caller reads.
 ///
 /// The envelope's own failures answer `200`, since an RPC caller reads
 /// `errors[]`; an endpoint bound to HTTP is read by callers that look at the
 /// status line, so one that could not read its input says so there: `400`, or
-/// whatever the body's rejection carried (`413` for one too large).
+/// whatever the body's rejection carried (`413` for one too large). A missing
+/// session answers `401` and a denied one `403`, and the service's own failure
+/// of an operation answered bare `500`: there a `200` would read as success.
+/// A status the failure already carries other than `200` is kept.
 fn http_status(mut response: Response, status: axum::http::StatusCode) -> Response {
     if response.status() == axum::http::StatusCode::OK {
         *response.status_mut() = status;
@@ -90,12 +93,17 @@ async fn read_http_input<T: serde::de::DeserializeOwned>(
             .map_err(|e| invalid_query(&e.to_string(), None));
     }
 
-    let mut pairs = url_pairs(parts.uri.query());
+    let mut pairs = url_pairs(parts.uri.query().unwrap_or_default().as_bytes())?;
     let is_form = parts
         .headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
+        .is_some_and(|value| {
+            // A media type is case-insensitive: `Application/X-WWW-Form-Urlencoded`
+            // is the same form.
+            const FORM: &str = "application/x-www-form-urlencoded";
+            value.get(..FORM.len()).is_some_and(|start| start.eq_ignore_ascii_case(FORM))
+        });
     if body == HttpBodyKind::Form && is_form {
         let request = axum::extract::Request::from_parts(parts, request_body);
         let read = <axum::body::Bytes as axum::extract::FromRequest<()>>::from_request(request, &()).await;
@@ -106,7 +114,7 @@ async fn read_http_input<T: serde::de::DeserializeOwned>(
                 return Err(http_status(invalid_query("the form body cannot be read", None), status));
             }
         };
-        let form = url_pairs(std::str::from_utf8(&bytes).ok());
+        let form = url_pairs(&bytes)?;
         override_pairs(&mut pairs, form);
     }
     override_pairs(&mut pairs, path_pairs);

@@ -510,7 +510,6 @@ dependencies = [
  "derive_more",
  "erris",
  "error_set",
- "form_urlencoded",
  "futures-core",
  "futures-util",
  "graphql-parser",

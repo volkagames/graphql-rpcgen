@@ -43,14 +43,58 @@ fn input_from_query<T: serde::de::DeserializeOwned>(
     query: Option<&str>,
     fields: &[QueryField],
 ) -> Result<T, Response> {
-    input_from_pairs(&url_pairs(query), fields)
+    let pairs = url_pairs(query.unwrap_or_default().as_bytes())?;
+    input_from_pairs(&pairs, fields)
 }
 
 /// The `key=value` pairs of a query string or a form body, decoded.
-fn url_pairs(encoded: Option<&str>) -> Vec<(String, String)> {
-    form_urlencoded::parse(encoded.unwrap_or_default().as_bytes())
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect()
+///
+/// Bytes, not text, and refused rather than altered when a pair is not UTF-8
+/// once decoded — escaped (`%E9`) or raw, as a legacy Latin-1 form may send
+/// it. Replacing the byte would hand the service a value nobody sent, a
+/// password among them, and make two different ones equal.
+fn url_pairs(encoded: &[u8]) -> Result<Vec<(String, String)>, Response> {
+    let mut pairs = Vec::new();
+    for pair in encoded.split(|byte| *byte == b'&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut halves = pair.splitn(2, |byte| *byte == b'=');
+        let key = url_text(halves.next().unwrap_or_default())?;
+        let value = url_text(halves.next().unwrap_or_default())?;
+        pairs.push((key, value));
+    }
+    Ok(pairs)
+}
+
+/// One `application/x-www-form-urlencoded` component as text: `+` is a space,
+/// `%XX` the byte it names, and a `%` without two hex digits after it itself.
+fn url_text(encoded: &[u8]) -> Result<String, Response> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut rest = encoded;
+    while let [first, tail @ ..] = rest {
+        rest = tail;
+        let escaped = match (*first, tail) {
+            (b'%', [high, low, after @ ..]) if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() => {
+                let digits = [*high, *low];
+                let byte = std::str::from_utf8(&digits)
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+                byte.map(|byte| (byte, after))
+            }
+            _ => None,
+        };
+        match (escaped, *first) {
+            (Some((byte, after)), _) => {
+                bytes.push(byte);
+                rest = after;
+            }
+            (None, b'+') => bytes.push(b' '),
+            (None, other) => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| invalid_query("a query or form parameter is not UTF-8 text", None))
 }
 
 /// Rebuild an operation's input from decoded `key=value` pairs, each converted
@@ -75,7 +119,10 @@ fn input_from_pairs<T: serde::de::DeserializeOwned>(
             if !items.is_empty() {
                 object.insert(field.name.to_string(), serde_json::Value::Array(items));
             }
-        } else if let Some(value) = values.next() {
+            continue;
+        }
+        let first = values.next();
+        if let Some(value) = first {
             object.insert(field.name.to_string(), query_value(field, value)?);
         }
     }

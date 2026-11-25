@@ -7,11 +7,12 @@ async fn {{{handler}}}<S: {{{trait_name}}}>(
         Ok(input) => input,
         Err(response) => return response,
     };
-    if let Err(violations) = validator::Validate::validate(&input) {
+    let validation = validator::Validate::validate(&input);
+    if let Err(violations) = validation {
         return http_status(invalid_input(&violations), axum::http::StatusCode::BAD_REQUEST);
     }
     match service.{{{method}}}({{{context_arg}}}input).await {
         Ok(response) => {{{respond}}},
-        Err(error) => error.into_response(),
+        Err(error) => {{{fail}}},
     }
 }

@@ -12,7 +12,8 @@ async fn {{{handler}}}<S: {{{trait_name}}}>(
         Ok(bytes) => bytes.into(),
         Err(response) => return response,
     };
-    if let Err(violations) = validator::Validate::validate(&input) {
+    let validation = validator::Validate::validate(&input);
+    if let Err(violations) = validation {
         return invalid_input(&violations);
     }
     match service.{{{method}}}({{{context_arg}}}input).await {

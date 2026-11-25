@@ -20,7 +20,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::error::CompileError;
+use erris::prelude::*;
+use erris::report;
 
 /// Values substituted into a template: a flat name -> text map.
 pub type Vars = BTreeMap<String, String>;
@@ -39,29 +40,28 @@ impl Template {
     ///
     /// `allowed` lists every variable the caller will supply. `origin`
     /// identifies the template in error messages.
-    pub fn compile(source: &str, origin: &str, allowed: &[&str]) -> Result<Self, CompileError> {
+    pub fn compile(source: &str, origin: &str, allowed: &[&str]) -> erris::Result<Self> {
         let referenced = referenced_variables(source);
 
         for name in &referenced {
             if !allowed.contains(&name.as_str()) {
                 let mut known: Vec<&str> = allowed.to_vec();
                 known.sort_unstable();
-                return Err(CompileError::new(format!(
+                return Err(report!(
                     "{origin}: unknown template variable `{name}`; available: {}",
                     known.join(", ")
-                )));
+                ));
             }
         }
 
         if let Some(name) = escaping_tag(source) {
-            return Err(CompileError::new(format!(
+            return Err(report!(
                 "{origin}: `{{{{{name}}}}}` HTML-escapes its value, which corrupts Rust \
                  syntax such as `Vec<T>`. Use `{{{{{{{name}}}}}}}` instead."
-            )));
+            ));
         }
 
-        let compiled = mustache::compile_str(source)
-            .map_err(|e| CompileError::new(format!("{origin}: {e}")))?;
+        let compiled = mustache::compile_str(source).wrap_report(format_args!("{origin}"))?;
 
         Ok(Self {
             compiled,
@@ -71,20 +71,19 @@ impl Template {
     }
 
     /// Read and compile a template file.
-    pub fn from_file(path: &Path, allowed: &[&str]) -> Result<Self, CompileError> {
+    pub fn from_file(path: &Path, allowed: &[&str]) -> erris::Result<Self> {
         let source = std::fs::read_to_string(path)
-            .map_err(|e| CompileError::new(format!("{}: {e}", path.display())))?;
+            .wrap_report(format_args!("cannot read {}", path.display()))?;
         Template::compile(&source, &path.display().to_string(), allowed)
     }
 
-    pub fn render(&self, vars: &Vars) -> Result<String, CompileError> {
+    pub fn render(&self, vars: &Vars) -> erris::Result<String> {
         let mut out = Vec::new();
         self.compiled
             .render(&mut out, vars)
-            .map_err(|e| CompileError::new(format!("{}: {e}", self.origin)))?;
-        String::from_utf8(out).map_err(|e| {
-            CompileError::new(format!("{}: template produced non-UTF-8: {e}", self.origin))
-        })
+            .wrap_report(format_args!("{}", self.origin))?;
+        String::from_utf8(out)
+            .wrap_report_with(|| report!("{}: the template produced non-UTF-8", self.origin))
     }
 
     /// The template text as compiled, for diagnostics.
@@ -110,11 +109,11 @@ fn referenced_variables(source: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = source;
 
-    while let Some(start) = rest.find("{{") {
-        rest = &rest[start + 2..];
-        let Some(end) = rest.find("}}") else { break };
-        let (tag, after) = rest.split_at(end);
-        rest = &after[2..];
+    while let Some((_, open)) = rest.split_once("{{") {
+        let Some((tag, after)) = open.split_once("}}") else {
+            break;
+        };
+        rest = after;
 
         // A triple-stache `{{{x}}}` is found as `{{` + `{x` + `}}`, so strip
         // the brace the outer match left on either side.
@@ -137,17 +136,17 @@ fn referenced_variables(source: &str) -> Vec<String> {
 fn escaping_tag(source: &str) -> Option<String> {
     let mut rest = source;
 
-    while let Some(start) = rest.find("{{") {
-        let before = &rest[start..];
-        rest = &rest[start + 2..];
+    while let Some((_, open)) = rest.split_once("{{") {
+        rest = open;
 
         // Triple-stache and the explicit `&` form do not escape.
-        if before.starts_with("{{{") || rest.trim_start().starts_with('&') {
+        if open.starts_with('{') || open.trim_start().starts_with('&') {
             continue;
         }
-        let Some(end) = rest.find("}}") else { break };
-        let (tag, after) = rest.split_at(end);
-        rest = &after[2..];
+        let Some((tag, after)) = open.split_once("}}") else {
+            break;
+        };
+        rest = after;
 
         let tag = tag.trim();
         if tag.starts_with(['#', '/', '^', '!', '>', '=', '<']) {
@@ -161,6 +160,10 @@ fn escaping_tag(source: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
 mod tests {
     use super::*;
 
@@ -169,7 +172,7 @@ mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// The error a test requires, or a failure naming what compiled instead.
-    fn refusal(source: &str, known: &[&str]) -> TestResult<CompileError> {
+    fn refusal(source: &str, known: &[&str]) -> TestResult<erris::Report> {
         match Template::compile(source, "<test>", known) {
             Err(error) => Ok(error),
             Ok(_) => Err(format!("`{source}` must be refused").into()),

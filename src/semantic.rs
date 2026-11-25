@@ -103,7 +103,7 @@ pub const RUNTIME_ERROR_CODES: [&str; 2] = [CODE_INVALID_BODY, CODE_INTERNAL_ERR
 /// resolves `ErrorCode::ALL` to the variant and only warns.
 pub const ENUM_ITEMS: [&str; 3] = ["ALL", "from_name", "as_str"];
 
-pub fn build(files: &[SdlFile]) -> Result<Api, CompileError> {
+pub fn build(files: &[SdlFile]) -> erris::Result<Api> {
     Analyzer::new(files).run()
 }
 
@@ -207,7 +207,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn run(mut self) -> Result<Api, CompileError> {
+    fn run(mut self) -> erris::Result<Api> {
         let mut types: Vec<ApiType> = builtin_scalars();
         let mut services: Vec<Service> = Vec::new();
 
@@ -280,6 +280,7 @@ impl<'a> Analyzer<'a> {
         };
         self.check_references(&api);
         self.check_paths(&api);
+        self.check_path_parameter_names(&api);
         self.check_operation_ids(&api);
         self.check_errors(&api);
         self.check_error_code_registry(&api);
@@ -1157,17 +1158,33 @@ impl<'a> Analyzer<'a> {
 
         // The operation's own @version wins over its service's, so one endpoint
         // can move ahead of the rest. The prefix leads whichever path was
-        // resolved above, derived or pinned.
-        let path = match self
-            .version_prefix(
+        // resolved above, derived or pinned — but not an `@http` one: that is
+        // the URL clients already call, and a prefix would move it. Its
+        // service's version passes it by; its own is refused, since the
+        // version belongs in the path it spells out.
+        let own_version = self.version_prefix(
+            file,
+            &format!("{service}.{}", field.name),
+            &field.directives,
+            field.position,
+        );
+        if http.is_some() && own_version.is_some() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "`{service}.{}`: @version would move the @http path clients already call; \
+                     write the version into @http(path:)",
+                    field.name
+                ),
                 file,
-                &format!("{service}.{}", field.name),
-                &field.directives,
                 field.position,
-            )
-            .as_deref()
-            .or(service_version)
-        {
+            ));
+            return None;
+        }
+        let prefix = match http {
+            Some(_) => None,
+            None => own_version.as_deref().or(service_version),
+        };
+        let path = match prefix {
             Some(prefix) => format!("{prefix}{path}"),
             None => path,
         };
@@ -1254,6 +1271,14 @@ impl<'a> Analyzer<'a> {
                     );
                 }
             },
+            // Present but not an enum value is a quoted method, which is a
+            // different mistake from leaving it out and is named as such.
+            None if has_arg(d, "method") => {
+                return fail(
+                    self,
+                    "@http(method:) is an enum value, written unquoted: `method: GET`".to_string(),
+                )
+            }
             None => {
                 return fail(
                     self,
@@ -1264,22 +1289,26 @@ impl<'a> Analyzer<'a> {
         };
 
         let Some(path) = string_arg(d, "path") else {
-            return fail(
-                self,
-                "@http needs `path:`, a string starting with `/`".to_string(),
-            );
+            let why = match has_arg(d, "path") {
+                true => "@http(path:) must be a string, quoted: `path: \"/items/{id}\"`",
+                false => "@http needs `path:`, a string starting with `/`",
+            };
+            return fail(self, why.to_string());
         };
         let Some(path_params) = path_parameters(&path) else {
             return fail(
                 self,
                 format!(
                     "@http(path:) must start with `/` and use only unreserved URL characters, \
-                     with `{{name}}` filling a whole segment, got `{path}`"
+                     with `{{name}}` filling a whole segment and naming the field as the wire \
+                     spells it, in lower snake_case (`{{user_id}}`, not `{{userId}}`), \
+                     got `{path}`"
                 ),
             );
         };
         let mut seen = BTreeSet::new();
-        if let Some(twice) = path_params.iter().find(|p| !seen.insert(p.as_str())) {
+        let twice = path_params.iter().find(|p| !seen.insert(p.as_str()));
+        if let Some(twice) = twice {
             return fail(self, format!("@http(path:) names `{{{twice}}}` twice"));
         }
 
@@ -1758,6 +1787,15 @@ impl<'a> Analyzer<'a> {
                          scalar, but it returns `{}`",
                         op.output.base_name()
                     ))),
+                    // `@raw` does not combine with `@http`, so its advice would
+                    // lead to a second refusal there.
+                    (None, true) if op.http.is_some() => {
+                        self.errors.push(CompileError::new(format!(
+                            "{name}: returns the binary scalar `{}`, which only a @raw \
+                             operation answers with, and @http does not combine with @raw",
+                            op.output.base_name()
+                        )));
+                    }
                     (None, true) => self.errors.push(CompileError::new(format!(
                         "{name}: returns the binary scalar `{}`, so it must declare \
                          @raw(response:) — bytes have no place in the JSON envelope",
@@ -1788,11 +1826,13 @@ impl<'a> Analyzer<'a> {
                         many.len(),
                         many.join(", ")
                     ))),
+                    // An `@http` operation's binary field is refused by
+                    // `check_http_bindings`, without advice it could not follow.
                     (None, []) => {}
-                    (None, many) => self.errors.push(CompileError::new(format!(
-                        "{name}: input field `{}` is a binary scalar, so the operation must \
-                         declare @raw(request:)",
-                        many[0]
+                    (None, _) if op.http.is_some() => {}
+                    (None, [first, ..]) => self.errors.push(CompileError::new(format!(
+                        "{name}: input field `{first}` is a binary scalar, so the operation \
+                         must declare @raw(request:)"
                     ))),
                 }
 
@@ -1814,11 +1854,10 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
-                if op.kind == OperationKind::Subscription && !bodies.is_empty() {
+                if let (OperationKind::Subscription, [first, ..]) = (op.kind, bodies.as_slice()) {
                     self.errors.push(CompileError::new(format!(
                         "{name}: a subscription sends no body, so its input cannot carry the \
-                         binary field `{}`",
-                        bodies[0]
+                         binary field `{first}`"
                     )));
                 }
             }
@@ -1854,10 +1893,12 @@ impl<'a> Analyzer<'a> {
                         )));
                         continue;
                     };
+                    // A value read as JSON text — the `JSON` scalar — has no
+                    // segment spelling a client writes, so it is no parameter.
                     let scalar_or_enum = matches!(
                         api.find_type(field.ty.base_name()),
                         Some(ApiType::Scalar(_) | ApiType::Enum(_))
-                    );
+                    ) && !api.is_json_text(field.ty.base_name());
                     let one_value = matches!(
                         field.ty,
                         TypeRef::Named {
@@ -1868,7 +1909,8 @@ impl<'a> Analyzer<'a> {
                     if !scalar_or_enum || !one_value {
                         self.errors.push(CompileError::new(format!(
                             "{name}: path parameter `{param}` must be a required scalar or enum \
-                             field, since it fills one path segment"
+                             field with a text form — a string, number or boolean, not `JSON` — \
+                             since it fills one path segment"
                         )));
                     }
                 }
@@ -3061,6 +3103,44 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Two routes naming the parameter in one position differently.
+    ///
+    /// The router keeps one name per parameter position, so `/items/{id}` and
+    /// `/items/{item_id}` cannot both be registered — whatever their methods,
+    /// and whatever follows the parameter — and building it panics at startup.
+    /// [`Self::check_paths`] compares whole strings and sees two paths.
+    /// Positions are compared by the segments before them, a parameter there
+    /// written as `{}`, which is how the router tells them apart too.
+    fn check_path_parameter_names(&mut self, api: &Api) {
+        // Shape of the prefix up to a parameter -> the name and who used it.
+        let mut seen: BTreeMap<String, (&str, String)> = BTreeMap::new();
+        for s in &api.services {
+            for op in &s.operations {
+                let owner = format!("{}.{}", s.name, op.name);
+                let mut shape = String::new();
+                for segment in op.path.split('/').skip(1) {
+                    shape.push('/');
+                    let name = segment.strip_prefix('{').and_then(|n| n.strip_suffix('}'));
+                    let Some(name) = name else {
+                        shape.push_str(segment);
+                        continue;
+                    };
+                    shape.push_str("{}");
+                    let (prev_name, prev) = seen
+                        .entry(shape.clone())
+                        .or_insert_with(|| (name, owner.clone()));
+                    if *prev_name != name {
+                        self.errors.push(CompileError::new(format!(
+                            "path parameter `{{{name}}}` of `{owner}` (`{}`) sits where `{prev}` names \
+                             `{{{prev_name}}}`; one route cannot name it twice, so use one name",
+                            op.path
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     /// Two operations answering to one `operationId`.
     ///
     /// The id is the service and the operation lowercased, so `getById` and
@@ -3404,59 +3484,49 @@ fn js_incompatible(pattern: &str) -> Option<(String, &'static str)> {
     const FLAGS: &str = "JavaScript carries flags after the closing slash, not inside the pattern.";
 
     let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0;
+    let mut rest: &[char] = &chars;
     let mut in_class = false;
 
-    while i < chars.len() {
-        match chars[i] {
+    while let [first, tail @ ..] = rest {
+        let mut next = tail;
+        match (first, tail) {
             // An escape and the character it escapes are one unit, so neither
             // opens a group nor a class.
-            '\\' => {
-                let (construct, fix) = match chars.get(i + 1) {
-                    Some(c @ ('p' | 'P')) if chars.get(i + 2) == Some(&'{') => (
-                        format!("\\{c}{{"),
-                        "Spell the class out; `\\p` needs the `u` flag, which the literal does \
-                         not carry.",
-                    ),
-                    Some('A') => ("\\A".to_string(), "Use `^`."),
-                    Some('z') => ("\\z".to_string(), "Use `$`."),
-                    _ => {
-                        i += 2;
-                        continue;
-                    }
-                };
-                return Some((construct, fix));
+            ('\\', [c @ ('p' | 'P'), '{', ..]) => {
+                return Some((
+                    format!("\\{c}{{"),
+                    "Spell the class out; `\\p` needs the `u` flag, which the literal does \
+                     not carry.",
+                ));
             }
-            '[' if !in_class => {
-                if chars[i..].starts_with(&['[', '[', ':']) {
-                    return Some((
-                        "[[:".to_string(),
-                        "Spell the POSIX class out, e.g. `[a-zA-Z]` for `[[:alpha:]]`.",
-                    ));
-                }
-                in_class = true;
+            ('\\', ['A', ..]) => return Some(("\\A".to_string(), "Use `^`.")),
+            ('\\', ['z', ..]) => return Some(("\\z".to_string(), "Use `$`.")),
+            ('\\', [_, after @ ..]) => next = after,
+            ('[', ['[', ':', ..]) if !in_class => {
+                return Some((
+                    "[[:".to_string(),
+                    "Spell the POSIX class out, e.g. `[a-zA-Z]` for `[[:alpha:]]`.",
+                ));
             }
-            ']' if in_class => in_class = false,
+            ('[', _) if !in_class => in_class = true,
+            (']', _) if in_class => in_class = false,
             // `(?:` is the portable non-capturing group and `(?<name>` the
             // portable named one. Every other `(?` the Rust crate accepts sets
             // inline flags, which a JavaScript literal has no syntax for.
-            '(' if !in_class && chars.get(i + 1) == Some(&'?') => {
-                match chars.get(i + 2) {
-                    Some(':' | '<') => {}
-                    Some('P') => return Some(("(?P<".to_string(), "Write `(?<name>...)`.")),
-                    _ => {
-                        let flags: String = chars[i + 2..]
-                            .iter()
-                            .take_while(|c| **c != ')' && **c != ':')
-                            .collect();
-                        return Some((format!("(?{flags}"), FLAGS));
-                    }
+            ('(', ['?', after @ ..]) if !in_class => match after {
+                [':' | '<', after @ ..] => next = after,
+                ['P', ..] => return Some(("(?P<".to_string(), "Write `(?<name>...)`.")),
+                _ => {
+                    let flags: String = after
+                        .iter()
+                        .take_while(|c| **c != ')' && **c != ':')
+                        .collect();
+                    return Some((format!("(?{flags}"), FLAGS));
                 }
-                i += 2;
-            }
+            },
             _ => {}
         }
-        i += 1;
+        rest = next;
     }
     None
 }
@@ -3478,10 +3548,25 @@ fn is_route(path: &str) -> bool {
 /// The `{name}` parameters of an `@http` path, in order, or `None` when the
 /// path is not one: it must start with `/`, a parameter must fill a whole
 /// segment and be a snake_case name, and the rest is held to [`is_route`].
+///
+/// A `.` or `..` segment is refused, and so is an empty one but a trailing
+/// slash: URL parsing drops the first two and a client's would never reach
+/// the route as mounted, and `//` is a route no caller writes on purpose.
 fn path_parameters(path: &str) -> Option<Vec<String>> {
     let rest = path.strip_prefix('/')?;
     let mut params = Vec::new();
-    for segment in rest.split('/') {
+    let segments: Vec<&str> = rest.split('/').collect();
+    let inner = segments
+        .split_last()
+        .map(|(_, inner)| inner)
+        .unwrap_or_default();
+    if inner.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    for segment in segments {
+        if matches!(segment, "." | "..") {
+            return None;
+        }
         let name = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
         match name {
             Some(name) => {
@@ -3549,6 +3634,11 @@ fn string_arg(d: &Directive<'static, String>, name: &str) -> Option<String> {
             Value::String(s) => Some(s.clone()),
             _ => None,
         })
+}
+
+/// Whether the directive names `name` at all, whatever its value.
+fn has_arg(d: &Directive<'static, String>, name: &str) -> bool {
+    d.arguments.iter().any(|(n, _)| n == name)
 }
 
 /// A GraphQL enum value such as `session`, as written.

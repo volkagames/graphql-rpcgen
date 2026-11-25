@@ -41,6 +41,29 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
+/// A report as one line: every message in its chain, outermost first, joined
+/// by `: ` — `cannot read api/a.graphql: No such file or directory`.
+///
+/// A report's `Display` is its outermost message alone, which names where a
+/// failure happened and not what it was; its `Debug` adds the generator's own
+/// source locations. This is the text for a person running the generator,
+/// and what the CLI prints. A link repeating the one before it is dropped: an
+/// error carried as a report displays as itself and is its own first source.
+pub fn describe(report: &erris::Report) -> String {
+    let root: &(dyn std::error::Error + 'static) = report.as_ref();
+    let mut parts: Vec<String> = Vec::new();
+    let mut link = Some(root);
+    while let Some(error) = link {
+        let text = error.to_string();
+        let repeated = parts.last().is_some_and(|last| *last == text);
+        if !text.is_empty() && !repeated {
+            parts.push(text);
+        }
+        link = error.source();
+    }
+    parts.join(": ")
+}
+
 /// Collects diagnostics so one run can report every problem, not just the first.
 #[derive(Debug, Default)]
 pub struct Errors {
@@ -56,7 +79,9 @@ impl Errors {
         self.items.is_empty()
     }
 
-    pub fn into_result(self) -> Result<(), CompileError> {
+    /// `Ok` when nothing was collected; otherwise one report listing every
+    /// diagnostic, so a run names all of its problems at once.
+    pub fn into_result(self) -> erris::Result<()> {
         if self.items.is_empty() {
             return Ok(());
         }
@@ -66,9 +91,9 @@ impl Errors {
             .map(|e| format!("  - {e}"))
             .collect::<Vec<_>>()
             .join("\n");
-        Err(CompileError::new(format!(
+        Err(erris::report!(
             "{} semantic error(s):\n{joined}",
             self.items.len()
-        )))
+        ))
     }
 }

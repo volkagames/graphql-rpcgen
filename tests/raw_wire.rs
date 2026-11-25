@@ -6,9 +6,9 @@
 //! parsing, an extractor ordering axum rejects, a trait bound that cannot be
 //! proved, or a crate the emitted runtime reaches for but no consumer knows to
 //! declare, all passed both. The last of those is not hypothetical: the
-//! streaming runtime calls `form_urlencoded::parse`, and the client reads a raw
-//! response through `reqwest`'s `stream` feature, neither of which any other
-//! test or document mentioned.
+//! streaming runtime once called `form_urlencoded::parse`, and the client reads
+//! a raw response through `reqwest`'s `stream` feature, neither of which any
+//! other test or document mentioned.
 //!
 //! This builds all three Rust targets from one SDL reaching every raw form, and
 //! the server of a second one checking permissions, in a scratch cargo
@@ -23,6 +23,11 @@
 //! from its Rust name, a `@variant(tag:)` code, because what reaches the
 //! envelope is decided by `treat`'s and `error_set`'s derives, which only a
 //! build exercises.
+
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
 
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
@@ -748,9 +753,8 @@ fn generated() -> TestResult<(String, String, String, String)> {
 /// What the generated code reaches for, with this crate's lockfile as the
 /// source of truth for versions.
 ///
-/// `form_urlencoded` and `reqwest`'s `stream` feature are in this list for the
-/// raw and streaming runtime alone, and `futures-util`'s `io` feature for a
-/// streamed request: drop any of them and the emitted code stops compiling,
+/// `reqwest`'s `stream` feature is in this list for the raw and streaming
+/// runtime alone, and `futures-util`'s `io` feature for a streamed request: drop any of them and the emitted code stops compiling,
 /// which is the failure this test exists to make visible. `tokio` is the
 /// driver's alone, for the `wire` tests.
 const DEPENDENCIES: &[&str] = &[
@@ -760,7 +764,6 @@ const DEPENDENCIES: &[&str] = &[
     "chrono",
     "derive_more",
     "error_set",
-    "form_urlencoded",
     "futures-core",
     "futures-util",
     "regex",

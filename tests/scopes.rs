@@ -8,6 +8,11 @@
 //! scope from being decorative. A mutation that forgets its scope failing the
 //! build above all: defaulted, it would be reachable by every token that writes.
 
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;

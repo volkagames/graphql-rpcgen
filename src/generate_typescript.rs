@@ -200,7 +200,10 @@ fn emit_one_of(out: &mut String, api: &Api, i: &InputObjectType) {
         }
         arm.push_str("    }");
         out.push_str(&arm);
-        if index + 1 < i.fields.len() {
+        if index
+            .checked_add(1)
+            .is_some_and(|next| next < i.fields.len())
+        {
             out.push('\n');
         }
     }
@@ -332,8 +335,11 @@ export interface RpcClientOptions {
    * rather than a built-in import so a client that does not want a validation
    * library in its bundle still has no dependencies. The server checks the same
    * rules regardless — this only moves the rejection off the network.
+   *
+   * `route` is the operation's path, or `METHOD path` for an `@http` operation,
+   * since two of those may share a path.
    */
-  validate?: (path: string, input: unknown) => void
+  validate?: (route: string, input: unknown) => void
 }
 
 export interface RpcCallOptions {
@@ -349,12 +355,15 @@ export interface RpcCallOptions {
   contentType?: string
 }
 
-/** Minimal typed wrapper over fetch. Every operation is POST + JSON. */
+/**
+ * Minimal typed wrapper over fetch. An RPC operation is POST + JSON; one bound
+ * to HTTP by `@http` goes through `http()` with its own method, path and body.
+ */
 export class RpcClient {
   private readonly baseUrl: string
   private readonly headers: Record<string, string>
   private readonly fetchImpl: typeof globalThis.fetch
-  private readonly validate?: (path: string, input: unknown) => void
+  private readonly validate?: (route: string, input: unknown) => void
 
   constructor(options: RpcClientOptions = {}) {
     // Paths from the IR are absolute (/rpc/...), so the base URL only
@@ -474,11 +483,21 @@ export class RpcClient {
     spec: RpcHttpSpec,
     options: RpcCallOptions = {},
   ): Promise<Output> {
-    this.validate?.(path, input ?? {})
+    // Keyed by method and path: two `@http` operations may share a path.
+    this.validate?.(`${spec.method} ${path}`, input ?? {})
     const fields: Record<string, unknown> = { ...((input ?? {}) as Record<string, unknown>) }
     let route = path
     for (const name of spec.pathFields) {
-      route = route.replace(`{${name}}`, encodeURIComponent(String(fields[name])))
+      if (fields[name] === undefined || fields[name] === null) {
+        throw new TypeError(`path parameter \`${name}\` is missing`)
+      }
+      const value = String(fields[name])
+      // URL parsing removes a `.` or `..` segment, escaped or not, so the
+      // request would reach another route; an empty one reaches none.
+      if (value === '' || value === '.' || value === '..') {
+        throw new TypeError(`path parameter \`${name}\` cannot be \`${value}\`: no URL carries it as a segment`)
+      }
+      route = route.replace(`{${name}}`, encodeURIComponent(value))
       delete fields[name]
     }
     let url = `${this.baseUrl}${route}`
@@ -604,15 +623,21 @@ function toQuery(input: Record<string, unknown> | undefined): string {
   for (const [key, value] of Object.entries(input)) {
     if (value === undefined || value === null) continue
     if (Array.isArray(value)) {
-      for (const item of value) params.append(key, String(item))
-    } else if (typeof value === 'object') {
-      params.append(key, JSON.stringify(value))
+      for (const item of value) params.append(key, queryParam(item))
     } else {
-      params.append(key, String(value))
+      params.append(key, queryParam(value))
     }
   }
   const query = params.toString()
   return query ? `?${query}` : ''
+}
+
+/**
+ * One value as a query parameter: a scalar as its text, an object as JSON
+ * text, which is how the server reads one — a list's items included.
+ */
+function queryParam(value: unknown): string {
+  return typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value)
 }
 
 /** Stands in when a failure carries no usable envelope. */
@@ -948,7 +973,6 @@ fn call_expr(api: &Api, op: &Operation, indent: &str) -> String {
     }
 }
 
-/// The `RpcRawSpec` literal for an operation, or `None` when it is plain JSON.
 /// The `RpcHttpSpec` literal of an `@http` operation.
 fn http_spec(op: &Operation) -> Option<String> {
     let http = op.http.as_ref()?;
@@ -966,6 +990,7 @@ fn http_spec(op: &Operation) -> Option<String> {
     ))
 }
 
+/// The `RpcRawSpec` literal for an operation, or `None` when it is plain JSON.
 fn raw_spec(api: &Api, op: &Operation) -> Option<String> {
     if op.raw_request.is_none() && op.raw_response.is_none() {
         return None;

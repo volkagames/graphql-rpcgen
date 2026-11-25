@@ -6,14 +6,18 @@
 use serde_json::{json, Map, Value};
 
 use crate::config::Config;
-use crate::error::CompileError;
 use crate::ir::*;
+use erris::prelude::*;
 
 const OPENAPI_VERSION: &str = "3.1.0";
 const DEFAULT_DESCRIPTION: &str =
     "Generated from GraphQL SDL by graphql-rpcgen. All operations are POST + JSON.";
+/// The default for an API with an `@http` operation, which is neither.
+const DEFAULT_DESCRIPTION_HTTP: &str = "Generated from GraphQL SDL by graphql-rpcgen. RPC \
+     operations are POST + JSON; an operation bound to HTTP keeps its own method, path \
+     and body, as each one describes.";
 
-pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
+pub fn generate(api: &Api, config: &Config) -> erris::Result<String> {
     let mut doc = Map::new();
     doc.insert("openapi".into(), json!(OPENAPI_VERSION));
     doc.insert(
@@ -25,7 +29,12 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
                 .openapi
                 .description
                 .as_deref()
-                .unwrap_or(DEFAULT_DESCRIPTION),
+                .unwrap_or(
+                    match api.services.iter().flat_map(|s| &s.operations).any(|op| op.http.is_some()) {
+                        true => DEFAULT_DESCRIPTION_HTTP,
+                        false => DEFAULT_DESCRIPTION,
+                    }
+                ),
         }),
     );
 
@@ -59,7 +68,7 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
 
     // Trailing newline keeps the file POSIX-friendly and diff-stable.
     let rendered = serde_json::to_string_pretty(&Value::Object(doc))
-        .map_err(|e| CompileError::new(format!("the OpenAPI document does not serialize: {e}")))?;
+        .wrap_report("the OpenAPI document does not serialize")?;
     Ok(format!("{rendered}\n"))
 }
 
@@ -153,10 +162,10 @@ fn paths(api: &Api) -> Map<String, Value> {
                             "name": f.name,
                             "in": "query",
                             "required": !f.ty.is_nullable(),
-                            "schema": type_ref_schema(api, &f.ty),
+                            "schema": url_schema(api, &f.ty),
                         });
-                        if let Some(d) = &f.description {
-                            param["description"] = json!(d);
+                        if let (Some(d), Some(fields)) = (&f.description, param.as_object_mut()) {
+                            fields.insert("description".into(), json!(d));
                         }
                         param
                     })
@@ -233,10 +242,10 @@ fn http_request(api: &Api, op: &Operation, http: &HttpBinding, operation: &mut M
             "name": f.name,
             "in": location,
             "required": location == "path" || !f.ty.is_nullable(),
-            "schema": type_ref_schema(api, &f.ty),
+            "schema": url_schema(api, &f.ty),
         });
-        if let Some(d) = &f.description {
-            param["description"] = json!(d);
+        if let (Some(d), Some(fields)) = (&f.description, param.as_object_mut()) {
+            fields.insert("description".into(), json!(d));
         }
         param
     };
@@ -256,19 +265,43 @@ fn http_request(api: &Api, op: &Operation, http: &HttpBinding, operation: &mut M
     match http.body {
         HttpBody::None => {}
         HttpBody::Json => {
-            let schema = match &op.input {
-                Some(input) => type_ref_schema(api, input),
-                None => json!({ "type": "object" }),
+            // The input type itself while the path takes none of it; with path
+            // parameters, the fields left over, since the server reads those
+            // from the path and a body naming them is overridden.
+            // No input is no body: the handler reads none.
+            let schema = match (&op.input, path_fields.is_empty()) {
+                (Some(input), true) => Some(type_ref_schema(api, input)),
+                (Some(_), false) => Some(object_schema(api, &None, &body_fields, false)),
+                (None, _) => None,
             };
-            operation.insert(
-                "requestBody".into(),
-                json!({ "required": true, "content": { "application/json": { "schema": schema } } }),
-            );
+            if let Some(schema) = schema {
+                operation.insert(
+                    "requestBody".into(),
+                    json!({ "required": true, "content": { "application/json": { "schema": schema } } }),
+                );
+            }
         }
         HttpBody::Form => {
             // The same fields are read from the query string too, the body
             // winning; the form is what a client sends, so it is what is shown.
-            let schema = object_schema(api, &None, &body_fields, false);
+            // A field read as JSON text is shown as such, rather than as an
+            // object a client would explode into keys of its own.
+            let mut properties = Map::new();
+            let mut required = Vec::new();
+            for f in &body_fields {
+                let schema = match api.is_json_text(f.ty.base_name()) {
+                    true => url_schema(api, &f.ty),
+                    false => field_schema(api, f),
+                };
+                properties.insert(f.name.clone(), schema);
+                if !f.ty.is_nullable() {
+                    required.push(f.name.clone());
+                }
+            }
+            let mut schema = json!({ "type": "object", "properties": properties });
+            if let (false, Some(object)) = (required.is_empty(), schema.as_object_mut()) {
+                object.insert("required".into(), json!(required));
+            }
             operation.insert(
                 "requestBody".into(),
                 json!({
@@ -277,6 +310,21 @@ fn http_request(api: &Api, op: &Operation, http: &HttpBinding, operation: &mut M
                 }),
             );
         }
+    }
+}
+
+/// A field's schema as a URL or a form body carries it: its own, but for a
+/// value read as JSON text, which is a string holding that JSON — one per item
+/// of a list, since a list repeats its key.
+fn url_schema(api: &Api, ty: &TypeRef) -> Value {
+    match ty {
+        TypeRef::List { inner, .. } => json!({ "type": "array", "items": url_schema(api, inner) }),
+        TypeRef::Named { name, .. } if api.is_json_text(name) => json!({
+            "type": "string",
+            "contentMediaType": "application/json",
+            "contentSchema": type_ref_schema(api, ty),
+        }),
+        TypeRef::Named { .. } => type_ref_schema(api, ty),
     }
 }
 
@@ -303,7 +351,9 @@ fn media_content(media_types: &[String]) -> Value {
 ///
 /// The status line carries no outcome — that is the portal's convention, which
 /// `treat` keeps — so one response describes both halves of the envelope and
-/// the `x-rpc-status` header gives the out-of-band signal.
+/// the `x-rpc-status` header gives the out-of-band signal. An `@http` operation
+/// is the exception: its callers read the status line, so its failures are
+/// described under `default` as well.
 fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
     let mut responses = Map::new();
 
@@ -357,7 +407,9 @@ fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
             json!({
                 "description":
                     "A failure: the envelope with `errors[]`, under the status the error \
-                     carries.",
+                     carries, `500` when it carries none; `400` (`413` past the body \
+                     limit) for an input the runtime cannot read, `401` for a refused \
+                     session, `403` for denied access.",
                 "content": { "application/json": { "schema": failure_schema(api, op) } },
             }),
         );
@@ -388,12 +440,37 @@ fn responses(api: &Api, op: &Operation) -> Map<String, Value> {
 
     alternatives.push(failure_schema(api, op));
 
+    // An `@http` route is read by callers that look at the status line, so the
+    // failures the runtime builds carry one; the service's own still answer
+    // `200` unless it gives them another.
+    let description = match op.http {
+        Some(_) => {
+            "Success carries `data`; failure carries `errors[]`. A failure the \
+             service returns answers 200 unless it carries another status; the \
+             others are described under `default`."
+        }
+        None => {
+            "Success carries `data`; failure carries `errors[]`. The status line is \
+             always 200 — read `errors[]`, or the `x-rpc-status` header."
+        }
+    };
+    if op.http.is_some() {
+        responses.insert(
+            "default".into(),
+            json!({
+                "description":
+                    "A failure the runtime answers with a status: `400` for an input it \
+                     cannot read (`413` for a body past the limit), `401` for a refused \
+                     session, `403` for denied access.",
+                "content": { "application/json": { "schema": failure_schema(api, op) } },
+            }),
+        );
+    }
+
     responses.insert(
         "200".into(),
         json!({
-            "description":
-                "Success carries `data`; failure carries `errors[]`. The status line is \
-                 always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "description": description,
             "headers": {
                 RPC_STATUS_HEADER: { "$ref": format!("#/components/headers/{RPC_STATUS_HEADER}") },
             },

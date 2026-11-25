@@ -16,7 +16,6 @@
 use std::fmt::Write;
 
 use crate::config::Config;
-use crate::error::CompileError;
 use crate::ir::*;
 use crate::naming::{codes_type_name, pascal_case, snake_case};
 use crate::template::{Template, Vars};
@@ -49,7 +48,6 @@ const DEFAULT_METHOD_RAW_REQUEST: &str =
 const DEFAULT_METHOD_RAW_BOTH: &str =
     include_str!("../templates/rust/client_method_raw_both.mustache");
 
-/// Default name of the generated client struct.
 /// Sending an input in a URL or a form, and reading a failure envelope off a
 /// response that is not one: shared by every form that does it.
 const DEFAULT_URL_RUNTIME: &str = include_str!("../templates/rust/client_url_runtime.mustache");
@@ -58,6 +56,7 @@ const DEFAULT_HTTP_RUNTIME: &str = include_str!("../templates/rust/client_http_r
 const DEFAULT_METHOD_HTTP: &str = include_str!("../templates/rust/client_method_http.mustache");
 const DEFAULT_METHOD_HTTP_NO_INPUT: &str =
     include_str!("../templates/rust/client_method_http_no_input.mustache");
+/// Default name of the generated client struct.
 const DEFAULT_CLIENT_NAME: &str = "ApiClient";
 
 /// Variables the client preamble may reference, besides `template_vars`.
@@ -86,7 +85,7 @@ const METHOD_VARS: [&str; 11] = [
     "envelope",
 ];
 
-pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
+pub fn generate(api: &Api, config: &Config) -> erris::Result<String> {
     let client = &config.rust_client;
     let extra_names: Vec<&str> = client.template_vars.keys().map(String::as_str).collect();
 
@@ -94,7 +93,7 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
                    origin: &str,
                    path: &Option<std::path::PathBuf>,
                    base: &[&str]|
-     -> Result<Template, CompileError> {
+     -> erris::Result<Template> {
         let mut allowed: Vec<&str> = base.to_vec();
         allowed.extend_from_slice(&extra_names);
         match path {
@@ -285,7 +284,7 @@ fn emit_service(
     method_no_input: &Template,
     methods: &RawMethods,
     vars: &impl Fn(&[(&str, &str)]) -> Vars,
-) -> Result<(), CompileError> {
+) -> erris::Result<()> {
     let group = format!("{}Operations", pascal_case(&service.name));
     let accessor = snake_case(&service.name);
 

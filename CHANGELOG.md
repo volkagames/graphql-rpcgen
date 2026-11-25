@@ -15,7 +15,13 @@ hold the exact migration steps; this file holds the motivation. Releases before
   when `envelope: false`. Failures keep the envelope; one the runtime builds
   (an input that does not parse, a body that cannot be read) answers `400` or
   the refusal's status, `413` past the body limit, since such a caller reads
-  the status line. Every target follows: the
+  the status line. For the same reason a refused session answers `401`, a
+  denied role or permission `403`, and with `envelope: false` a service
+  failure left at `200` answers `500`: a bare success is told from a failure
+  by its status alone. Two paths naming a parameter in the same position
+  differently are refused, since the router would panic on them, and the zod
+  `inputSchemas` key an `@http` operation by `METHOD path`, since two may
+  share a path. Every target follows: the
   Rust server and client, the TypeScript client (`RpcClient.http`,
   `RpcHttpSpec`), and OpenAPI (path and query parameters, form bodies,
   `x-rpc-any-method`). `tests/http_wire.rs` serves the generated router and
@@ -34,10 +40,53 @@ hold the exact migration steps; this file holds the motivation. Releases before
   `futures-*` crates. The Rust client's URL helpers moved the same way.
 - `operations::ALL` is sorted by path and then method, and `by_route` finds the
   row of the method asked for among several on one path; an `ANY` row answers
-  every method.
+  every method. It takes the request's path as well as the route's, matching a
+  `{name}` segment against any one segment and preferring a fixed segment as
+  the router does, so a gate reading `request.uri().path()` finds an `@http`
+  operation with path parameters. A path some row spells exactly stays a
+  binary search.
 - **Breaking:** a consumer's own inherent `ALL`, `from_name` or `as_str` on a
   generated enum, or its own `impl Hash` for one, now collides with the
   generated item and must be deleted.
+- **Breaking (library API):** `compile`, `compile_str`, `generate_all`, every
+  target's `generate`, `Config::from_toml_file`, `Template` and the version
+  check return `erris::Result` rather than `Result<_, CompileError>`. A failure
+  reading or parsing a file now keeps the I/O, TOML or SDL error as its cause
+  instead of flattening it into a string. A report's `Display` is its outer
+  message alone (`failed to parse api/a.graphql`); `error::describe` joins the
+  whole chain into one line (`failed to parse api/a.graphql: Parse error at
+  2:1 …`), which is what the CLI prints. `CompileError` remains the located
+  diagnostic the semantic pass collects.
+- The generator's own code denies panics and unchecked arithmetic
+  (`indexing_slicing`, `arithmetic_side_effects`, `string_slice`,
+  `panic_in_result_fn` and the rest of the set its sibling crates use); the
+  slice indexing and `+ 1` arithmetic it had are rewritten as slice patterns
+  and checked operations.
+- A path parameter that is empty, `.` or `..` is refused by the Rust and
+  TypeScript clients: URL parsing drops a dot segment, escaped or not, so the
+  call would reach another route. A missing one makes the TypeScript client
+  throw, as the Rust client already failed, instead of calling `/undefined`.
+- **Query strings and form bodies are decoded by the runtime itself**, and a
+  parameter that is not UTF-8 once decoded — escaped (`%E9`) or raw — is
+  refused as `invalid_body` rather than altered: replacing the byte with
+  U+FFFD handed the service a value nobody sent, a password among them. This
+  applies to subscriptions and raw requests too. The generated server no
+  longer needs `form_urlencoded`.
+- A service's `@version` no longer prefixes an `@http` path, and `@version` on
+  an `@http` operation is refused. A path with a `.`, `..` or empty segment
+  (but a trailing slash) is refused too, since no client reaches it as
+  mounted, and a quoted `method:` or an unquoted `path:` is named as such
+  rather than as missing.
+- A form body is recognised whatever the case of its `Content-Type`.
+- A path parameter of the `JSON` scalar is refused: it is read as JSON text,
+  which no client writes for a segment. `ir::Api::is_json_text` is the one
+  rule the server, the clients and OpenAPI share for such values.
+- OpenAPI: a JSON body beside path parameters lists only the other fields, an
+  `@http` operation without input has no body, an enveloped `@http` operation
+  describes its runtime failures under `default`, and a value read from a URL
+  or a form as JSON text is described as a string holding JSON
+  (`contentMediaType`) rather than as an object a client would explode into
+  keys.
 - The `@roles`, `@permissions` and `@scopes` enums get `from_name` and
   `as_str` from the general rule; only `Role::authorizes` is still emitted
   for one kind of enum alone.

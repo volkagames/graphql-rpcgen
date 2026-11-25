@@ -51,7 +51,7 @@ pub fn snake_case(input: &str) -> String {
 /// Wire names are shared by every target, so they must stay valid JSON keys
 /// rather than carry a Rust-specific escape.
 pub fn snake_case_raw(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 4);
+    let mut out = String::with_capacity(input.len().saturating_add(4));
     let chars: Vec<char> = input.chars().collect();
 
     for (i, ch) in chars.iter().enumerate() {
@@ -60,10 +60,12 @@ pub fn snake_case_raw(input: &str) -> String {
             continue;
         }
         if ch.is_uppercase() {
-            let prev_lower = i > 0 && (chars[i - 1].is_lowercase() || chars[i - 1].is_numeric());
+            let prev = i.checked_sub(1).and_then(|p| chars.get(p));
+            let next = i.checked_add(1).and_then(|n| chars.get(n));
+            let prev_lower = prev.is_some_and(|p| p.is_lowercase() || p.is_numeric());
             // Trailing capital of an acronym followed by a word: HTTPServer.
-            let next_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
-            let prev_upper = i > 0 && chars[i - 1].is_uppercase();
+            let next_lower = next.is_some_and(|n| n.is_lowercase());
+            let prev_upper = prev.is_some_and(|p| p.is_uppercase());
             if prev_lower || (prev_upper && next_lower) {
                 out.push('_');
             }

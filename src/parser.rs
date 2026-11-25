@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use graphql_parser::schema::{Definition, Document, TypeDefinition};
 
-use crate::error::CompileError;
+use erris::prelude::*;
+use erris::report;
 
 /// One parsed SDL file, kept alongside its path for diagnostics.
 pub struct SdlFile {
@@ -16,12 +17,9 @@ pub struct SdlFile {
 }
 
 /// Recursively collect `*.graphql` files, sorted for deterministic output.
-pub fn discover(dir: &Path) -> Result<Vec<PathBuf>, CompileError> {
+pub fn discover(dir: &Path) -> erris::Result<Vec<PathBuf>> {
     if !dir.is_dir() {
-        return Err(CompileError::new(format!(
-            "SDL directory not found: {}",
-            dir.display()
-        )));
+        return Err(report!("SDL directory not found: {}", dir.display()));
     }
 
     let mut files = Vec::new();
@@ -29,21 +27,17 @@ pub fn discover(dir: &Path) -> Result<Vec<PathBuf>, CompileError> {
     files.sort();
 
     if files.is_empty() {
-        return Err(CompileError::new(format!(
-            "no .graphql files found under {}",
-            dir.display()
-        )));
+        return Err(report!("no .graphql files found under {}", dir.display()));
     }
     Ok(files)
 }
 
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CompileError> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| CompileError::new(format!("cannot read {}: {e}", dir.display())))?;
+fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> erris::Result<()> {
+    let entries =
+        std::fs::read_dir(dir).wrap_report(format_args!("cannot read {}", dir.display()))?;
 
     for entry in entries {
-        let entry =
-            entry.map_err(|e| CompileError::new(format!("cannot read {}: {e}", dir.display())))?;
+        let entry = entry.wrap_report(format_args!("cannot read {}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
             collect(&path, out)?;
@@ -54,13 +48,13 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CompileError> {
     Ok(())
 }
 
-pub fn parse_dir(dir: &Path) -> Result<Vec<SdlFile>, CompileError> {
+pub fn parse_dir(dir: &Path) -> erris::Result<Vec<SdlFile>> {
     discover(dir)?.into_iter().map(parse_file).collect()
 }
 
-pub fn parse_file(path: PathBuf) -> Result<SdlFile, CompileError> {
+pub fn parse_file(path: PathBuf) -> erris::Result<SdlFile> {
     let text = std::fs::read_to_string(&path)
-        .map_err(|e| CompileError::new(format!("cannot read {}: {e}", path.display())))?;
+        .wrap_report(format_args!("cannot read {}", path.display()))?;
 
     // parse_schema borrows from the input, so leak the text to obtain a 'static
     // document. The compiler is a short-lived CLI process; this is bounded by
@@ -68,7 +62,7 @@ pub fn parse_file(path: PathBuf) -> Result<SdlFile, CompileError> {
     let leaked: &'static str = Box::leak(text.into_boxed_str());
 
     let document = graphql_parser::parse_schema::<String>(leaked)
-        .map_err(|e| CompileError::new(format!("failed to parse {}: {e}", path.display())))?;
+        .wrap_report(format_args!("failed to parse {}", path.display()))?;
 
     Ok(SdlFile { path, document })
 }

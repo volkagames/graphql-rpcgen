@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::error::CompileError;
 use crate::ir::{ApiType, Constraints, ScalarType};
+use erris::prelude::*;
+use erris::report;
 
 /// Everything the generators need beyond the IR itself.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -197,15 +198,15 @@ impl Config {
     /// The file must declare `rpcgen_version`, and this build must satisfy it,
     /// or the read fails. Both are errors about the file, so they are reported
     /// with its path like any other.
-    pub fn from_toml_file(path: &Path) -> Result<Self, CompileError> {
+    pub fn from_toml_file(path: &Path) -> erris::Result<Self> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| CompileError::new(format!("{}: {e}", path.display())))?;
-        let mut config: Config = toml::from_str(&text)
-            .map_err(|e| CompileError::new(format!("{}: {e}", path.display())))?;
+            .wrap_report(format_args!("cannot read {}", path.display()))?;
+        let mut config: Config =
+            toml::from_str(&text).wrap_report(format_args!("{}", path.display()))?;
 
         config
             .check_version()
-            .map_err(|e| CompileError::new(format!("{}: {e}", path.display())))?;
+            .wrap_report(format_args!("{}", path.display()))?;
 
         if let Some(dir) = path.parent() {
             config.rebase_template_paths(dir);
@@ -219,14 +220,14 @@ impl Config {
     /// this check exists to rule out. A [`Config`] built in Rust rather than
     /// read from a file has no such gap — cargo already pinned the version —
     /// so library callers do not go through here.
-    pub fn check_version(&self) -> Result<(), CompileError> {
+    pub fn check_version(&self) -> erris::Result<()> {
         let Some(required) = &self.rpcgen_version else {
-            return Err(CompileError::new(format!(
+            return Err(report!(
                 "missing `rpcgen_version`. Add the generator version this project \
                  is written against at the top of the file, e.g. \
                  `rpcgen_version = \"{}\"`",
                 crate::version::CURRENT
-            )));
+            ));
         };
         crate::version::check(required)
     }
@@ -261,6 +262,10 @@ impl RustClientConfig {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
 mod tests {
     use super::*;
 
@@ -270,9 +275,12 @@ mod tests {
 
     /// The message of an error the test requires, or a failure naming what went
     /// through instead.
-    fn refusal<T, E: std::fmt::Display>(outcome: Result<T, E>, what: &str) -> TestResult<String> {
+    ///
+    /// The whole chain, as the CLI prints it: a report's `Display` is its
+    /// outermost message alone, and the reason sits in the cause under it.
+    fn refusal<T>(outcome: erris::Result<T>, what: &str) -> TestResult<String> {
         match outcome {
-            Err(error) => Ok(error.to_string()),
+            Err(error) => Ok(crate::error::describe(&error)),
             Ok(_) => Err(format!("{what} must be refused").into()),
         }
     }
@@ -309,7 +317,8 @@ mod tests {
             rust = "String"
             typescript = "string"
             "#,
-            ),
+            )
+            .track(),
             "a `[[scalar]]` section",
         )?;
 
@@ -326,7 +335,8 @@ mod tests {
             rust_server = "a.rs"
             rust_serverr = "typo.rs"
             "#,
-            ),
+            )
+            .track(),
             "an unknown key",
         )?;
 

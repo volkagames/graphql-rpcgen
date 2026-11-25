@@ -165,19 +165,27 @@ fn emit_inputs(out: &mut String, api: &Api) {
     }
 }
 
-/// The path-to-schema table and the hook the generated client calls.
+/// The route-to-schema table and the hook the generated client calls.
 ///
-/// Keyed by path rather than by operation name because the path is what the
+/// Keyed by route rather than by operation name because the route is what the
 /// client has in hand at the call site, and the compiler already guarantees it
 /// is unique — two versions of one operation are two paths, so each gets the
-/// schema of its own version.
+/// schema of its own version. An RPC route is its path, every one of them
+/// `POST`; an `@http` route is its method and its path, since two of them may
+/// share a path under different methods and take different inputs.
 fn emit_registry(out: &mut String, api: &Api) {
-    out.push_str("\n/** Input schema for every operation that takes one, keyed by RPC path. */\n");
+    out.push_str(
+        "\n/** Input schema for every operation that takes one, keyed by its route: the RPC path, or `METHOD path` for an `@http` operation. */\n",
+    );
     out.push_str("export const inputSchemas: Record<string, z.ZodType> = {\n");
     for service in &api.services {
         for op in &service.operations {
             let Some(input) = &op.input else { continue };
-            let _ = writeln!(out, "  '{}': {},", op.path, schema_name(input.base_name()));
+            let route = match op.http {
+                Some(_) => format!("{} {}", op.client_method(), op.path),
+                None => op.path.clone(),
+            };
+            let _ = writeln!(out, "  '{route}': {},", schema_name(input.base_name()));
         }
     }
     out.push_str("}\n");
@@ -195,8 +203,8 @@ fn emit_registry(out: &mut String, api: &Api) {
  *
  * An operation taking no input has no schema and nothing to check.
  */
-export function validateInput(path: string, input: unknown): void {
-  inputSchemas[path]?.parse(input)
+export function validateInput(route: string, input: unknown): void {
+  inputSchemas[route]?.parse(input)
 }
 "#,
     );

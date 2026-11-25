@@ -37,10 +37,18 @@ impl {{{client_name}}} {
 
         let mut url_path = path.to_string();
         for name in path_fields {
-            let segment = match fields.remove(*name) {
-                Some(value) => urlencode(&scalar_param(value)).replace('+', "%20"),
+            let value = match fields.remove(*name) {
+                Some(value) => scalar_param(value),
                 None => return Err(ClientError::Decode(format!("path parameter `{name}` is missing"))),
             };
+            // URL parsing removes a `.` or `..` segment, escaped or not, so the
+            // request would reach another route; an empty one reaches none.
+            if matches!(value.as_str(), "" | "." | "..") {
+                return Err(ClientError::Decode(format!(
+                    "path parameter `{name}` cannot be `{value}`: no URL carries it as a segment"
+                )));
+            }
+            let segment = urlencode(&value).replace('+', "%20");
             let placeholder = ["{", name, "}"].concat();
             url_path = url_path.replace(&placeholder, &segment);
         }

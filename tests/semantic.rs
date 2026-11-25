@@ -1,5 +1,10 @@
 //! Semantic validation: every rule from the spec gets a positive or negative case.
 
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1680,6 +1685,120 @@ type S @service @mcp {
     Ok(())
 }
 
+/// Bytes on an `@http` operation are refused once, without the advice to add
+/// `@raw`, which `@http` refuses in turn.
+#[test]
+fn http_binary_fields_are_refused_without_raw_advice() -> TestResult {
+    let e = expect_error(
+        r#"
+scalar Binary @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+input I { file: Binary! }
+type R { id: String! }
+type S @service {
+  up(input: I!): R! @mutation @http(method: POST, path: "/u")
+}
+"#,
+    )?;
+    assert!(e.contains("which only a @raw operation carries"), "{e}");
+    assert!(!e.contains("must declare @raw"), "{e}");
+
+    let e = expect_error(
+        r#"
+scalar Binary @scalar(rust: "Vec<u8>", typescript: "Blob", openapiType: "string", openapiFormat: "binary")
+input I { id: String! }
+type S @service {
+  down(input: I!): Binary! @query @http(method: GET, path: "/d")
+}
+"#,
+    )?;
+    assert!(e.contains("@http does not combine with @raw"), "{e}");
+    assert!(!e.contains("must declare @raw"), "{e}");
+    Ok(())
+}
+
+/// A route no client reaches as mounted is refused: URL parsing drops `.` and
+/// `..`, and `//` is no route a caller writes. A trailing slash is a route.
+/// A quoted method or an unquoted path is named as what it is, not as absent.
+#[test]
+fn http_paths_and_arguments_are_spelled_as_written() -> TestResult {
+    for path in ["/a/../b", "/a/./b", "/a//b", "/.."] {
+        let e = expect_error(&format!(
+            r#"
+input I {{ id: String! }}
+type R {{ id: String! }}
+type S @service {{
+  get(input: I!): R! @query @http(method: GET, path: "{path}")
+}}
+"#
+        ))?;
+        assert!(e.contains("must start with `/`"), "{path}: {e}");
+    }
+    compile(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/a/")
+  root(input: I!): R! @query @http(method: GET, path: "/")
+}
+"#,
+    )?;
+
+    let e = expect_error(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: "GET", path: "/a")
+}
+"#,
+    )?;
+    assert!(e.contains("written unquoted"), "{e}");
+    let e = expect_error(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: a)
+}
+"#,
+    )?;
+    assert!(e.contains("must be a string"), "{e}");
+    Ok(())
+}
+
+/// A value read as JSON text has no segment spelling a client writes.
+#[test]
+fn http_path_parameters_have_a_text_form() -> TestResult {
+    let e = expect_error(
+        r#"
+input I { key: JSON! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/x/{key}")
+}
+"#,
+    )?;
+    assert!(e.contains("with a text form"), "{e}");
+    Ok(())
+}
+
+/// A path parameter is the field's wire name, which is lower snake_case.
+#[test]
+fn http_path_parameters_are_wire_names() -> TestResult {
+    let e = expect_error(
+        r#"
+input I { userId: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/u/{userId}")
+}
+"#,
+    )?;
+    assert!(e.contains("lower snake_case"), "{e}");
+    Ok(())
+}
+
 #[test]
 fn http_path_parameters_need_an_input() -> TestResult {
     let e = expect_error(
@@ -1727,6 +1846,82 @@ type S @service {{
         ))?;
         assert!(e.contains("duplicate RPC path"), "{second}: {e}");
     }
+    Ok(())
+}
+
+/// `@http` names the URL clients already call: a service's `@version` passes
+/// it by, and one of its own is refused rather than moving it.
+#[test]
+fn http_paths_take_no_version_prefix() -> TestResult {
+    let api = compile(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service @version(n: 2) {
+  get(input: I!): R! @query @http(method: GET, path: "/api/r/{id}")
+  rpc(input: I!): R! @query
+}
+"#,
+    )?;
+    let ops = &api.services.first().ok_or("one service")?.operations;
+    let path = |name: &str| {
+        ops.iter()
+            .find(|op| op.name == name)
+            .map(|op| op.path.as_str())
+    };
+    assert_eq!(path("get"), Some("/api/r/{id}"));
+    assert_eq!(path("rpc"), Some("/v2/rpc/s/rpc"));
+
+    let e = expect_error(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/api/r/{id}") @version(n: 2)
+}
+"#,
+    )?;
+    assert!(e.contains("write the version into @http(path:)"), "{e}");
+    Ok(())
+}
+
+/// The router keeps one name per parameter position, whatever the method and
+/// whatever follows: two names there are a startup panic, so they are an
+/// error here. A static segment beside a parameter is not.
+#[test]
+fn http_path_parameters_keep_one_name_per_position() -> TestResult {
+    for (first, second) in [
+        ("/r/{id}", "/r/{item_id}"),
+        ("/r/{id}/a", "/r/{item_id}/b"),
+        ("/r/{id}", "/r/{item_id}/b"),
+    ] {
+        let e = expect_error(&format!(
+            r#"
+input I {{ id: String! item_id: String! }}
+type R {{ id: String! }}
+type S @service {{
+  get(input: I!): R! @query @http(method: GET, path: "{first}")
+  drop(input: I!): R! @mutation @http(method: DELETE, path: "{second}")
+}}
+"#
+        ))?;
+        assert!(
+            e.contains("one route cannot name it twice"),
+            "{first} / {second}: {e}"
+        );
+    }
+
+    compile(
+        r#"
+input I { id: String! }
+type R { id: String! }
+type S @service {
+  get(input: I!): R! @query @http(method: GET, path: "/r/{id}")
+  sub(input: I!): R! @query @http(method: GET, path: "/r/{id}/sub")
+  fixed: R! @query @http(method: GET, path: "/r/new")
+}
+"#,
+    )?;
     Ok(())
 }
 

@@ -204,13 +204,11 @@ top of that, which a plain JSON API never compiles:
 
 | Target | Additional crates |
 | --- | --- |
-| `rust_server` | `futures-core`, `futures-util`, `form_urlencoded` |
+| `rust_server` | `futures-core`, `futures-util` |
 | `rust_client` | `futures-core`, `futures-util`, `bytes`, and the **`stream` feature** on `reqwest` |
 
-`form_urlencoded` and the `stream` feature are easy to miss because nothing
-needs them until the first `@raw` or `@subscription` operation: the runtime
-reads a raw request's parameters out of the query string, its one body having
-been spent on the payload, and the client reads a raw response back as a byte
+The `stream` feature is easy to miss because nothing needs it until the first
+`@raw` or `@subscription` operation: the client reads a raw response back as a byte
 stream.
 
 A `@raw(request:, stream: true)` operation adds one more to `rust_server`: the
@@ -290,16 +288,27 @@ or the body: it is what the route matched. A failure is the envelope whatever
 so a caller reads failures one way. An input the generated runtime cannot read
 answers `400` — and a body it cannot read at all the status of that refusal,
 `413` for one past the body limit — rather than the `200` the envelope uses
-elsewhere: a caller of a route fixed elsewhere reads the status line. `ANY` reads the same input for every method
+elsewhere: a caller of a route fixed elsewhere reads the status line. For the
+same reason a refused session answers `401` and a denied role or permission
+`403` — when the context left its refusal at `200`, so a `from_parts` failing
+for a reason not the caller's (an unreachable session store) gives it its own
+status, `503` say, or the caller reads it as a sign-out — and with `envelope: false` a service failure left at `200` answers
+`500`, since a bare success is told from a failure by its status alone. `ANY` reads the same input for every method
 — a `GET` simply has no body — and clients send it as `GET`, or as `POST` with
 `body: FORM`; OpenAPI describes it under that method with `x-rpc-any-method`.
 Two operations may share a path under different methods; `ANY` shares it with
-none.
+none. Paths that put a parameter in the same position name it the same, since
+the router keeps one name per position. The zod `inputSchemas` key an `@http`
+operation by `METHOD path`.
 
 An existing format often writes every key, an absent value as `null`, where
 this generator leaves the key out; `@explicitNulls` on an output type keeps
 that: Rust drops `skip_serializing_if`, TypeScript makes the key required with
 a `| null` value, and OpenAPI lists every field as required.
+
+A service's `@version` does not prefix an `@http` path, which is the URL
+clients already call, and `@version` on the operation itself is refused: a
+version belongs in the path `@http` spells out.
 
 `@http` does not combine with `@rpc` (both name the route), `@raw` or
 `@subscription` (both already decide how the operation sits on HTTP), or `@mcp`
@@ -1178,7 +1187,7 @@ pub mod operations {
 
     pub struct Operation {
         pub id: &'static str,       // the operationId
-        pub method: &'static str,   // "GET" or "POST"
+        pub method: &'static str,   // "POST", or an `@http` operation's method
         pub path: &'static str,     // as mounted, `@version` prefix included
         pub kind: Kind,
         pub auth: Auth,             // `@auth(require:)`, inherited or not
@@ -1186,7 +1195,7 @@ pub mod operations {
         pub scope: Option<super::TokenScope>,       // with @scopes
     }
 
-    pub const ALL: &[Operation] = &[ /* sorted by path */ ];
+    pub const ALL: &[Operation] = &[ /* sorted by path, then method */ ];
     pub fn by_route(method: &str, path: &str) -> Option<&'static Operation>;
     pub fn by_id(id: &str) -> Option<&'static Operation>;
 }
@@ -1202,9 +1211,13 @@ Both lookups answer `None` for what the API lacks, so a caller refusing on
 operation that needs nothing. `by_route` matches the method as spelled: a
 router may answer `HEAD` on a `GET` route — axum's `get()` does — but the table
 has no `HEAD` row, so a gate refusing on `None` refuses it rather than reading it
-as the `GET`. `by_route` is a binary search over `ALL`, which no two operations
-share a path of; `by_id` a scan. The table checks nothing by itself: a caller
-that skips it runs unchecked.
+as the `GET`. `path` is the request's (`/api/user/u1`) or the route's
+(`/api/user/{user_id}`, as axum's `MatchedPath` gives it): a `{name}` segment
+takes any one segment, and the route is picked as the router picks it, a fixed
+segment before a parameter, before the method is matched. A path some row
+spells exactly is a binary search over `ALL`; only one no row spells scans the
+rows with a parameter. `by_id` is a scan. The table checks nothing by itself: a caller that skips it runs
+unchecked.
 
 ### `@mcp`
 
@@ -1502,14 +1515,15 @@ just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 
 `oneof_wire` and `raw_wire` build generated code against the versions in this
 repo's `Cargo.lock`, offline. Those crates (`treat`, `axum`, `reqwest`,
-`form_urlencoded`, …) are dev-dependencies here for exactly that reason: the
+`futures-util`, …) are dev-dependencies here for exactly that reason: the
 generator itself needs none of them, but the lockfile has to carry them for the
 tests to resolve a version without reaching the network.
 
 That is also what keeps the dependency table above honest. A crate the emitted
 code reaches for is easy to leave undocumented, because nothing notices until a
-consumer writes their first `@raw` operation — `form_urlencoded` and `reqwest`'s
-`stream` feature were both exactly that. Dropping either from `raw_wire`'s
+consumer writes their first `@raw` operation — `reqwest`'s `stream` feature was
+exactly that, and so was the URL decoding crate the runtime used before it
+decoded query strings itself. Dropping the feature from `raw_wire`'s
 dependency set now fails the test with the same error the consumer would have
 seen.
 

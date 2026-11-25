@@ -19,8 +19,9 @@ pub mod version;
 
 use std::path::{Path, PathBuf};
 
+use erris::prelude::*;
+
 use config::Config;
-use error::CompileError;
 use ir::Api;
 
 /// Default name of the settings file, looked up beside the SDL directory.
@@ -29,16 +30,16 @@ pub const CONFIG_FILE: &str = "rpcgen.toml";
 /// Parse and validate every `*.graphql` under `dir` into a single IR.
 ///
 /// Scalar mappings come from the SDL itself, so this needs no settings.
-pub fn compile(dir: &Path) -> Result<Api, CompileError> {
+pub fn compile(dir: &Path) -> erris::Result<Api> {
     let files = parser::parse_dir(dir)?;
     semantic::build(&files)
 }
 
 /// Compile SDL supplied as a string. Used by tests.
-pub fn compile_str(sdl: &str) -> Result<Api, CompileError> {
+pub fn compile_str(sdl: &str) -> erris::Result<Api> {
     let leaked: &'static str = Box::leak(sdl.to_string().into_boxed_str());
-    let document = graphql_parser::parse_schema::<String>(leaked)
-        .map_err(|e| CompileError::new(format!("failed to parse SDL: {e}")))?;
+    let document =
+        graphql_parser::parse_schema::<String>(leaked).wrap_report("failed to parse SDL")?;
     let files = vec![parser::SdlFile {
         path: std::path::PathBuf::from("<memory>"),
         document,
@@ -56,7 +57,7 @@ pub struct GeneratedFile {
 ///
 /// A target with no path in [`config::Output`] is skipped, so a project
 /// generating only a server or only a client gets exactly what it asked for.
-pub fn generate_all(api: &Api, config: &Config) -> Result<Vec<GeneratedFile>, CompileError> {
+pub fn generate_all(api: &Api, config: &Config) -> erris::Result<Vec<GeneratedFile>> {
     let mut files = Vec::new();
 
     if let Some(path) = &config.output.rust_types {

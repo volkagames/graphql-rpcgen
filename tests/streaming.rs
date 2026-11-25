@@ -4,6 +4,11 @@
 //! where the input is read from. These pin each of those, on both sides, since
 //! the server and the client have to agree about all three.
 
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;

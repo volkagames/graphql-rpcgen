@@ -4,6 +4,11 @@
 //! unions, oneOf, recursion, constraints) rather than whole-file byte equality,
 //! which would break on every cosmetic change.
 
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -245,7 +250,7 @@ fn rust_snapshot() -> TestResult {
 
     // A body that parses but breaks a rule is rejected before the trait is
     // called, as the registry code for a body that did not match the input.
-    assert!(out.contains("if let Err(violations) = validator::Validate::validate(&input) {"));
+    assert!(out.contains("let validation = validator::Validate::validate(&input);\n    if let Err(violations) = validation {"));
     assert!(out.contains("return invalid_input(&violations);"));
     assert!(out.contains("message.code = ErrorCode::invalid_body.to_string();"));
 
@@ -836,8 +841,8 @@ fn zod_snapshot() -> TestResult {
 
     // Keyed by path, which is what the client has at the call site.
     assert!(out.contains("'/rpc/things/get': CreateInputSchema,"));
-    assert!(out.contains("export function validateInput(path: string, input: unknown): void {"));
-    assert!(out.contains("inputSchemas[path]?.parse(input)"));
+    assert!(out.contains("export function validateInput(route: string, input: unknown): void {"));
+    assert!(out.contains("inputSchemas[route]?.parse(input)"));
     Ok(())
 }
 
@@ -847,6 +852,9 @@ const HTTP_SDL: &str = r#"
 enum ErrorCode { invalid_body internal_error not_found }
 input UserInput { user_id: String! }
 input InfoInput { session_id: String verbose: Boolean }
+input RenameInput { id: String! name: String! }
+input Filter { a: Int }
+input SearchInput { filters: [Filter!] one: Filter }
 type User { id: String! }
 type Info { session_id: String }
 type Users @service {
@@ -856,6 +864,14 @@ type Users @service {
     @query @http(method: ANY, path: "/api/info", body: FORM, envelope: false)
   drop(input: UserInput!): User!
     @mutation @http(method: DELETE, path: "/api/user/{user_id}")
+  rename(input: RenameInput!): User!
+    @mutation @http(method: PUT, path: "/items/{id}")
+  search(input: SearchInput!): User!
+    @query @http(method: GET, path: "/search")
+  find(input: SearchInput!): User!
+    @mutation @http(method: POST, path: "/find", body: FORM)
+  logout: User!
+    @mutation @http(method: POST, path: "/logout")
 }
 "#;
 
@@ -871,6 +887,23 @@ fn http_typescript_snapshot() -> TestResult {
         "client.http<User>('/api/user/{user_id}', input, { method: 'DELETE', pathFields: ['user_id'], body: 'none', envelope: true }, options)",
     ] {
         assert!(ts.contains(expected), "missing `{expected}` in:\n{ts}");
+    }
+    assert!(ts.contains("throw new TypeError(`path parameter \\`${name}\\` is missing`)"));
+    // An object in a list rides as JSON text, as the server reads it.
+    assert!(ts.contains("for (const item of value) params.append(key, queryParam(item))"));
+    assert!(
+        ts.contains("this.validate?.(`${spec.method} ${path}`, input ?? {})"),
+        "{ts}"
+    );
+
+    // Two operations on one path are two keys, the one the client passes.
+    let zod = generate_zod::generate(&api);
+    for expected in [
+        "'GET /api/user/{user_id}': UserInputSchema,",
+        "'DELETE /api/user/{user_id}': UserInputSchema,",
+        "'POST /api/info': InfoInputSchema,",
+    ] {
+        assert!(zod.contains(expected), "missing `{expected}` in:\n{zod}");
     }
     Ok(())
 }
@@ -916,6 +949,49 @@ fn http_openapi_snapshot() -> TestResult {
             .is_some(),
         "an enveloped success keeps the envelope: {drop}"
     );
+    assert!(
+        drop.pointer("/responses/default").is_some(),
+        "an enveloped @http failure the runtime builds has a status: {drop}"
+    );
+
+    // The path parameter is read from the path, so the body does not list it.
+    let rename = doc
+        .pointer("/paths/~1items~1{id}/put/requestBody/content/application~1json/schema")
+        .ok_or("PUT /items/{id} body")?;
+    assert_eq!(
+        rename.pointer("/required"),
+        Some(&serde_json::json!(["name"])),
+        "{rename}"
+    );
+    assert!(rename.pointer("/properties/id").is_none(), "{rename}");
+
+    // An object read as JSON text is described as a string holding JSON, in
+    // the query string and in a form, one per item of a list.
+    let search = doc
+        .pointer("/paths/~1search/get/parameters")
+        .ok_or("GET /search parameters")?;
+    assert_eq!(
+        search.pointer("/0/schema/items/contentMediaType"),
+        Some(&serde_json::json!("application/json")),
+        "{search}"
+    );
+    assert_eq!(
+        search.pointer("/1/schema/contentMediaType"),
+        Some(&serde_json::json!("application/json")),
+        "{search}"
+    );
+    let find = doc
+        .pointer("/paths/~1find/post/requestBody/content/application~1x-www-form-urlencoded/schema/properties/one")
+        .ok_or("POST /find form field")?;
+    assert_eq!(
+        find.get("type"),
+        Some(&serde_json::json!("string")),
+        "{find}"
+    );
+
+    // No input, no body: the handler reads none.
+    let logout = doc.pointer("/paths/~1logout/post").ok_or("POST /logout")?;
+    assert!(logout.get("requestBody").is_none(), "{logout}");
 
     let info = doc
         .pointer("/paths/~1api~1info/post")

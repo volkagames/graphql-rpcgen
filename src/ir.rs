@@ -707,6 +707,24 @@ impl Api {
             })
     }
 
+    /// Whether a value of the named type travels in a URL or a form body as JSON
+    /// text rather than as a text form of its own.
+    ///
+    /// A scalar with an OpenAPI type of string, integer, number or boolean, and
+    /// an enum, have one; an object, and the unconstrained `JSON` scalar that
+    /// declares no type, do not. Every target asks this one question, so the
+    /// server's decoding and what the clients and OpenAPI describe stay one.
+    pub fn is_json_text(&self, name: &str) -> bool {
+        match self.find_type(name) {
+            Some(ApiType::Enum(_)) => false,
+            Some(ApiType::Scalar(s)) => !matches!(
+                s.openapi_type.as_str(),
+                "string" | "integer" | "number" | "boolean"
+            ),
+            _ => true,
+        }
+    }
+
     /// Whether the named type is a binary scalar. See [`ScalarType::is_binary`].
     pub fn is_binary(&self, name: &str) -> bool {
         self.find_scalar(name).is_some_and(ScalarType::is_binary)

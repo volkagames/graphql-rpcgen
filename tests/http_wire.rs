@@ -9,6 +9,11 @@
 //! both hand-written requests (the format) and the generated client's (the two
 //! sides agreeing).
 
+#![allow(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and returns `Result` only to use `?` on its setup"
+)]
+
 /// What a test body answers with: the first failure ends it, carrying the
 /// message of whatever actually went wrong rather than a fixed one.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -28,7 +33,10 @@ enum ErrorCode {
   not_found
   "Declared by no operation, so every generated set keeps a reachable fallback."
   database_error
+  role_required
 }
+
+enum Role @roles { admin }
 
 input UserInput { user_id: String! }
 input FindInput { email: String! limit: Int }
@@ -72,6 +80,18 @@ type Users @service {
   drop(input: UserInput!): Me!
     @mutation
     @http(method: DELETE, path: "/api/user/{user_id}", envelope: false)
+
+  "A fixed segment where `user` has its parameter: the router tries it first."
+  blank: Me!
+    @query
+    @http(method: GET, path: "/api/user/new", envelope: false)
+
+  "A session and a role, answered bare: both refusals need a status."
+  whoami: Me!
+    @query
+    @http(method: GET, path: "/api/whoami", envelope: false)
+    @auth(require: session, role: admin)
+    @throws(codes: ["role_required"])
 }
 "#;
 
@@ -81,14 +101,48 @@ const DRIVER: &str = r##"
 #[derive(Clone)]
 pub struct Users;
 
+/// The caller named by `x-user`. Both refusals are the envelope under `200`,
+/// as an RPC project writes them: the `@http` handler is what gives them a
+/// status.
+pub struct Caller(String);
+
+fn refusal(code: &str) -> axum::response::Response {
+    axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+        "errors": [{ "code": code, "message": code }]
+    })))
+}
+
+impl server::FromRequestContext for Caller {
+    async fn from_parts(
+        parts: &mut axum::http::request::Parts,
+    ) -> Result<Self, axum::response::Response> {
+        match parts.headers.get("x-user").and_then(|v| v.to_str().ok()) {
+            Some(user) => Ok(Caller(user.to_string())),
+            None => Err(refusal("unauthenticated")),
+        }
+    }
+
+    fn require_role(&self, _role: server::Role) -> Result<(), axum::response::Response> {
+        match self.0.as_str() {
+            "admin" => Ok(()),
+            _ => Err(refusal("forbidden")),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl server::UsersService for Users {
+    type Ctx = Caller;
+
     async fn user(
         &self,
         input: server::UserInput,
     ) -> Result<server::User, server::ApiError<server::UsersUserCodes>> {
         if input.user_id == "missing" {
             return Err(server::error(server::UsersUserCodes::NotFound).with_status(404));
+        }
+        if input.user_id == "unstated" {
+            return Err(server::error(server::UsersUserCodes::NotFound));
         }
         Ok(server::User {
             email: format!("{}@example.com", input.user_id),
@@ -142,6 +196,21 @@ impl server::UsersService for Users {
             user_id: input.user_id,
         })
     }
+
+    async fn blank(&self) -> Result<server::Me, server::ApiError<server::UsersBlankCodes>> {
+        Ok(server::Me {
+            user_id: "new".to_string(),
+        })
+    }
+
+    async fn whoami(
+        &self,
+        ctx: &Caller,
+    ) -> Result<server::Me, server::ApiError<server::UsersWhoamiCodes>> {
+        Ok(server::Me {
+            user_id: ctx.0.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +247,16 @@ mod wire {
             .user(&crate::types::UserInput { user_id: "a b/c".to_string() })
             .await?;
         assert_eq!(user.id, "a b/c");
+
+        // A dot segment would be dropped from the URL, an empty one leaves no
+        // route: the client refuses them rather than calling another endpoint.
+        for user_id in ["..", ".", ""] {
+            let call = client(&base)
+                .users()
+                .user(&crate::types::UserInput { user_id: user_id.to_string() })
+                .await;
+            assert!(matches!(call, Err(crate::client::ClientError::Decode(_))), "{user_id:?}: {call:?}");
+        }
         Ok(())
     }
 
@@ -200,6 +279,41 @@ mod wire {
             }
             other => return Err(format!("expected the not_found envelope, got {other:?}").into()),
         }
+
+        // Left at `200`, a bare operation's failure would read as its success.
+        let response = reqwest::get(format!("{base}/api/user/unstated")).await?;
+        assert_eq!(response.status(), 500);
+        let call = client(&base)
+            .users()
+            .user(&crate::types::UserInput { user_id: "unstated".to_string() })
+            .await;
+        match call {
+            Err(crate::client::ClientError::Api(errors)) => {
+                assert!(errors.is(crate::types::UsersUserCodes::NotFound));
+            }
+            other => return Err(format!("expected the not_found envelope, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    /// A refused session answers `401` and a denied role `403`, though the
+    /// context wrote both under `200`; an admitted caller is answered bare.
+    #[tokio::test]
+    async fn session_and_role_refusals_carry_a_status() -> TestResult {
+        let base = serve().await?;
+        let http = reqwest::Client::new();
+        let anonymous = http.get(format!("{base}/api/whoami")).send().await?;
+        assert_eq!(anonymous.status(), 401);
+        let json: serde_json::Value = anonymous.json().await?;
+        assert_eq!(json.pointer("/errors/0/code"), Some(&serde_json::json!("unauthenticated")), "{json}");
+
+        let denied = http.get(format!("{base}/api/whoami")).header("x-user", "guest").send().await?;
+        assert_eq!(denied.status(), 403);
+
+        let admitted = http.get(format!("{base}/api/whoami")).header("x-user", "admin").send().await?;
+        assert_eq!(admitted.status(), 200);
+        let json: serde_json::Value = admitted.json().await?;
+        assert_eq!(json, serde_json::json!({ "user_id": "admin" }));
         Ok(())
     }
 
@@ -243,6 +357,39 @@ mod wire {
             .json()
             .await?;
         assert_eq!(form, serde_json::json!({ "session_id": "f", "verbose": true }), "the body wins per field");
+
+        // A media type is case-insensitive.
+        let cased: serde_json::Value = http
+            .post(format!("{base}/api/info?session_id=q"))
+            .header("content-type", "Application/X-WWW-Form-Urlencoded; charset=UTF-8")
+            .body("session_id=c")
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(cased, serde_json::json!({ "session_id": "c", "verbose": false }));
+
+        // A byte that is not UTF-8, raw or escaped, is refused rather than
+        // replaced: the service would read a value nobody sent.
+        for body in [b"session_id=Jos\xe9".to_vec(), b"session_id=Jos%E9".to_vec()] {
+            let latin1 = http
+                .post(format!("{base}/api/info"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await?;
+            assert_eq!(latin1.status(), 400);
+        }
+        // `+` is a space, `%XX` a byte, and a `%` without hex digits itself.
+        let decoded: serde_json::Value = http
+            .post(format!("{base}/api/info"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body("session_id=a+b%2Bc%zz%C3%A9%")
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(decoded, serde_json::json!({ "session_id": "a b+c%zz\u{e9}%", "verbose": false }));
 
         let json_body: serde_json::Value = http
             .post(format!("{base}/api/info?session_id=q"))
@@ -339,6 +486,22 @@ mod wire {
         assert_eq!(id("DELETE", "/api/user/{user_id}"), Some("users_drop"));
         assert_eq!(id("POST", "/api/user/{user_id}"), None);
         assert_eq!(id("PATCH", "/api/info"), Some("users_info"), "ANY answers every method");
+        // The request's own path, as a gate reads it off the URI.
+        assert_eq!(id("GET", "/api/user/u1"), Some("users_user"));
+        assert_eq!(id("DELETE", "/api/user/u1"), Some("users_drop"));
+        assert_eq!(id("POST", "/api/user/u1"), None);
+        assert_eq!(id("GET", "/api/user/"), None, "a parameter takes a non-empty segment");
+        assert_eq!(id("GET", "/api/user/a/b"), None, "and one segment only");
+        assert_eq!(id("GET", "/api/whoami"), Some("users_whoami"));
+
+        // A fixed segment wins over a parameter, in the router and in the table,
+        // and a method the fixed route lacks is not handed to the parameter's.
+        assert_eq!(id("GET", "/api/user/new"), Some("users_blank"));
+        assert_eq!(id("DELETE", "/api/user/new"), None);
+        let fixed: serde_json::Value = reqwest::get(format!("{base}/api/user/new")).await?.json().await?;
+        assert_eq!(fixed, serde_json::json!({ "user_id": "new" }));
+        let other = reqwest::Client::new().delete(format!("{base}/api/user/new")).send().await?;
+        assert_eq!(other.status(), 405, "the router does not fall back to the parameter's route either");
         Ok(())
     }
 }
@@ -357,16 +520,15 @@ fn generated() -> TestResult<(String, String, String)> {
     ))
 }
 
-/// What the generated code reaches for. `form_urlencoded` is the `@http`
-/// runtime's: it decodes query strings and form bodies. No `futures-*` and no
-/// `reqwest` `stream` feature: an `@http` API compiles neither.
+/// What the generated code reaches for. Query strings and form bodies are
+/// decoded by the runtime itself, so no URL crate; no `futures-*` and no
+/// `reqwest` `stream` feature either: an `@http` API compiles neither.
 const DEPENDENCIES: &[&str] = &[
     "async-trait",
     "axum",
     "chrono",
     "derive_more",
     "error_set",
-    "form_urlencoded",
     "regex",
     "reqwest",
     "serde",

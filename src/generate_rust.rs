@@ -36,7 +36,6 @@
 use std::fmt::Write;
 
 use crate::config::Config;
-use crate::error::CompileError;
 use crate::ir::*;
 use crate::naming::{codes_type_name, pascal_case, snake_case};
 use crate::template::{Template, Vars};
@@ -103,7 +102,7 @@ const PREAMBLE_VARS: [&str; 3] = ["error_code_enum", "invalid_body_code", "types
 ///
 /// The no-input form sees the same set; `input` is simply empty there, so a
 /// project overriding one template can use the same variable names in both.
-const HANDLER_VARS: [&str; 14] = [
+const HANDLER_VARS: [&str; 15] = [
     "handler",
     "trait_name",
     "input",
@@ -121,13 +120,15 @@ const HANDLER_VARS: [&str; 14] = [
     "context_arg",
     // An `@http` operation's path parameters as a `[&str; N]` literal, the
     // `HttpBodyKind` variant its other fields are read with, and the
-    // expression turning the service's success into the response. Empty for
-    // every other form.
+    // expressions turning the service's success and its failure into the
+    // response. Empty for every other form.
     "path_fields",
     "http_body",
     "respond",
+    "fail",
     // The access gate — a role or a permission — run before the service is
-    // called so a denial never reaches the method.
+    // called so a denial never reaches the method. For an `@http` operation it
+    // also unwraps the session, whose refusal it gives a status.
     "access_guard",
 ];
 /// Variables the runtime template may reference, besides `template_vars`.
@@ -184,7 +185,7 @@ impl Templates {
     ///
     /// `default_preamble` differs per target: the single-file layout keeps the
     /// original combined preamble, while a split server imports its types.
-    fn load(config: &Config, default_preamble: &str) -> Result<Self, CompileError> {
+    fn load(config: &Config, default_preamble: &str) -> erris::Result<Self> {
         let extra_names: Vec<&str> = config
             .rust
             .template_vars
@@ -196,7 +197,7 @@ impl Templates {
                        origin: &str,
                        path: &Option<std::path::PathBuf>,
                        base: &[&str]|
-         -> Result<Template, CompileError> {
+         -> erris::Result<Template> {
             let mut allowed: Vec<&str> = base.to_vec();
             allowed.extend_from_slice(&extra_names);
             match path {
@@ -329,7 +330,7 @@ impl Templates {
 ///
 /// With no `types_path` configured this is the whole API in one file, which is
 /// the layout a project gets before it splits anything.
-pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
+pub fn generate(api: &Api, config: &Config) -> erris::Result<String> {
     let split = config.rust.types_path.is_some();
     let default_preamble = if split {
         DEFAULT_SERVER_PREAMBLE
@@ -417,7 +418,7 @@ pub fn generate(api: &Api, config: &Config) -> Result<String, CompileError> {
 }
 
 /// Wire types alone: no service traits, no transport, no web framework.
-pub fn generate_types(api: &Api, config: &Config) -> Result<String, CompileError> {
+pub fn generate_types(api: &Api, config: &Config) -> erris::Result<String> {
     let templates = Templates::load(config, DEFAULT_TYPES_PREAMBLE)?;
 
     let mut out = String::new();
@@ -732,9 +733,11 @@ fn emit_operations_module(out: &mut String, api: &Api) {
          pub struct Operation {\n        \
          /// The OpenAPI `operationId`.\n        \
          pub id: &'static str,\n        \
-         /// `GET` or `POST`, upper-case as HTTP spells it.\n        \
+         /// `POST`, or an `@http` operation's `GET`, `PUT`, `PATCH`, `DELETE` or\n        \
+         /// `ANY`, upper-case as HTTP spells it. `ANY` answers every method.\n        \
          pub method: &'static str,\n        \
-         /// The path the router mounts, `@version` prefix included.\n        \
+         /// The path the router mounts, `@version` prefix included; an `@http`\n        \
+         /// path as the SDL writes it, `{name}` segments and all.\n        \
          pub path: &'static str,\n        \
          /// `@query`, `@mutation` or `@subscription`.\n        \
          pub kind: Kind,\n        \
@@ -827,12 +830,56 @@ fn emit_operations_module(out: &mut String, api: &Api) {
          /// matched as spelled: `HEAD`, which a router may answer for a `GET` route,\n    \
          /// is no row, and is refused rather than read as the `GET`. An `ANY` row\n    \
          /// answers every method, as its route does.\n    \
+         ///\n    \
+         /// `path` is the request's (`/api/user/u1`) or the route's (`/api/user/{user_id}`,\n    \
+         /// a router's matched path): a `{name}` segment of a row takes any one segment.\n    \
+         /// The route is chosen as the router chooses it, a fixed segment before a\n    \
+         /// parameter, and only then the method: a method the chosen route lacks is\n    \
+         /// `None`, as the router answers it `405`, even where another route would fit.\n    \
+         ///\n    \
+         /// A path some row spells exactly — every segment fixed, or a route's own\n    \
+         /// template — is a binary search; only a path no row spells scans the rows\n    \
+         /// with a parameter.\n    \
          pub fn by_route(method: &str, path: &str) -> Option<&'static Operation> {\n        \
-         let start = ALL.partition_point(|op| op.path < path);\n        \
-         ALL.get(start..)?\n            \
+         let mut route = rows_at(path).first().map(|op| op.path);\n        \
+         if route.is_none() {\n            \
+         for op in ALL.iter().filter(|op| op.path.contains('{')) {\n                \
+         let closer = match route {\n                    \
+         Some(chosen) => more_fixed(op.path, chosen),\n                    \
+         None => true,\n                \
+         };\n                \
+         if closer && fits(op.path, path) {\n                    \
+         route = Some(op.path);\n                \
+         }\n            \
+         }\n        \
+         }\n        \
+         rows_at(route?)\n            \
          .iter()\n            \
-         .take_while(|op| op.path == path)\n            \
          .find(|op| op.method == method || op.method == \"ANY\")\n    }\n\n    \
+         /// The rows mounted at exactly `path`, one per method: `ALL` is sorted by path.\n    \
+         fn rows_at(path: &str) -> &'static [Operation] {\n        \
+         let start = ALL.partition_point(|op| op.path < path);\n        \
+         let rows = ALL.get(start..).unwrap_or_default();\n        \
+         let len = rows.partition_point(|op| op.path == path);\n        \
+         rows.get(..len).unwrap_or_default()\n    }\n\n    \
+         /// Whether `path` is a path the route `route` matches.\n    \
+         fn fits(route: &str, path: &str) -> bool {\n        \
+         route.split('/').count() == path.split('/').count()\n            \
+         && route\n                \
+         .split('/')\n                \
+         .zip(path.split('/'))\n                \
+         .all(|(want, got)| want == got || (want.starts_with('{') && !got.is_empty()))\n    }\n\n    \
+         /// Whether the route `a` has a fixed segment where `b` has its first\n    \
+         /// parameter the two do not share: what the router tries first.\n    \
+         fn more_fixed(a: &str, b: &str) -> bool {\n        \
+         for (x, y) in a.split('/').zip(b.split('/')) {\n            \
+         match (x.starts_with('{'), y.starts_with('{')) {\n                \
+         (false, true) => return true,\n                \
+         (true, false) => return false,\n                \
+         _ => {}\n            \
+         }\n        \
+         }\n        \
+         false\n    }\n\n    \
          /// The operation whose `operationId` is `id`; `None` for an id the API lacks,\n    \
          /// so a misspelt one never reads as an operation that needs nothing.\n    \
          pub fn by_id(id: &str) -> Option<&'static Operation> {\n        \
@@ -1403,7 +1450,7 @@ fn emit_service(
     api: &Api,
     service: &Service,
     templates: &Templates,
-) -> Result<(), CompileError> {
+) -> erris::Result<()> {
     let trait_name = format!("{}Service", service.name);
     let module = snake_case(&service.name);
 
@@ -1536,6 +1583,17 @@ fn emit_service(
                     false => "axum::Json(response).into_response()",
                 },
             ),
+            (
+                "fail",
+                // A bare success is told from a failure by its status alone,
+                // so a failure the service left at `200` cannot stay there.
+                match op.enveloped() {
+                    true => "error.into_response()",
+                    false => {
+                        "http_status(error.into_response(), axum::http::StatusCode::INTERNAL_SERVER_ERROR)"
+                    }
+                },
+            ),
             ("access_guard", &access_guard(api, op)?),
         ]))?);
     }
@@ -1603,11 +1661,15 @@ fn context_param(op: &Operation) -> String {
 /// Names the context through the service trait rather than directly, so the
 /// handler stays generic over `S` and the concrete type is the implementation's
 /// business.
+///
+/// An `@http` handler takes the extraction's `Result` rather than letting axum
+/// answer the refusal: [`access_guard`] unwraps it and gives the refusal a
+/// status, which a caller of a route fixed elsewhere reads.
 fn context_extractor(op: &Operation) -> String {
-    if op.auth.has_context() {
-        "Ctx(ctx): Ctx<S::Ctx>,\n    ".to_string()
-    } else {
-        String::new()
+    match (op.auth.has_context(), op.http.is_some()) {
+        (true, true) => "ctx: Result<Ctx<S::Ctx>, Response>,\n    ".to_string(),
+        (true, false) => "Ctx(ctx): Ctx<S::Ctx>,\n    ".to_string(),
+        (false, _) => String::new(),
     }
 }
 
@@ -1626,15 +1688,27 @@ fn context_extractor(op: &Operation) -> String {
 /// the set naming it — is an error rather than a handler without the check:
 /// `generate` is public, and an `Api` built or changed by hand reaches it
 /// without the compiler's checks.
-fn access_guard(api: &Api, op: &Operation) -> Result<String, CompileError> {
+///
+/// An `@http` handler's gate starts by unwrapping the session
+/// [`context_extractor`] left as a `Result`, and both refusals keep the status
+/// they carry unless it is `200`: `401` for no session, `403` for no access.
+/// The envelope's `200` is for RPC callers, who read `errors[]`; a bare
+/// `@http` success is told from a failure by its status line alone.
+fn access_guard(api: &Api, op: &Operation) -> erris::Result<String> {
+    let http = op.http.is_some();
+    let session = match http && op.auth.has_context() {
+        true => "    let ctx = match ctx {\n        Ok(Ctx(ctx)) => ctx,\n        \
+                 Err(response) => return http_status(response, axum::http::StatusCode::UNAUTHORIZED),\n    };\n",
+        false => "",
+    };
     let Some(access) = &op.access else {
-        return Ok(String::new());
+        return Ok(session.to_string());
     };
     let unchecked = |why: &str| {
-        CompileError::new(format!(
+        erris::report!(
             "`{}`: @auth demands a check, but {why}; the handler would run without it",
             op.operation_id
-        ))
+        )
     };
     if !op.auth.has_context() {
         return Err(unchecked("the operation has no session to check it on"));
@@ -1661,8 +1735,12 @@ fn access_guard(api: &Api, op: &Operation) -> Result<String, CompileError> {
             )
         }
     };
+    let refusal = match http {
+        true => "http_status(response, axum::http::StatusCode::FORBIDDEN)",
+        false => "response",
+    };
     Ok(format!(
-        "    let access = {check};\n    if let Err(response) = access {{\n        return response;\n    }}\n"
+        "{session}    let access = {check};\n    if let Err(response) = access {{\n        return {refusal};\n    }}\n"
     ))
 }
 
@@ -1751,10 +1829,6 @@ fn handler_template<'a>(templates: &'a Templates, op: &Operation) -> &'a Templat
     }
 }
 
-/// The `[QueryField; N]` literal a handler decodes its query string against.
-///
-/// Only the operations that read their input from the URL render it; for the
-/// rest it is an unused variable in a template that never mentions it.
 /// An `@http` operation's path parameters as a `[&str; N]` literal; `[]` for
 /// every other operation, which no template reading it renders.
 fn path_fields_literal(op: &Operation) -> String {
@@ -1767,6 +1841,10 @@ fn path_fields_literal(op: &Operation) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
+/// The `[QueryField; N]` literal a handler decodes its query string against.
+///
+/// Only the operations that read their input from the URL render it; for the
+/// rest it is an unused variable in a template that never mentions it.
 fn query_fields_literal(api: &Api, op: &Operation) -> String {
     let fields = api.query_fields(op);
     if fields.is_empty() {
@@ -1792,20 +1870,21 @@ fn query_fields_literal(api: &Api, op: &Operation) -> String {
 /// number 2 for an `Int!` field and the string `"2"` for a `String!` one, and
 /// only the schema knows which was meant.
 fn query_kind(api: &Api, f: &Field) -> &'static str {
+    // An object, or the unconstrained `JSON` scalar, has no query-string
+    // spelling of its own, so it travels as JSON text — which is what both
+    // clients write for one.
+    if api.is_json_text(f.ty.base_name()) {
+        return "Json";
+    }
     match api.find_type(f.ty.base_name()) {
-        // An enum value is a string on the wire, whatever it is called in Rust.
-        Some(ApiType::Enum(_)) => "Str",
         Some(ApiType::Scalar(s)) => match s.openapi_type.as_str() {
             "integer" => "Int",
             "number" => "Float",
             "boolean" => "Bool",
-            "string" => "Str",
-            // The unconstrained `JSON` scalar declares no OpenAPI type at all.
-            _ => "Json",
+            _ => "Str",
         },
-        // An object has no query-string spelling of its own, so it travels as
-        // JSON text — which is what the TypeScript client writes for one.
-        _ => "Json",
+        // An enum value is a string on the wire, whatever it is called in Rust.
+        _ => "Str",
     }
 }
 

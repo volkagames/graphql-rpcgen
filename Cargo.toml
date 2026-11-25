@@ -29,9 +29,9 @@ toml = { version = "1.2.1", default-features = false, features = [
 #
 # `raw_wire` is why the server and client halves are here: a `@raw` operation
 # emits handlers and client methods, not just types, and those reach for a web
-# framework and an HTTP stack. `form_urlencoded` and `reqwest`'s `stream`
-# feature are the two the generated streaming runtime needs and nothing else
-# does, and `futures-util`'s `io` feature is for a streamed `@raw` request alone
+# framework and an HTTP stack. `reqwest`'s `stream` feature is what the
+# generated streaming client needs and nothing else does, and `futures-util`'s
+# `io` feature is for a streamed `@raw` request alone
 # — see "What the generated Rust needs on the other side" in the README.
 [dev-dependencies]
 async-trait = "0.1"
@@ -45,7 +45,6 @@ derive_more = { version = "2", features = [
     "as_ref",
 ] }
 error_set = "0.9"
-form_urlencoded = "1"
 futures-core = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 reqwest = { version = "0.13", default-features = false, features = [
@@ -71,3 +70,12 @@ panic = "deny"
 todo = "deny"
 unreachable = "deny"
 unwrap_used = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+missing_panics_doc = "deny"
+exit = "deny"

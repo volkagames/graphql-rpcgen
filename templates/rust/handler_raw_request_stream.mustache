@@ -8,7 +8,8 @@ async fn {{{handler}}}<S: {{{trait_name}}}>(
         Ok(input) => input,
         Err(response) => return response,
     };
-    if let Err(violations) = validator::Validate::validate(&input) {
+    let validation = validator::Validate::validate(&input);
+    if let Err(violations) = validation {
         return invalid_input(&violations);
     }
     match service.{{{method}}}({{{context_arg}}}input, RawRequest { parts, body }).await {
