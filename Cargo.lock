@@ -121,9 +121,9 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "cc"
-version = "1.11.3"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
+checksum = "95e45cf2980b2d467be49a9ed942c9179b701063a7ca3d037de7ee9bd67f8d66"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -332,9 +332,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+checksum = "3e44f110d1777dc6559a51e7d45083945ded4f1bf3305494350f693b6d20b9c8"
 
 [[package]]
 name = "foldhash"
@@ -1404,9 +1404,9 @@ dependencies = [
 
 [[package]]
 name = "treat"
-version = "0.27.0"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "570ff2909bba786efeeccdcbcccef54079d78ef19849218dc2827ba473b7f4b0"
+checksum = "542cd1cc29ea023596c1be4429d44f66e64e67100eaa7f29475e72ce137246bf"
 dependencies = [
  "treat-core",
  "treat-derive",
@@ -1415,9 +1415,9 @@ dependencies = [
 
 [[package]]
 name = "treat-core"
-version = "0.27.0"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24a26534df6fbe89c25a237b7eae75815ea66befca130e3696d0f9b532d0b170"
+checksum = "abcfb9638b4ae413f97da31a59486089514b8b1c032f43a0f9c2b23784879a60"
 dependencies = [
  "axum",
  "cfg_block",
@@ -1431,9 +1431,9 @@ dependencies = [
 
 [[package]]
 name = "treat-derive"
-version = "0.27.0"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e70d58fb5b65b979f079319b78f780b9326d5c7391aeef80c568ee9ed483016"
+checksum = "c4b87cc94df6ac28b10c2624bf4ffbc36135d95db131c40f65f5d39d23bb8911"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1443,9 +1443,9 @@ dependencies = [
 
 [[package]]
 name = "treat-rpc"
-version = "0.27.0"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c846b545b0cad2d554ea31e6719e78810466438176762578dcb501bc7f18c743"
+checksum = "08061caf068ca8f9cd646a26f1da115ee2927d16dc11d8c4282f67ddf388c3c6"
 dependencies = [
  "axum",
  "bytes",
