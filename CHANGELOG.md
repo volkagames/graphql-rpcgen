@@ -4,6 +4,44 @@ Each release says what changed and why. The README's "Upgrading from …" notes
 hold the exact migration steps; this file holds the motivation. Releases before
 0.10.1 are in the git history.
 
+## Unreleased
+
+### Added
+- **Error groups: `@errorGroup(includes:)`, `@throws(groups:)`,
+  `@message(text:)`.** For a service moving to layered errors: each area keeps
+  a small table of its own codes and a failure type, the code of that area
+  names its code where the failure happens, and the edge converts once — with
+  the names written once, in the SDL, and a mismatch failing the build rather
+  than answering `internal_error`.
+  - A group's codes are its own values, every included group's (transitively)
+    and `internal_error`, its `#[undeclared]` value. Its own codes join
+    `ErrorCode`, which stays the one list of everything the API answers; a
+    code lives in `ErrorCode` or in exactly one group, so codes move into
+    groups one at a time.
+  - Rust, in the types target: per group an `<Area>Code` enum with the
+    registry's derives and an `<Area>Failure(pub ApiError<<Area>Code>)`, an
+    `erris::tracked::TrackedError`, built from `.wrap_api_code(<Area>Code::x)?`
+    or a code; `From` from every included group's code and failure, keeping
+    the message, `meta`, status, source, raise site and hops; `From` into
+    `ErrorCode` and the flat `ApiError<ErrorCode>`; and `From<<Area>Failure>`
+    for the `ApiError` of every operation whose codes hold the group's, so
+    the trait method's `?` compiles exactly where `@throws` covers the group.
+  - `@throws(groups:)` adds a group's codes to the operation's, beside or
+    instead of `codes:`; TypeScript, zod and OpenAPI carry each group as they
+    carry an enum, and its codes in `ErrorCode` and in each operation's
+    failure enum.
+  - `@message(text:)` on a code of `ErrorCode` or of a group sets the message
+    it carries; a GraphQL directive argument is named, hence `text:`.
+  - Refused, each at its declaration: a code declared twice, a runtime code
+    in a group, an include that is not a group or closes a cycle, a group not
+    named `<Area>Code` or marked as an access set, `@errorGroup` without or on
+    `ErrorCode`, a type spelt like `<Area>Failure`, `@throws(groups:)` naming a
+    non-group, and `@message` off an error code or without a string.
+- An API declaring a group needs `treat`'s `tracked` feature where its types
+  compile, and so a nightly toolchain. A `?` from one group's
+  `erris::Result` into another's waits for erris to convert between tracked
+  errors through `From`; the conversions are generated for it.
+
 ## 0.16.0 — 2026-11-25
 
 Written for a project upgrading from 0.15.0. When you regenerate with this

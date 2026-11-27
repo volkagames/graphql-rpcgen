@@ -30,7 +30,8 @@
 //!
 //! What is emitted is the schema: the types and their `validator` rules, the
 //! registry and the per-operation code sets (`WireEnum`, so the runtime reads
-//! a code by its wire name), the `operations` table, the `wire` statics —
+//! a code by its wire name), the error groups with their failure types and the
+//! conversions between them, the `operations` table, the `wire` statics —
 //! query tables, `@http` specs, raw media types — the server reads a request
 //! with and the client writes one with, the service traits and their routers.
 //!
@@ -438,7 +439,7 @@ fn emit_types(out: &mut String, api: &Api) {
             // every enum gets: neither declares a hierarchy to compile into an
             // `authorizes`, so which implies which stays the implementation's.
             ApiType::Enum(e) => {
-                emit_enum(out, e);
+                emit_enum(out, api, e);
                 if api.roles.as_ref().is_some_and(|r| r.enum_name == e.name) {
                     emit_role_impl(out, api, e);
                 }
@@ -450,6 +451,7 @@ fn emit_types(out: &mut String, api: &Api) {
     }
 
     emit_error_sets(out, api);
+    emit_group_conversions(out, api);
     emit_operations_module(out, api);
     emit_wire_module(out, api);
 }
@@ -606,9 +608,13 @@ fn emit_scalar_newtype(out: &mut String, s: &ScalarType) {
 /// than restating it in an array and a `match` of its own that drift from it.
 /// `as_str` is exactly what serde writes, the `@variant(tag:)` when a value has
 /// one, since names such as `admin.users.read` are seldom identifiers.
-fn emit_enum(out: &mut String, e: &EnumType) {
+fn emit_enum(out: &mut String, api: &Api, e: &EnumType) {
     if e.name == crate::semantic::ERROR_CODE_ENUM {
         emit_error_code_enum(out, e);
+        return;
+    }
+    if e.error_group.is_some() {
+        emit_error_group(out, api, e);
         return;
     }
 
@@ -1037,28 +1043,12 @@ fn http_spec(api: &Api, op: &Operation, binding: &HttpBinding) -> String {
 ///
 /// `RuntimeCodes` tells the runtime which values are the two it reports on its
 /// own: a request it could not read, and a failure of its own.
+///
+/// Every error group's own codes are values of the registry too, so it stays
+/// the one list of everything the API can answer.
 fn emit_error_code_enum(out: &mut String, e: &EnumType) {
     let registry = &e.name;
-    out.push('\n');
-    emit_doc_rust(out, "", &e.description);
-    out.push_str("#[allow(non_camel_case_types, reason = \"variants keep the SDL's spelling\")]\n");
-    out.push_str(
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, \
-         ::serde::Deserialize, ::treat::ApiErrorCode, ::treat::rpc::WireEnum)]\n",
-    );
-    let _ = writeln!(out, "pub enum {registry} {{");
-    for v in &e.values {
-        emit_doc_rust(out, "    ", &v.description);
-        // The default message travels with the code, so a handler that has
-        // nothing to add does not restate it at the call site.
-        let _ = writeln!(out, "    #[message({:?})]", default_message(&v.name));
-        if let Some(tag) = &v.variant_tag {
-            let _ = writeln!(out, "    #[code({tag:?})]");
-            let _ = writeln!(out, "    #[serde(rename = {tag:?})]");
-        }
-        let _ = writeln!(out, "    {},", v.name);
-    }
-    out.push_str("}\n");
+    emit_code_enum(out, e, false);
 
     let _ = writeln!(
         out,
@@ -1068,6 +1058,204 @@ fn emit_error_code_enum(out: &mut String, e: &EnumType) {
         crate::semantic::CODE_INVALID_BODY,
         crate::semantic::CODE_INTERNAL_ERROR
     );
+}
+
+/// A table of error codes — the registry or an error group — as a `treat`
+/// code enum, its variants spelt as in the SDL, each carrying its message:
+/// the `@message(text:)` it declares, or one derived from its name. A group
+/// (`undeclared`) marks `internal_error` `#[undeclared]`: what it answers for
+/// a code it does not hold when a flat failure is narrowed into it.
+fn emit_code_enum(out: &mut String, e: &EnumType, undeclared: bool) {
+    out.push('\n');
+    emit_doc_rust(out, "", &e.description);
+    out.push_str("#[allow(non_camel_case_types, reason = \"variants keep the SDL's spelling\")]\n");
+    out.push_str(
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, \
+         ::serde::Deserialize, ::treat::ApiErrorCode, ::treat::rpc::WireEnum)]\n",
+    );
+    let _ = writeln!(out, "pub enum {} {{", e.name);
+    for v in &e.values {
+        emit_doc_rust(out, "    ", &v.description);
+        // The message travels with the code, so a handler that has nothing to
+        // add does not restate it at the call site.
+        let message = v
+            .message
+            .clone()
+            .unwrap_or_else(|| default_message(&v.name));
+        let _ = writeln!(out, "    #[message({message:?})]");
+        if undeclared && v.name == crate::semantic::CODE_INTERNAL_ERROR {
+            out.push_str("    #[undeclared]\n");
+        }
+        if let Some(tag) = &v.variant_tag {
+            let _ = writeln!(out, "    #[code({tag:?})]");
+            let _ = writeln!(out, "    #[serde(rename = {tag:?})]");
+        }
+        let _ = writeln!(out, "    {},", v.name);
+    }
+    out.push_str("}\n");
+}
+
+/// An error group: its code enum, flattened over the groups it includes, and
+/// its failure type, with the conversions that carry a failure up a layer —
+/// from each group it includes, and into the flat registry's `ApiError`.
+///
+/// The failure is a newtype rather than an alias of `ApiError<XCode>`: as an
+/// `erris::tracked::TrackedError` of the generated crate's own it can be the
+/// error of an `erris::Result` and a `?` records each hop, and the
+/// conversions between groups — `From<AccessFailure> for FolderFailure` — are
+/// impls the orphan rules allow only on types the crate owns. Each conversion
+/// goes through `ApiError::map_code`, which keeps everything but the code: the
+/// message, `meta`, the status, the source and the hops recorded so far.
+fn emit_error_group(out: &mut String, api: &Api, e: &EnumType) {
+    emit_code_enum(out, e, true);
+    let (Some(group), Some(failure)) = (&e.error_group, e.failure_name()) else {
+        return;
+    };
+    let code = &e.name;
+    let error = format!("::treat::ApiError<{code}>");
+    let _ = write!(
+        out,
+        "\n/// A failure of the error group [`{code}`]: an `ApiError` whose code is one of\n\
+         /// the group's. The error of an `erris::Result` in the code of this area:\n\
+         /// `.wrap_api_code({code}::…)?` raises one, and each `?` records its hop.\n\
+         #[derive(Debug, Clone)]\n\
+         pub struct {failure}(pub {error});\n\
+         \n\
+         impl {failure} {{\n    \
+             /// The code this failure answers with.\n    \
+             pub fn code(&self) -> {code} {{\n        *self.0.code()\n    }}\n\n    \
+             /// The error underneath.\n    \
+             pub fn error(&self) -> &{error} {{\n        &self.0\n    }}\n\n    \
+             /// The error underneath, by value.\n    \
+             pub fn into_error(self) -> {error} {{\n        self.0\n    }}\n\
+         }}\n\
+         \n\
+         impl ::treat::erris::tracked::TrackedError for {failure} {{\n    \
+             #[track_caller]\n    \
+             fn track_hop(self) -> Self {{\n        \
+                 Self(::treat::erris::tracked::TrackedError::track_hop(self.0))\n    \
+             }}\n\
+         }}\n\
+         \n\
+         impl ::std::fmt::Display for {failure} {{\n    \
+             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {{\n        \
+                 ::std::fmt::Display::fmt(&self.0, f)\n    \
+             }}\n\
+         }}\n\
+         \n\
+         impl ::std::error::Error for {failure} {{\n    \
+             fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {{\n        \
+                 ::std::error::Error::source(&self.0)\n    \
+             }}\n\
+         }}\n\
+         \n\
+         impl From<{error}> for {failure} {{\n    \
+             fn from(error: {error}) -> Self {{\n        Self(error)\n    }}\n\
+         }}\n\
+         \n\
+         impl From<{code}> for {failure} {{\n    \
+             #[track_caller]\n    \
+             fn from(code: {code}) -> Self {{\n        Self(::treat::ApiError::from(code))\n    }}\n\
+         }}\n"
+    );
+
+    for included in &group.includes {
+        let Some(ApiType::Enum(inner)) = api.find_type(included) else {
+            continue;
+        };
+        let Some(inner_failure) = inner.failure_name() else {
+            continue;
+        };
+        emit_code_conversion(out, inner, code, |v| format!("Self::{v}"));
+        let _ = write!(
+            out,
+            "\nimpl From<{inner_failure}> for {failure} {{\n    \
+                 fn from(failure: {inner_failure}) -> Self {{\n        \
+                     Self(failure.0.map_code({code}::from))\n    \
+                 }}\n\
+             }}\n"
+        );
+    }
+
+    let registry = crate::semantic::ERROR_CODE_ENUM;
+    emit_code_conversion(out, e, registry, |v| format!("Self::{v}"));
+    let _ = write!(
+        out,
+        "\nimpl From<{failure}> for ::treat::ApiError<{registry}> {{\n    \
+             fn from(failure: {failure}) -> Self {{\n        \
+                 failure.0.map_code({registry}::from)\n    \
+             }}\n\
+         }}\n"
+    );
+}
+
+/// `From<{from}> for {into}`, a code enum's every value matched onto the
+/// variant `variant` spells for its name.
+fn emit_code_conversion(
+    out: &mut String,
+    from: &EnumType,
+    into: &str,
+    variant: impl Fn(&str) -> String,
+) {
+    let _ = write!(
+        out,
+        "\nimpl From<{}> for {into} {{\n    fn from(code: {}) -> Self {{\n        match code {{\n",
+        from.name, from.name
+    );
+    for v in &from.values {
+        let _ = writeln!(
+            out,
+            "            {}::{} => {},",
+            from.name,
+            v.name,
+            variant(&v.name)
+        );
+    }
+    out.push_str("        }\n    }\n}\n");
+}
+
+/// For each operation and each error group whose every code the operation
+/// may answer with, `From<XFailure> for ApiError<<Op>Codes>`: a service method
+/// written over the group's failure reaches the operation's edge with a `?`,
+/// and one whose group the operation's `@throws` does not cover fails to
+/// compile there.
+fn emit_group_conversions(out: &mut String, api: &Api) {
+    for service in &api.services {
+        for op in &service.operations {
+            let codes = op.error_codes();
+            let set = codes_type_name(&service.name, &op.name);
+            for group in api.error_groups() {
+                let covered = group
+                    .values
+                    .iter()
+                    .all(|v| codes.contains(&v.name.as_str()));
+                let Some(failure) = group.failure_name() else {
+                    continue;
+                };
+                if !covered {
+                    continue;
+                }
+                let _ = write!(
+                    out,
+                    "\n/// `{}.{}` answers every code of [`{}`].\n\
+                     impl From<{failure}> for ::treat::ApiError<{set}> {{\n    \
+                         fn from(failure: {failure}) -> Self {{\n        \
+                             failure.0.map_code(|code| match code {{\n",
+                    service.name, op.name, group.name
+                );
+                for v in &group.values {
+                    let _ = writeln!(
+                        out,
+                        "            {}::{} => {set}::{},",
+                        group.name,
+                        v.name,
+                        code_type_name(&v.name)
+                    );
+                }
+                out.push_str("        })\n    }\n}\n");
+            }
+        }
+    }
 }
 
 /// Human-readable default for a code: `clan_not_found` -> `clan not found`.

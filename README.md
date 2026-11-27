@@ -246,7 +246,7 @@ consumer needs no web framework:
 
 | Target | Crates |
 | --- | --- |
-| `rust_types` | `serde`, `serde_json`, `treat` (default features; its `validator` feature with any `@pattern`), `validator`, `error_set`; `derive_more` with any newtype `@scalar`; plus whatever each `@scalar(rust:)` names — typically `uuid` and `chrono` |
+| `rust_types` | `serde`, `serde_json`, `treat` (default features; its `validator` feature with any `@pattern`; its `tracked` feature, and so a nightly toolchain, with any `@errorGroup`), `validator`, `error_set`; `derive_more` with any newtype `@scalar`; plus whatever each `@scalar(rust:)` names — typically `uuid` and `chrono` |
 | `rust_server` | `axum`, `async-trait`, and `treat` with its `rpc-server` feature |
 | `rust_client` | `treat` with its `rpc-client` feature, which brings `reqwest` — without TLS: see below |
 
@@ -483,7 +483,8 @@ An API with any operation declares `enum ErrorCode`, the registry every code
 comes from, listing at least `invalid_body` and `internal_error`: the runtime
 answers those for any operation, `@throws` or not, and the generated server
 and client are typed over the registry. Only an SDL of types alone may leave it
-out.
+out. A code may also be declared by an [error group](#error-groups-errorgroup),
+whose codes join the registry in every target.
 
 `code` is the `ErrorCode` value's wire name: its SDL spelling, or its
 `@variant(tag:)` when the wire carries something that is not a GraphQL
@@ -750,7 +751,9 @@ type PaymentInput =
 | `@permissions(codes:)` | ENUM | the enum's values are the API's permissions; `codes` are what the permission check answers with |
 | `@scopes(query:)` | ENUM | the enum's values are the scopes a token carries; `query` is the one a query needs by default |
 | `@mcp(expose:)` | OBJECT/FIELD | the operation is an MCP tool; surfaces as `x-mcp` in OpenAPI |
-| `@throws(codes:)` | FIELD | error codes the operation may return |
+| `@throws(codes:, groups:)` | FIELD | error codes the operation may return: those listed, and every code of each [error group](#error-groups-errorgroup) named |
+| `@errorGroup(includes:)` | ENUM | the enum's values are one area's error codes, joined by the codes of the groups it includes — see [Error groups](#error-groups-errorgroup) |
+| `@message(text:)` | ENUM_VALUE | on an error code, of `ErrorCode` or of a group: the message it carries |
 | `@length(min:, max:)` | FIELD/INPUT | `minLength` / `maxLength` |
 | `@range(min:, max:)` | FIELD/INPUT | `minimum` / `maximum` |
 | `@pattern(value:)` | FIELD/INPUT | `pattern` |
@@ -787,7 +790,8 @@ the second is declared, naming the first and every name the two share.
 A type is a Rust item beside the ones the generator declares itself, so it may
 not be spelt like one of those: `Rt`, `Failure`, `FromRequestContext`,
 `ApiClient`, the `operations` and `wire` modules, a service's `<S>Service`
-trait and `<S>Operations` client group, an operation's `<S><Op>Codes` set. Nor
+trait and `<S>Operations` client group, an operation's `<S><Op>Codes` set, an
+error group's `<Area>Failure`. Nor
 like a prelude name the generated code writes unqualified — `Option`, `Some`,
 `None`, `Result`, `Ok`, `Err`, `Vec`, `Box`, `String`, `Clone`, `Send`, `Sync`,
 `Sized`, `From`, `Into` — which it would take the place of (`From` because
@@ -1419,6 +1423,105 @@ restating the default; and a mutation, a query taking a raw request body, or —
 without a default — any operation, that a credential can reach, has no
 permission and names no scope. Each is reported at the operation's declaration.
 
+### Error groups: `@errorGroup`
+
+The flat registry says what the API can answer; the code below a handler that
+answers the registry's `Failure` may raise any code of it, and only the
+operation's edge narrows it to what `@throws` declares. An error group is one
+area's own small table of codes, with a failure type of its own: code in that
+area can only raise the group's codes, and an operation's edge takes the
+group's failure exactly when its `@throws` covers the group — a mismatch is a
+compile error, not a request answered `internal_error`.
+
+```graphql
+"""Reaching a path: who may, and whether its storage answers."""
+enum AccessCode @errorGroup {
+  forbidden
+  read_only_storage
+  storage_unavailable
+}
+
+enum LockCode @errorGroup { locked }
+
+"""Making and changing folders."""
+enum FolderCode @errorGroup(includes: [AccessCode, LockCode]) {
+  "A file holds the name."
+  kind_conflict
+  name_refused @message(text: "the name is not allowed here")
+  symlink_refused
+  not_supported
+}
+
+type Folders @service {
+  mkdir(input: MkdirInput!): Folder! @mutation @throws(groups: [FolderCode])
+}
+```
+
+| Rule | |
+| --- | --- |
+| A group's codes | its own values, the codes of every group it includes (transitively, each once), and `internal_error` |
+| The registry | `ErrorCode`'s own values and every group's own values: a code lives in `ErrorCode` or in exactly one group, so a project moves codes into groups one at a time |
+| `invalid_body`, `internal_error` | stay in `ErrorCode`: the runtime answers them for any operation, and every group holds `internal_error` already |
+| `@message(text:)` | on a code of `ErrorCode` or of a group, the message the code carries; without it, the message is the name with spaces (`kind_conflict` → `kind conflict`) |
+| `@throws(codes:, groups:)` | the operation answers the runtime codes, the codes listed and every code of each group named; either argument may stand alone |
+| The name | `<Area>Code`; the area names the failure type, `<Area>Failure` |
+
+The types target generates, for `FolderCode`:
+
+| Item | What it is for |
+| --- | --- |
+| `enum FolderCode` | the group's codes, flattened, spelt as in the SDL — the registry's derives and attributes, `#[message]` on each, and `internal_error` as its `#[undeclared]` value |
+| `struct FolderFailure(pub ApiError<FolderCode>)` | the error of an `erris::Result` in the folder area: an `erris::tracked::TrackedError` (each `?` records its hop), a std error showing the `ApiError` underneath; `code()`, `error()`, `into_error()` |
+| `From<ApiError<FolderCode>>` and `From<FolderCode>` for `FolderFailure` | `.wrap_api_code(FolderCode::kind_conflict)?` and `return Err(FolderCode::kind_conflict.into())` |
+| `From<AccessCode> for FolderCode`, `From<AccessFailure> for FolderFailure` | for every group included, directly or not; the failure keeps its message, `meta`, status, source, raise site and hops — only the code changes |
+| `From<FolderCode> for ErrorCode`, `From<FolderFailure> for ApiError<ErrorCode>` | a group's failure as the flat `Failure`; `.narrow::<FolderCode>()` reads a `Failure` back, a code the group lacks becoming `internal_error` |
+| `From<FolderFailure> for ApiError<FoldersMkdirCodes>` | for every operation whose codes hold all of the group's, named in `@throws(groups:)` or not |
+
+```rust
+use treat::erris::prelude::*;
+use treat::prelude::*;
+
+fn make(path: &str) -> treat::erris::Result<Folder, FolderFailure> {
+    check_name(path).wrap_api_code(FolderCode::name_refused)?;
+    Ok(Folder { path: path.to_string() })
+}
+
+// The edge: the service trait's method, a std `Result` over the operation's set.
+async fn mkdir(&self, input: MkdirInput) -> Result<ApiResponse<Folder>, ApiError<FoldersMkdirCodes>> {
+    Ok(success(make(&input.path)?))
+}
+```
+
+Which `?` compiles:
+
+| `?` on | in a function returning | |
+| --- | --- | --- |
+| `Result<T, ApiError<FolderCode>>` (`wrap_api_code`, `ok_or_api_code`) | `erris::Result<_, FolderFailure>` | compiles |
+| `erris::Result<T, FolderFailure>` | `Result<_, ApiError<FoldersMkdirCodes>>`, the operation's edge | compiles when the operation's codes hold the group's; a compile error otherwise |
+| `erris::Result<T, FolderFailure>` | `Result<_, Failure>`, or `erris::Result<_>` over a `Report` | compiles |
+| `erris::Result<T, AccessFailure>` | `erris::Result<_, FolderFailure>` | not yet: erris converts a tracked error only into the same type; the `From` it will use is generated |
+| `erris::Result<T, FolderFailure>` | `erris::Result<_, Failure>` | not yet, for the same reason |
+
+A failure type is an `erris::tracked::TrackedError`, so an API declaring a group
+needs `treat`'s **`tracked`** feature wherever the types target compiles, and
+with it a nightly toolchain. An API without one compiles as before.
+
+The other targets hold the group as they hold any enum — a TypeScript union of
+its wire names, a zod enum, an OpenAPI schema — its codes flattened as in Rust;
+`ErrorCode` lists the groups' codes everywhere, and an operation's failure
+`code` enum in OpenAPI lists its groups' codes. GraphQL names every directive
+argument, so the message is `@message(text: "…")` rather than a bare string.
+
+The compiler refuses, each at its declaration: a code declared by two of
+`ErrorCode` and the groups; `invalid_body` or `internal_error` in a group;
+`includes:` naming something that is not a group, or quoted, or twice; groups
+including each other in a cycle, reported once with the way round; a group
+not named `<Area>Code`, or marked `@roles`, `@permissions` or `@scopes`;
+`@errorGroup` on `ErrorCode`, or a group in an API without it; a type spelt
+like a group's `<Area>Failure`; `@throws(groups:)` naming something that is not
+a group, quoted, or twice; `@message` on a value of any other enum, or without
+a string `text:`; and a group's tagged code spelt on the wire like another code.
+
 ### The operation table
 
 `operations`, in the types target, is every operation of the API as its router
@@ -1766,12 +1869,14 @@ just test-one registry     # by test name
 just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
-316 tests. None needs a network; `ts_check`, the two `#[ignore]`d, needs the
+340 tests. None needs a network; `ts_check`, the two `#[ignore]`d, needs the
 TypeScript compiler `just check-ts` installs from npm (and `node`) and runs
 only with `-- --ignored`:
 
-- **semantic** (118) — every validation rule, the error-code registry (and that
-  an API with operations declares one), path versioning, union tags, which
+- **semantic** (140) — every validation rule, the error-code registry (and that
+  an API with operations declares one), error groups (their codes flattened
+  into the group, the registry and each operation, and every rejection),
+  path versioning, union tags, which
   constraint may sit on which type, two services or operations whose generated
   names collide (refused where the second is declared), a type spelt like an
   item the generated Rust declares or a prelude name it writes (and one spelt
@@ -1815,7 +1920,7 @@ only with `-- --ignored`:
   a pass over the whole OpenAPI document for the breaks a per-path assertion
   cannot see: a dangling `$ref`, a duplicated `operationId`, an operation with
   no response
-- **golden** (2) — one test runs every fixture under `tests/fixtures/` (seven,
+- **golden** (2) — one test runs every fixture under `tests/fixtures/` (eight,
   `mcp_version` with its OpenAPI metadata among them) through every target:
   Rust types, server and client in the split layout the wire tests compile,
   the server once more as a single file with its types inline, TypeScript, zod
@@ -1874,6 +1979,16 @@ only with `-- --ignored`:
   edition and with a field, an input field and an operation named `gen`.
   Nothing runs; the five share `raw_wire`'s target directory and
   dependency set, so each compiles only its own crate
+- **error_groups** (2) — the `error_groups` fixture's types and server
+  compiled with `treat`'s `tracked` feature (so on nightly) beside a service
+  written over its groups, and run: a code raised with `.wrap_api_code` into a
+  group's failure with its `@message` and its cause, an included group's
+  failure converted keeping its message, status, `meta`, cause, raise site and
+  hops, a group's failure into the flat `Failure` and narrowed back, and the
+  service trait's edge taking a group's failure with `?`; and an edge whose
+  operation does not cover the group, which must fail to build. The two
+  share a target directory of their own, since `tracked` changes what `treat`
+  compiles to
 - **harness** (5) — the scratch-project setup the wire tests share, on
   synthetic manifests and lockfiles: every dependency asks for the version the
   lockfile carries for it, whatever its source; a crate the lockfile lacks, or
@@ -1889,7 +2004,7 @@ only with `-- --ignored`:
   goes with whatever the default headers hold, and a refusal told from a raw
   answer
 
-`oneof_wire`, `raw_wire`, `http_wire` and `fixture_builds` build generated code
+`oneof_wire`, `raw_wire`, `http_wire`, `fixture_builds` and `error_groups` build generated code
 against the versions in this repo's `Cargo.lock`, offline: the lockfile is copied into each
 scratch project, and this crate's `[patch.*]` tables into its manifest. Before
 its tests run, each project writes the generated files through the generator's

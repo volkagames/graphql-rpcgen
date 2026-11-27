@@ -1,8 +1,9 @@
 //! What the integration tests share: the fixture SDL, and scratch cargo
 //! projects that compile and run generated Rust.
 //!
-//! `http_wire`, `raw_wire`, `oneof_wire` and `fixture_builds` each put generated
-//! code in front of rustc in a project of its own under this crate's `target/`.
+//! `http_wire`, `raw_wire`, `oneof_wire`, `fixture_builds` and `error_groups`
+//! each put generated code in front of rustc in a project of its own under this
+//! crate's `target/`.
 //! The arrangement is the same for all of them and is kept here:
 //!
 //! - A stable location. The project's target directory survives across runs,
@@ -31,7 +32,9 @@
 //! --check` on the generated files and `cargo clippy -- -D warnings` on the
 //! crate, so the generated code is formatted and warning-free as the CLI
 //! writes it. A project with nothing to run — `fixture_builds` — stops at the
-//! gates.
+//! gates. A project whose sources misuse the generated items on purpose is
+//! not held to them: it must fail to build, with the error it pins
+//! ([`ScratchProject::refuses`]).
 
 #![allow(
     dead_code,
@@ -299,6 +302,72 @@ impl ScratchProject {
         sources: &[(&str, &str)],
         generated: &[&str],
     ) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        let (project, project_target) = self.write(sources, generated)?;
+        let src = project.join("src");
+
+        let rustfmt = Command::new("rustfmt")
+            .args(["--check", "--edition", self.edition])
+            .args(generated.iter().map(|path| src.join(path)))
+            .output()?;
+        passed("rustfmt --check on the generated files", &rustfmt)?;
+
+        let clippy = Command::new(cargo())
+            .args([
+                "clippy",
+                "--quiet",
+                "--offline",
+                "--lib",
+                "--",
+                "-D",
+                "warnings",
+            ])
+            .current_dir(&project)
+            .env("CARGO_TARGET_DIR", &project_target)
+            .output()?;
+        passed("cargo clippy --lib -- -D warnings", &clippy)?;
+        Ok((project, project_target))
+    }
+
+    /// Write the project and build it, which must fail: rustc refusing code
+    /// that misuses the generated items is what the case pins. `Ok` only when
+    /// `cargo check --lib` fails and its output carries every one of
+    /// `expected`; otherwise an error with what it printed, so a build that
+    /// fails for another reason does not pass for this one.
+    pub fn refuses(
+        &self,
+        sources: &[(&str, &str)],
+        generated: &[&str],
+        expected: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        let (project, project_target) = self.write(sources, generated)?;
+        let check = Command::new(cargo())
+            .args(["check", "--quiet", "--offline", "--lib"])
+            .current_dir(&project)
+            .env("CARGO_TARGET_DIR", &project_target)
+            .output()?;
+        let printed = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+        if check.status.success() {
+            return Err(format!("cargo check was meant to fail, and passed:\n{printed}").into());
+        }
+        let missing: Vec<&&str> = expected.iter().filter(|e| !printed.contains(**e)).collect();
+        if !missing.is_empty() {
+            return Err(format!("cargo check failed without {missing:?}:\n{printed}").into());
+        }
+        Ok(())
+    }
+
+    /// Write the sources, formatting those `generated` names, the manifest
+    /// and this crate's lockfile, answering with the project's directory and
+    /// its target directory.
+    fn write(
+        &self,
+        sources: &[(&str, &str)],
+        generated: &[&str],
+    ) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
         let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))?;
         let project = root.join("target").join(self.dir);
         let target = match self.target {
@@ -336,27 +405,6 @@ impl ScratchProject {
         )?;
         std::fs::write(project.join("Cargo.toml"), manifest)?;
         std::fs::write(project.join("Cargo.lock"), lock)?;
-
-        let rustfmt = Command::new("rustfmt")
-            .args(["--check", "--edition", self.edition])
-            .args(generated.iter().map(|path| src.join(path)))
-            .output()?;
-        passed("rustfmt --check on the generated files", &rustfmt)?;
-
-        let clippy = Command::new(cargo())
-            .args([
-                "clippy",
-                "--quiet",
-                "--offline",
-                "--lib",
-                "--",
-                "-D",
-                "warnings",
-            ])
-            .current_dir(&project)
-            .env("CARGO_TARGET_DIR", &project_target)
-            .output()?;
-        passed("cargo clippy --lib -- -D warnings", &clippy)?;
         Ok((project, project_target))
     }
 }

@@ -2185,3 +2185,416 @@ type Users @service {
     );
     Ok(())
 }
+
+/// Two groups, one including the other, and operations naming them; the line
+/// numbers below count from the prelude's end.
+const GROUPS: &str = r#"
+enum AccessCode @errorGroup { forbidden storage_unavailable }
+"""Folders."""
+enum FolderCode @errorGroup(includes: [AccessCode]) {
+  kind_conflict @message(text: "a file holds the name")
+  name_refused
+}
+input I { id: UUID! }
+type O { id: UUID! }
+"#;
+
+/// A group's values are its own codes, then its includes', then the
+/// registry's `internal_error`; the registry lists every group's own codes;
+/// an operation's codes take in a named group's.
+#[test]
+fn error_groups_flatten_into_the_registry_and_the_operations() -> TestResult {
+    let api = compile(&format!(
+        "{GROUPS}
+type Folders @service {{
+  mkdir(input: I!): O! @mutation @throws(codes: [\"x\"], groups: [FolderCode])
+}}
+"
+    ))?;
+    let values = |name: &str| -> TestResult<Vec<String>> {
+        let ApiType::Enum(e) = api.find_type(name).ok_or("enum exists")? else {
+            return Err(format!("`{name}` is an enum").into());
+        };
+        Ok(e.values.iter().map(|v| v.name.clone()).collect())
+    };
+    assert_eq!(
+        values("FolderCode")?,
+        [
+            "kind_conflict",
+            "name_refused",
+            "forbidden",
+            "storage_unavailable",
+            "internal_error"
+        ]
+    );
+    assert_eq!(
+        values("AccessCode")?,
+        ["forbidden", "storage_unavailable", "internal_error"]
+    );
+    assert_eq!(
+        values("ErrorCode")?,
+        [
+            "invalid_body",
+            "internal_error",
+            "same",
+            "x",
+            "not_listed",
+            "forbidden",
+            "storage_unavailable",
+            "kind_conflict",
+            "name_refused"
+        ]
+    );
+    let ApiType::Enum(folder) = api.find_type("FolderCode").ok_or("enum exists")? else {
+        return Err("`FolderCode` is an enum".into());
+    };
+    let group = folder
+        .error_group
+        .as_ref()
+        .ok_or("`FolderCode` is a group")?;
+    assert_eq!(group.own, ["kind_conflict", "name_refused"]);
+    assert_eq!(group.includes, ["AccessCode"]);
+    assert_eq!(folder.failure_name().as_deref(), Some("FolderFailure"));
+    let message = folder.values.first().and_then(|v| v.message.as_deref());
+    assert_eq!(message, Some("a file holds the name"));
+
+    let op = api
+        .services
+        .first()
+        .and_then(|s| s.operations.first())
+        .ok_or("one operation")?;
+    assert_eq!(
+        op.errors,
+        [
+            "x",
+            "kind_conflict",
+            "name_refused",
+            "forbidden",
+            "storage_unavailable"
+        ]
+    );
+    assert_eq!(op.error_groups, ["FolderCode"]);
+    Ok(())
+}
+
+/// Groups including each other transitively flatten each code once: a
+/// diamond's shared group is met through both sides.
+#[test]
+fn a_diamond_of_includes_holds_each_code_once() -> TestResult {
+    let api = compile(
+        r#"
+enum BaseCode @errorGroup { gone }
+enum LeftCode @errorGroup(includes: [BaseCode]) { left }
+enum RightCode @errorGroup(includes: [BaseCode]) { right }
+enum TopCode @errorGroup(includes: [LeftCode, RightCode]) { top }
+"#,
+    )?;
+    let ApiType::Enum(top) = api.find_type("TopCode").ok_or("enum exists")? else {
+        return Err("`TopCode` is an enum".into());
+    };
+    let names: Vec<&str> = top.values.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["top", "left", "gone", "right", "internal_error"]);
+    let group = top.error_group.as_ref().ok_or("a group")?;
+    assert_eq!(group.includes, ["LeftCode", "BaseCode", "RightCode"]);
+    Ok(())
+}
+
+#[test]
+fn a_code_in_the_registry_and_a_group_is_rejected() -> TestResult {
+    let e = expect_error("enum LockCode @errorGroup { locked same }")?;
+    assert!(
+        e.contains(
+            "<memory>:13:36: error code `same` is declared by `LockCode` and by `ErrorCode` \
+             (at <memory>:9:3); a code lives in `ErrorCode` or in exactly one @errorGroup"
+        ),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_code_in_two_groups_is_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum LockCode @errorGroup { locked }
+enum LeaseCode @errorGroup { locked }
+"#,
+    )?;
+    assert!(
+        e.contains("error code `locked` is declared by `LeaseCode` and by `LockCode`"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_group_cannot_declare_a_runtime_code() -> TestResult {
+    let e = expect_error("enum LockCode @errorGroup { locked internal_error }")?;
+    assert!(
+        e.contains("@errorGroup `LockCode` cannot declare `internal_error`"),
+        "{e}"
+    );
+    assert!(!e.contains("is declared by"), "reported once: {e}");
+    Ok(())
+}
+
+#[test]
+fn including_an_enum_that_is_not_a_group_is_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum Plain { a }
+enum LockCode @errorGroup(includes: [Plain, Missing]) { locked }
+"#,
+    )?;
+    assert!(
+        e.contains(
+            "<memory>:15:1: enum `LockCode`: @errorGroup(includes:) names `Plain`, which is \
+             not an @errorGroup enum"
+        ),
+        "{e}"
+    );
+    assert!(
+        e.contains("@errorGroup(includes:) names `Missing`, which is not declared"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn includes_written_as_strings_are_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum AccessCode @errorGroup { forbidden }
+enum LockCode @errorGroup(includes: ["AccessCode"]) { locked }
+"#,
+    )?;
+    assert!(
+        e.contains("@errorGroup(includes:) must be a list of group names written bare"),
+        "{e}"
+    );
+    Ok(())
+}
+
+/// A cycle is reported once, naming the way round.
+#[test]
+fn an_include_cycle_is_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum ACode @errorGroup(includes: [CCode]) { a }
+enum BCode @errorGroup(includes: [ACode]) { b }
+enum CCode @errorGroup(includes: [BCode]) { c }
+"#,
+    )?;
+    assert!(
+        e.contains("@errorGroup `ACode` includes itself: ACode -> CCode -> BCode -> ACode"),
+        "{e}"
+    );
+    assert_eq!(e.matches("includes itself").count(), 1, "{e}");
+    Ok(())
+}
+
+#[test]
+fn a_group_including_itself_is_rejected() -> TestResult {
+    let e = expect_error("enum LockCode @errorGroup(includes: [LockCode]) { locked }")?;
+    assert!(
+        e.contains("@errorGroup `LockCode` includes itself: LockCode -> LockCode"),
+        "{e}"
+    );
+    Ok(())
+}
+
+/// A group is a type like any other: its name is taken once.
+#[test]
+fn a_group_spelt_like_another_type_is_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+type LockCode { id: UUID! }
+enum LockCode @errorGroup { locked }
+"#,
+    )?;
+    assert!(e.contains("duplicate type `LockCode`"), "{e}");
+    Ok(())
+}
+
+/// The group's failure type is an item of the generated Rust too.
+#[test]
+fn a_type_spelt_like_a_groups_failure_is_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum LockCode @errorGroup { locked }
+type LockFailure { id: UUID! }
+"#,
+    )?;
+    assert!(
+        e.contains("type `LockFailure` is spelt like the failure type of error group `LockCode`"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_group_without_the_code_suffix_is_rejected() -> TestResult {
+    for name in ["Locks", "Code"] {
+        let e = expect_error(&format!("enum {name} @errorGroup {{ locked }}"))?;
+        assert!(
+            e.contains(&format!(
+                "@errorGroup enum `{name}` must be named `<Area>Code`"
+            )),
+            "{e}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_registry_cannot_be_a_group() -> TestResult {
+    let e = match graphql_rpcgen::compile_str(
+        "enum ErrorCode @errorGroup { invalid_body internal_error }",
+    ) {
+        Ok(_) => return Err("the registry marked as a group must be refused".into()),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains("`ErrorCode` is the error code registry, which every group's codes join"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_group_needs_the_registry() -> TestResult {
+    let e = match graphql_rpcgen::compile_str("enum LockCode @errorGroup { locked }") {
+        Ok(_) => return Err("a group without a registry must be refused".into()),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains("@errorGroup `LockCode`: a group's codes join the error code registry"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_group_marked_as_an_access_set_is_rejected() -> TestResult {
+    let e = expect_error("enum LockCode @errorGroup @scopes { locked }")?;
+    assert!(
+        e.contains("enum `LockCode`: an @errorGroup is a set of error codes, apart from @scopes"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn throws_naming_a_group_that_is_not_one_is_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        "{GROUPS}
+enum Plain {{ a }}
+type Folders @service {{
+  mkdir(input: I!): O! @mutation @throws(groups: [Plain, FolderCode, FolderCode])
+}}
+"
+    ))?;
+    assert!(
+        e.contains(
+            "`Folders.mkdir`: @throws(groups:) names `Plain`, which is not an @errorGroup enum"
+        ),
+        "{e}"
+    );
+    assert!(
+        e.contains("`Folders.mkdir`: @throws(groups:) names `FolderCode` twice"),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn throws_groups_written_as_strings_are_rejected() -> TestResult {
+    let e = expect_error(&format!(
+        "{GROUPS}
+type Folders @service {{
+  mkdir(input: I!): O! @mutation @throws(groups: [\"FolderCode\"])
+}}
+"
+    ))?;
+    assert!(
+        e.contains("@throws(groups:) must be a list of @errorGroup names written bare"),
+        "{e}"
+    );
+    Ok(())
+}
+
+/// `groups:` alone is a whole `@throws`; `codes:` alone stays one too.
+#[test]
+fn throws_takes_groups_without_codes() -> TestResult {
+    let api = compile(&format!(
+        "{GROUPS}
+type Folders @service {{
+  mkdir(input: I!): O! @mutation @throws(groups: [AccessCode])
+  stat(input: I!): O! @query @throws(codes: [\"x\"])
+}}
+"
+    ))?;
+    let ops = &api.services.first().ok_or("one service")?.operations;
+    let errors: Vec<&Vec<String>> = ops.iter().map(|op| &op.errors).collect();
+    assert_eq!(
+        errors,
+        [
+            &vec!["forbidden".to_string(), "storage_unavailable".to_string()],
+            &vec!["x".to_string()]
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_message_on_an_enum_that_holds_no_codes_is_rejected() -> TestResult {
+    let e = expect_error(r#"enum Plain { a @message(text: "hello") }"#)?;
+    assert!(
+        e.contains(
+            "<memory>:13:16: enum `Plain`: @message applies to an error code — a value of \
+             `ErrorCode` or of an @errorGroup enum — not to `a`"
+        ),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_message_that_is_not_a_string_is_rejected() -> TestResult {
+    for message in ["@message(text: 3)", "@message(text: hello)", "@message"] {
+        let e = expect_error(&format!("enum LockCode @errorGroup {{ locked {message} }}"))?;
+        assert!(
+            e.contains(
+                "enum `LockCode`: value `locked` has a malformed @message, expected a string \
+                 `text` argument"
+            ),
+            "{message}: {e}"
+        );
+    }
+    Ok(())
+}
+
+/// The registry's own codes take a message too.
+#[test]
+fn a_message_on_a_registry_code_is_read() -> TestResult {
+    let api = graphql_rpcgen::compile_str(
+        r#"enum ErrorCode { invalid_body internal_error gone @message(text: "it is gone") }"#,
+    )?;
+    let ApiType::Enum(registry) = api.find_type("ErrorCode").ok_or("enum exists")? else {
+        return Err("`ErrorCode` is an enum".into());
+    };
+    let gone = registry.values.iter().find(|v| v.name == "gone");
+    assert_eq!(gone.and_then(|v| v.message.as_deref()), Some("it is gone"));
+    Ok(())
+}
+
+/// A group's tagged code cannot be spelt on the wire like another code.
+#[test]
+fn a_group_code_tagged_like_another_code_is_rejected() -> TestResult {
+    let e = expect_error(r#"enum LockCode @errorGroup { locked @variant(tag: "same") }"#)?;
+    assert!(
+        e.contains("`ErrorCode`: codes `same` and `locked` both serialise to `same`"),
+        "{e}"
+    );
+    Ok(())
+}

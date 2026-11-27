@@ -1,0 +1,435 @@
+---
+source: tests/golden.rs
+expression: output
+---
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RPC API",
+    "version": "0.1.0",
+    "description": "Generated from GraphQL SDL by graphql-rpcgen. All operations are POST + JSON."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Folders"
+    }
+  ],
+  "paths": {
+    "/rpc/folders/lock": {
+      "post": {
+        "operationId": "folders_lock",
+        "tags": [
+          "Folders"
+        ],
+        "summary": "Folders.lock",
+        "description": "Locks a path: the access group, and `locked` listed — which covers the lock group too.",
+        "x-rpc-kind": "mutation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PathInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Folder"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "locked",
+                                  "not_found",
+                                  "forbidden",
+                                  "read_only_storage",
+                                  "storage_unavailable",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rpc/folders/mkdir": {
+      "post": {
+        "operationId": "folders_mkdir",
+        "tags": [
+          "Folders"
+        ],
+        "summary": "Folders.mkdir",
+        "description": "Makes a folder: every code of the folder group, its includes' among them.",
+        "x-rpc-kind": "mutation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PathInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Folder"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "kind_conflict",
+                                  "name_refused",
+                                  "symlink_refused",
+                                  "not_supported",
+                                  "folder.path-too-deep",
+                                  "forbidden",
+                                  "read_only_storage",
+                                  "storage_unavailable",
+                                  "locked",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rpc/folders/stat": {
+      "post": {
+        "operationId": "folders_stat",
+        "tags": [
+          "Folders"
+        ],
+        "summary": "Folders.stat",
+        "description": "Reads a folder: one access code listed, which covers no group.",
+        "x-rpc-kind": "query",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PathInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success carries `data`; failure carries `errors[]`. The status line is always 200 — read `errors[]`, or the `x-rpc-status` header.",
+            "headers": {
+              "x-rpc-status": {
+                "$ref": "#/components/headers/x-rpc-status"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "title": "Success",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Folder"
+                        },
+                        "meta": {
+                          "type": "object",
+                          "description": "Free-form response metadata."
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    },
+                    {
+                      "title": "Failure",
+                      "type": "object",
+                      "properties": {
+                        "errors": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/RpcErrorItem"
+                              }
+                            ],
+                            "properties": {
+                              "code": {
+                                "enum": [
+                                  "not_found",
+                                  "forbidden",
+                                  "invalid_body",
+                                  "internal_error"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "errors"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccessCode": {
+        "description": "Reaching a path: who may, and whether its storage answers.",
+        "type": "string",
+        "enum": [
+          "forbidden",
+          "read_only_storage",
+          "storage_unavailable",
+          "internal_error"
+        ]
+      },
+      "ErrorCode": {
+        "description": "Every code the API can answer with; each group's own codes join it.",
+        "type": "string",
+        "enum": [
+          "invalid_body",
+          "internal_error",
+          "not_found",
+          "forbidden",
+          "read_only_storage",
+          "storage_unavailable",
+          "kind_conflict",
+          "name_refused",
+          "symlink_refused",
+          "not_supported",
+          "folder.path-too-deep",
+          "locked"
+        ]
+      },
+      "Folder": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "FolderCode": {
+        "description": "Making and changing folders.",
+        "type": "string",
+        "enum": [
+          "kind_conflict",
+          "name_refused",
+          "symlink_refused",
+          "not_supported",
+          "folder.path-too-deep",
+          "forbidden",
+          "read_only_storage",
+          "storage_unavailable",
+          "locked",
+          "internal_error"
+        ]
+      },
+      "LockCode": {
+        "type": "string",
+        "enum": [
+          "locked",
+          "internal_error"
+        ]
+      },
+      "PathInput": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "RpcErrorItem": {
+        "type": "object",
+        "description": "One entry of `errors[]`, as produced by `treat::ErrorMessage`.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object",
+            "description": "Free-form context; its keys depend on the code."
+          },
+          "type": {
+            "type": "string",
+            "description": "RFC 9457 problem type URI."
+          },
+          "instance": {
+            "type": "string",
+            "description": "RFC 9457 occurrence id."
+          },
+          "source": {
+            "type": "object",
+            "description": "Locator for the offending input (JSON:API `source`).",
+            "properties": {
+              "pointer": {
+                "type": "string",
+                "description": "RFC 6901 JSON Pointer."
+              },
+              "parameter": {
+                "type": "string"
+              },
+              "header": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RpcErrorItem"
+            }
+          }
+        },
+        "required": [
+          "errors"
+        ]
+      }
+    },
+    "headers": {
+      "x-rpc-status": {
+        "description": "`ok` when `errors[]` is empty, `error` otherwise.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        }
+      }
+    }
+  }
+}

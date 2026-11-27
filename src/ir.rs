@@ -87,7 +87,34 @@ pub struct InputObjectType {
 pub struct EnumType {
     pub name: String,
     pub description: Option<String>,
+    /// Every value. For an error group, its codes flattened: its own, then
+    /// those of the groups it includes, then the registry's `internal_error`.
     pub values: Vec<EnumValue>,
+    /// Set by `@errorGroup`: the enum is one area's table of error codes.
+    pub error_group: Option<ErrorGroup>,
+}
+
+impl EnumType {
+    /// The Rust failure type of an error group: `FolderCode` -> `FolderFailure`.
+    /// `None` for an enum that is not a group.
+    pub fn failure_name(&self) -> Option<String> {
+        self.error_group.as_ref()?;
+        let area = self
+            .name
+            .strip_suffix(crate::semantic::ERROR_GROUP_SUFFIX)?;
+        Some(format!("{area}Failure"))
+    }
+}
+
+/// What `@errorGroup(includes:)` declares beside the enum's values.
+#[derive(Debug, Clone, Default)]
+pub struct ErrorGroup {
+    /// The codes the group declares itself, in SDL order. Each is also a value
+    /// of the `ErrorCode` registry, and of no other group.
+    pub own: Vec<String>,
+    /// Every group it includes, directly or through another, in the order a
+    /// depth-first walk of `includes:` meets them.
+    pub includes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +128,10 @@ pub struct EnumValue {
     /// so without this the choice would be between renaming them on the wire
     /// and dropping the enum for an untyped string.
     pub variant_tag: Option<String>,
+    /// The human message an error code carries, from `@message(text:)`. Only
+    /// on a value of the registry or of an error group; `None` leaves the
+    /// message derived from the name.
+    pub message: Option<String>,
 }
 
 impl EnumValue {
@@ -388,9 +419,13 @@ pub struct Operation {
     /// either way.
     pub input: Option<TypeRef>,
     pub output: TypeRef,
-    /// Error codes this operation may return, in declaration order.
-    /// Each names a value of the `ErrorCode` registry.
+    /// Error codes this operation may return, in declaration order: the codes
+    /// `@throws(codes:)` lists, then those of each group `@throws(groups:)`
+    /// names that are not listed yet. Each names a value of the `ErrorCode`
+    /// registry.
     pub errors: Vec<String>,
+    /// The error groups `@throws(groups:)` names, as written.
+    pub error_groups: Vec<String>,
     /// Media types the request body carries, when it is not the JSON envelope.
     ///
     /// Set by `@raw(request:)`. The payload is then the input's single binary
@@ -704,6 +739,14 @@ impl Api {
                 .map_or(code, EnumValue::wire_name),
             _ => code,
         }
+    }
+
+    /// Every enum marked `@errorGroup`, in name order.
+    pub fn error_groups(&self) -> impl Iterator<Item = &EnumType> {
+        self.types.iter().filter_map(|t| match t {
+            ApiType::Enum(e) if e.error_group.is_some() => Some(e),
+            _ => None,
+        })
     }
 
     /// The scalar named `name`, if it is one.

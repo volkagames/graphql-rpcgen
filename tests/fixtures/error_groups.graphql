@@ -1,0 +1,48 @@
+"""Every code the API can answer with; each group's own codes join it."""
+enum ErrorCode {
+  invalid_body
+  internal_error
+  not_found @message(text: "no such folder")
+}
+
+"""Reaching a path: who may, and whether its storage answers."""
+enum AccessCode @errorGroup {
+  forbidden
+  read_only_storage
+  storage_unavailable
+}
+
+enum LockCode @errorGroup {
+  locked
+}
+
+"""Making and changing folders."""
+enum FolderCode @errorGroup(includes: [AccessCode, LockCode]) {
+  "A file holds the name."
+  kind_conflict
+  name_refused @message(text: "the name is not allowed here")
+  symlink_refused
+  not_supported
+  path_too_deep @variant(tag: "folder.path-too-deep")
+}
+
+input PathInput {
+  path: String!
+}
+
+type Folder {
+  path: String!
+}
+
+type Folders @service {
+  "Makes a folder: every code of the folder group, its includes' among them."
+  mkdir(input: PathInput!): Folder! @mutation @throws(groups: [FolderCode])
+
+  "Locks a path: the access group, and `locked` listed — which covers the lock group too."
+  lock(input: PathInput!): Folder!
+    @mutation
+    @throws(codes: ["locked", "not_found"], groups: [AccessCode])
+
+  "Reads a folder: one access code listed, which covers no group."
+  stat(input: PathInput!): Folder! @query @throws(codes: ["not_found", "forbidden"])
+}

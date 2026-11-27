@@ -18,6 +18,11 @@ pub struct Fixture {
 /// Every fixture under `tests/fixtures/`.
 pub const FIXTURES: &[Fixture] = &[
     Fixture {
+        name: "error_groups",
+        sdl: include_str!("../fixtures/error_groups.graphql"),
+        config: "",
+    },
+    Fixture {
         name: "http_wire",
         sdl: include_str!("../fixtures/http_wire.graphql"),
         config: "",

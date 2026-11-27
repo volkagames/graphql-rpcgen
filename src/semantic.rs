@@ -41,7 +41,9 @@ const DIRECTIVES: &[(&str, &[&str])] = &[
     ),
     ("mcp", &["expose"]),
     ("explicitNulls", &[]),
-    ("throws", &["codes"]),
+    ("throws", &["codes", "groups"]),
+    ("errorGroup", &["includes"]),
+    ("message", &["text"]),
     ("length", &["min", "max"]),
     ("range", &["min", "max"]),
     ("pattern", &["value"]),
@@ -102,6 +104,10 @@ pub const ROLE_REQUIRED_CODE: &str = "role_required";
 
 pub const RUNTIME_ERROR_CODES: [&str; 2] = [CODE_INVALID_BODY, CODE_INTERNAL_ERROR];
 
+/// What an `@errorGroup` enum's name ends with. The rest is the area the group
+/// covers, which also names its Rust failure type: `FolderCode`, `FolderFailure`.
+pub const ERROR_GROUP_SUFFIX: &str = "Code";
+
 /// The items every Rust enum gets beside its variants. A registry variant keeps
 /// its SDL spelling, so a code spelt as one of these would shadow the item: rustc
 /// resolves `ErrorCode::ALL` to the variant and only warns.
@@ -133,6 +139,30 @@ struct Analyzer<'a> {
     /// Where each operation is declared, by `Service.operation`, for a check
     /// that runs once every file is read to report at the declaration.
     operation_sites: HashMap<String, (PathBuf, Pos)>,
+    /// Every enum marked `@errorGroup`, with the groups it includes directly.
+    /// Resolved once every file is read, since an included group may be
+    /// declared after — or in another file than — the group naming it.
+    group_enums: Vec<GroupEnum>,
+    /// Every value of the registry and of each group, in the order the SDL
+    /// declares them, so a code declared twice is reported at its second
+    /// declaration.
+    code_sites: Vec<CodeSite>,
+}
+
+/// An enum marked `@errorGroup`, as declared: where, and what it includes.
+struct GroupEnum {
+    file: PathBuf,
+    pos: Pos,
+    name: String,
+    includes: Vec<String>,
+}
+
+/// One error code as declared: by which enum, and where.
+struct CodeSite {
+    code: String,
+    owner: String,
+    file: PathBuf,
+    pos: Pos,
 }
 
 /// An enum marked `@roles`, as declared: where, and what each value inherits
@@ -217,6 +247,8 @@ impl<'a> Analyzer<'a> {
             permission_enums: Vec::new(),
             scope_enums: Vec::new(),
             operation_sites: HashMap::new(),
+            group_enums: Vec::new(),
+            code_sites: Vec::new(),
         }
     }
 
@@ -263,6 +295,8 @@ impl<'a> Analyzer<'a> {
         let permissions = self.resolve_permissions();
         let scopes = self.resolve_scopes(&types);
         self.resolve_operation_scopes(&types, scopes.as_ref(), &mut services);
+        self.resolve_error_groups(&mut types);
+        self.resolve_operation_groups(&types, &mut services);
         // Under `@permissions` the roles are the implementation's data, so a
         // `@roles` enum beside it would describe a second, static set of roles
         // living next to the dynamic one. One enum marked both is reported
@@ -579,19 +613,47 @@ impl<'a> Analyzer<'a> {
         }));
     }
 
-    /// An enum, and the access set it may be marked as: `@roles` with its
-    /// `@inherits` hierarchy, `@permissions` or `@scopes`.
+    /// An enum, and the set it may be marked as: `@roles` with its `@inherits`
+    /// hierarchy, `@permissions`, `@scopes`, or `@errorGroup`.
     fn collect_enum(
         &mut self,
         file: &Path,
         t: &EnumTypeDef<'static, String>,
         types: &mut Vec<ApiType>,
     ) {
-        self.check_directives(file, &t.directives, &["roles", "permissions", "scopes"]);
+        self.check_directives(
+            file,
+            &t.directives,
+            &["roles", "permissions", "scopes", "errorGroup"],
+        );
         let is_roles = find_directive(&t.directives, "roles").is_some();
         let permissions = find_directive(&t.directives, "permissions");
         let scopes = find_directive(&t.directives, "scopes");
-        self.check_enum_sets(file, t, is_roles, permissions.is_some(), scopes.is_some());
+        let group = find_directive(&t.directives, "errorGroup");
+        self.check_enum_sets(
+            file,
+            t,
+            [
+                (is_roles, "roles"),
+                (permissions.is_some(), "permissions"),
+                (scopes.is_some(), "scopes"),
+                (group.is_some(), "errorGroup"),
+            ],
+        );
+        let error_group = group.map(|d| self.error_group(file, t, d));
+        // The values of the registry and of a group are error codes: each is
+        // declared once across them, and only they carry a `@message`.
+        let codes = t.name == ERROR_CODE_ENUM || error_group.is_some();
+        if codes {
+            for v in &t.values {
+                self.code_sites.push(CodeSite {
+                    code: v.name.clone(),
+                    owner: t.name.clone(),
+                    file: file.to_path_buf(),
+                    pos: v.position,
+                });
+            }
+        }
         if let Some(d) = scopes {
             let query = self.scope_default(file, &t.name, d);
             self.scope_enums.push(ScopeEnum {
@@ -615,7 +677,7 @@ impl<'a> Analyzer<'a> {
             .values
             .iter()
             .map(|v| {
-                self.check_directives(file, &v.directives, &["variant", "inherits"]);
+                self.check_directives(file, &v.directives, &["variant", "inherits", "message"]);
                 match (is_roles, find_directive(&v.directives, "inherits")) {
                     (true, _) => {
                         inherits.push((v.name.clone(), self.inherited_roles(file, &t.name, v)))
@@ -636,6 +698,7 @@ impl<'a> Analyzer<'a> {
                     name: v.name.clone(),
                     description: v.description.clone(),
                     variant_tag: self.enum_variant_tag(file, &t.name, v),
+                    message: self.code_message(file, &t.name, codes, v),
                 }
             })
             .collect();
@@ -648,7 +711,9 @@ impl<'a> Analyzer<'a> {
             });
         }
         self.check_enum_wire_names(file, &t.name, &values, t.position);
-        if t.name == ERROR_CODE_ENUM {
+        // A code keeps its SDL spelling as a variant of the registry and of
+        // every group holding it.
+        if codes {
             for v in t
                 .values
                 .iter()
@@ -656,9 +721,8 @@ impl<'a> Analyzer<'a> {
             {
                 self.errors.push(CompileError::at(
                     format!(
-                        "`{ERROR_CODE_ENUM}` cannot list `{}`: the generated `{}::{}` \
-                         would be shadowed by it",
-                        v.name, ERROR_CODE_ENUM, v.name
+                        "`{}` cannot list `{}`: the generated `{}::{}` would be shadowed by it",
+                        t.name, v.name, t.name, v.name
                     ),
                     file,
                     v.position,
@@ -669,28 +733,158 @@ impl<'a> Analyzer<'a> {
             name: t.name.clone(),
             description: t.description.clone(),
             values,
+            error_group,
         }));
+    }
+
+    /// `@errorGroup` on the enum `t`: the name checked for the suffix its
+    /// failure type is derived from, and the groups `includes:` names as
+    /// written. Whether each is a group, and whether the includes close into a
+    /// cycle, is [`Self::resolve_error_groups`]'s to check once every file is
+    /// read.
+    fn error_group(
+        &mut self,
+        file: &Path,
+        t: &EnumTypeDef<'static, String>,
+        d: &Directive<'static, String>,
+    ) -> ErrorGroup {
+        let fail = |this: &mut Self, message: String| {
+            this.errors
+                .push(CompileError::at(message, file, t.position));
+        };
+        if t.name == ERROR_CODE_ENUM {
+            fail(
+                self,
+                format!(
+                    "`{ERROR_CODE_ENUM}` is the error code registry, which every group's codes \
+                     join; it cannot be an @errorGroup itself"
+                ),
+            );
+        }
+        // The runtime answers these for any operation, so they stay the
+        // registry's; `internal_error` is every group's already.
+        for v in &t.values {
+            if RUNTIME_ERROR_CODES.contains(&v.name.as_str()) {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "@errorGroup `{}` cannot declare `{}`: the runtime answers it for any \
+                         operation, so it stays in `{ERROR_CODE_ENUM}`, and every group holds \
+                         `{CODE_INTERNAL_ERROR}` already",
+                        t.name, v.name
+                    ),
+                    file,
+                    v.position,
+                ));
+            }
+        }
+        let area = t.name.strip_suffix(ERROR_GROUP_SUFFIX);
+        if area.is_none_or(str::is_empty) {
+            fail(
+                self,
+                format!(
+                    "@errorGroup enum `{}` must be named `<Area>{ERROR_GROUP_SUFFIX}`: the \
+                     area names its Rust failure type, `<Area>Failure`",
+                    t.name
+                ),
+            );
+        }
+        let includes = match has_arg(d, "includes") {
+            false => Vec::new(),
+            true => match enum_list_arg(d, "includes") {
+                Some(includes) => includes,
+                None => {
+                    fail(
+                        self,
+                        format!(
+                            "enum `{}`: @errorGroup(includes:) must be a list of group names \
+                             written bare",
+                            t.name
+                        ),
+                    );
+                    Vec::new()
+                }
+            },
+        };
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for name in &includes {
+            let first = seen.insert(name);
+            if !first {
+                fail(
+                    self,
+                    format!(
+                        "enum `{}`: @errorGroup(includes:) names `{name}` twice",
+                        t.name
+                    ),
+                );
+            }
+        }
+        self.group_enums.push(GroupEnum {
+            file: file.to_path_buf(),
+            pos: t.position,
+            name: t.name.clone(),
+            includes: includes.clone(),
+        });
+        ErrorGroup {
+            own: t.values.iter().map(|v| v.name.clone()).collect(),
+            // The direct includes until the groups are resolved, which closes
+            // over them.
+            includes,
+        }
+    }
+
+    /// `@message(text:)` on a value of the enum `owner`, which must be an
+    /// error code (`codes`): of the registry or of an error group.
+    fn code_message(
+        &mut self,
+        file: &Path,
+        owner: &str,
+        codes: bool,
+        value: &GqlEnumValue<'static, String>,
+    ) -> Option<String> {
+        let d = find_directive(&value.directives, "message")?;
+        if !codes {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{owner}`: @message applies to an error code — a value of \
+                     `{ERROR_CODE_ENUM}` or of an @errorGroup enum — not to `{}`",
+                    value.name
+                ),
+                file,
+                d.position,
+            ));
+            return None;
+        }
+        let text = string_arg(d, "text");
+        if text.is_none() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{owner}`: value `{}` has a malformed @message, expected a string \
+                     `text` argument",
+                    value.name
+                ),
+                file,
+                d.position,
+            ));
+        }
+        text
     }
 
     /// The sets an enum is marked as, each a question of its own: who acts
     /// (`@roles`), what is done (`@permissions`), what a credential may do
-    /// (`@scopes`). One enum answers one of them, and the error code registry
-    /// none.
+    /// (`@scopes`), what can go wrong in one area (`@errorGroup`). One enum
+    /// answers one of them, and the error code registry none of the first
+    /// three. Each mark comes with its directive's name.
     fn check_enum_sets(
         &mut self,
         file: &Path,
         t: &EnumTypeDef<'static, String>,
-        is_roles: bool,
-        is_permissions: bool,
-        is_scopes: bool,
+        marks: [(bool, &str); 4],
     ) {
+        let [(is_roles, _), (is_permissions, _), (is_scopes, _), (is_group, _)] = marks;
         // The registry names what can go wrong, not who may act, and
-        // its Rust form is not the one an access enum gets.
-        for (marked, directive) in [
-            (is_roles, "roles"),
-            (is_permissions, "permissions"),
-            (is_scopes, "scopes"),
-        ] {
+        // its Rust form is not the one an access enum gets. Whether it may
+        // be a group is the group's check to say.
+        for (marked, directive) in marks.into_iter().take(3) {
             if marked && t.name == ERROR_CODE_ENUM {
                 self.errors.push(CompileError::at(
                     format!(
@@ -723,6 +917,25 @@ impl<'a> Analyzer<'a> {
                     "enum `{}`: @scopes is the set a credential carries, apart from the \
                      roles and the permissions; mark one",
                     t.name
+                ),
+                file,
+                t.position,
+            ));
+        }
+        // What can go wrong is not who acts, what is done or what a
+        // credential may do.
+        let access = marks
+            .iter()
+            .take(3)
+            .filter(|(marked, _)| *marked)
+            .map(|(_, directive)| format!("@{directive}"))
+            .collect::<Vec<_>>();
+        if is_group && !access.is_empty() {
+            self.errors.push(CompileError::at(
+                format!(
+                    "enum `{}`: an @errorGroup is a set of error codes, apart from {}; mark one",
+                    t.name,
+                    access.join(" and ")
                 ),
                 file,
                 t.position,
@@ -1116,7 +1329,7 @@ impl<'a> Analyzer<'a> {
         let path =
             self.versioned_path(file, service, field, http.is_some(), service_version, path)?;
 
-        let errors = self.declared_errors(file, service, field);
+        let (errors, error_groups) = self.declared_errors(file, service, field);
 
         Some(Operation {
             name: field.name.clone(),
@@ -1127,6 +1340,7 @@ impl<'a> Analyzer<'a> {
             input,
             output,
             errors,
+            error_groups,
             raw_request,
             raw_request_stream,
             raw_response,
@@ -1351,30 +1565,45 @@ impl<'a> Analyzer<'a> {
         })
     }
 
-    /// The codes `@throws` lists; none, once reported, for a malformed list.
+    /// The codes and the groups `@throws` lists; none, once reported, for a
+    /// malformed list. A `@throws` names at least one of the two arguments.
     fn declared_errors(
         &mut self,
         file: &Path,
         service: &str,
         field: &GqlField<'static, String>,
-    ) -> Vec<String> {
-        match find_directive(&field.directives, "throws") {
-            Some(d) => match string_list_arg(d, "codes") {
-                Some(list) => list,
-                None => {
-                    self.errors.push(CompileError::at(
-                        format!(
-                            "`{service}.{}`: @throws(codes:) must be a list of strings",
-                            field.name
-                        ),
-                        file,
-                        field.position,
-                    ));
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        }
+    ) -> (Vec<String>, Vec<String>) {
+        let Some(d) = find_directive(&field.directives, "throws") else {
+            return (Vec::new(), Vec::new());
+        };
+        let fail = |this: &mut Self, message: &str| {
+            this.errors.push(CompileError::at(
+                format!("`{service}.{}`: {message}", field.name),
+                file,
+                field.position,
+            ));
+        };
+        let groups_given = has_arg(d, "groups");
+        let codes = match (string_list_arg(d, "codes"), groups_given) {
+            (Some(list), _) => list,
+            (None, true) if !has_arg(d, "codes") => Vec::new(),
+            (None, _) => {
+                fail(self, "@throws(codes:) must be a list of strings");
+                Vec::new()
+            }
+        };
+        let groups = match (enum_list_arg(d, "groups"), groups_given) {
+            (Some(list), _) => list,
+            (None, false) => Vec::new(),
+            (None, true) => {
+                fail(
+                    self,
+                    "@throws(groups:) must be a list of @errorGroup names written bare",
+                );
+                Vec::new()
+            }
+        };
+        (codes, groups)
     }
 
     /// Read `@http`: the method, the path and its `{parameters}`, where the
@@ -2707,6 +2936,221 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// The error groups resolved: every code declared once, every include a
+    /// group, no group including itself; then each group's values flattened —
+    /// its own codes, those of every group it includes, and the registry's
+    /// `internal_error`, which a group answers with for a code it does not
+    /// hold — and the registry extended with every group's own codes, so it
+    /// stays the one list of everything the API can answer.
+    fn resolve_error_groups(&mut self, types: &mut [ApiType]) {
+        self.check_codes_declared_once();
+        let groups = std::mem::take(&mut self.group_enums);
+        let Some(first) = groups.first() else { return };
+        let registry = types.iter().find_map(|t| match t {
+            ApiType::Enum(e) if e.name == ERROR_CODE_ENUM => Some(e.values.clone()),
+            _ => None,
+        });
+        let Some(registry) = registry else {
+            self.errors.push(CompileError::at(
+                format!(
+                    "@errorGroup `{}`: a group's codes join the error code registry, so the \
+                     API must declare `enum {ERROR_CODE_ENUM}`",
+                    first.name
+                ),
+                &first.file,
+                first.pos,
+            ));
+            return;
+        };
+
+        let names: BTreeSet<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        for g in &groups {
+            for included in &g.includes {
+                if names.contains(included.as_str()) {
+                    continue;
+                }
+                let what = match self.declared_at(included) {
+                    Some(_) => "which is not an @errorGroup enum",
+                    None => "which is not declared",
+                };
+                self.errors.push(CompileError::at(
+                    format!(
+                        "enum `{}`: @errorGroup(includes:) names `{included}`, {what}",
+                        g.name
+                    ),
+                    &g.file,
+                    g.pos,
+                ));
+            }
+        }
+
+        let direct: BTreeMap<&str, &[String]> = groups
+            .iter()
+            .map(|g| (g.name.as_str(), g.includes.as_slice()))
+            .collect();
+        for g in &groups {
+            // A cycle is reported once, at the group whose name sorts first
+            // in it, naming the whole way round.
+            let Some(cycle) = include_cycle(&direct, &g.name) else {
+                continue;
+            };
+            let first_in_cycle = cycle.iter().min().is_some_and(|min| *min == g.name);
+            if first_in_cycle {
+                self.errors.push(CompileError::at(
+                    format!(
+                        "@errorGroup `{}` includes itself: {}; a group's codes would be its \
+                         own included codes",
+                        g.name,
+                        cycle.join(" -> ")
+                    ),
+                    &g.file,
+                    g.pos,
+                ));
+            }
+        }
+
+        // Each group's own values, as declared, before any is flattened.
+        let own: BTreeMap<String, Vec<EnumValue>> = types
+            .iter()
+            .filter_map(|t| match t {
+                ApiType::Enum(e) if names.contains(e.name.as_str()) => {
+                    Some((e.name.clone(), e.values.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let internal_error = registry.iter().find(|v| v.name == CODE_INTERNAL_ERROR);
+        let mut joined: Vec<EnumValue> = Vec::new();
+        for ty in types.iter_mut() {
+            let ApiType::Enum(e) = ty else { continue };
+            let Some(group) = &mut e.error_group else {
+                continue;
+            };
+            group.includes = included_groups(&direct, &e.name);
+            let mut values: Vec<EnumValue> = Vec::new();
+            let held = std::iter::once(&e.name).chain(&group.includes);
+            for value in held.filter_map(|name| own.get(name)).flatten() {
+                let present = values.iter().any(|v| v.name == value.name);
+                if !present && value.name != CODE_INTERNAL_ERROR {
+                    values.push(value.clone());
+                }
+            }
+            values.extend(internal_error.cloned());
+            e.values = values;
+        }
+        for value in own.values().flatten() {
+            let present = registry.iter().chain(&joined).any(|v| v.name == value.name);
+            if !present {
+                joined.push(value.clone());
+            }
+        }
+
+        // A group's code may carry a `@variant(tag:)` another enum's code is
+        // spelt like, which no single enum's check sees.
+        let mut wire: BTreeMap<&str, &str> = registry
+            .iter()
+            .map(|v| (v.wire_name(), v.name.as_str()))
+            .collect();
+        let mut clashes: Vec<String> = Vec::new();
+        for value in &joined {
+            if let Some(other) = wire.insert(value.wire_name(), &value.name) {
+                clashes.push(format!(
+                    "codes `{other}` and `{}` both serialise to `{}`",
+                    value.name,
+                    value.wire_name()
+                ));
+            }
+        }
+        for clash in clashes {
+            self.type_error(ERROR_CODE_ENUM, format!("`{ERROR_CODE_ENUM}`: {clash}"));
+        }
+        for ty in types.iter_mut() {
+            if let ApiType::Enum(e) = ty {
+                if e.name == ERROR_CODE_ENUM {
+                    e.values.extend(joined.iter().cloned());
+                }
+            }
+        }
+    }
+
+    /// A code declared by two enums — the registry and a group, or two groups —
+    /// reported at the second declaration, naming the first. One enum listing
+    /// a value twice is its own wire-name check's to report.
+    fn check_codes_declared_once(&mut self) {
+        let sites = std::mem::take(&mut self.code_sites);
+        let mut first: BTreeMap<&str, &CodeSite> = BTreeMap::new();
+        for site in &sites {
+            let earlier = match first.entry(site.code.as_str()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(site);
+                    continue;
+                }
+                Entry::Occupied(slot) => *slot.get(),
+            };
+            // A group declaring a runtime code is reported where the group
+            // is read, saying why that code is the registry's.
+            let runtime = RUNTIME_ERROR_CODES.contains(&site.code.as_str());
+            if earlier.owner == site.owner || runtime {
+                continue;
+            }
+            self.errors.push(CompileError::at(
+                format!(
+                    "error code `{}` is declared by `{}` and by `{}` (at {}:{}:{}); a code \
+                     lives in `{ERROR_CODE_ENUM}` or in exactly one @errorGroup",
+                    site.code,
+                    site.owner,
+                    earlier.owner,
+                    earlier.file.display(),
+                    earlier.pos.line,
+                    earlier.pos.column
+                ),
+                &site.file,
+                site.pos,
+            ));
+        }
+    }
+
+    /// `@throws(groups:)` resolved: each name an error group, named once, and
+    /// the operation's codes extended with every group code it does not list
+    /// already. `internal_error` is left to [`Operation::error_codes`], which
+    /// every operation answers with.
+    fn resolve_operation_groups(&mut self, types: &[ApiType], services: &mut [Service]) {
+        for s in services.iter_mut() {
+            for op in &mut s.operations {
+                let owner = format!("{}.{}", s.name, op.name);
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                for name in &op.error_groups {
+                    let first = seen.insert(name);
+                    if !first {
+                        self.operation_error(
+                            &owner,
+                            format!("@throws(groups:) names `{name}` twice"),
+                        );
+                    }
+                    let group = types.iter().find_map(|t| match t {
+                        ApiType::Enum(e) if e.name == *name && e.error_group.is_some() => Some(e),
+                        _ => None,
+                    });
+                    let Some(group) = group else {
+                        self.operation_error(
+                            &owner,
+                            format!(
+                                "@throws(groups:) names `{name}`, which is not an @errorGroup enum"
+                            ),
+                        );
+                        continue;
+                    };
+                    for value in &group.values {
+                        let listed = op.errors.contains(&value.name);
+                        if !listed && value.name != CODE_INTERNAL_ERROR {
+                            op.errors.push(value.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// An error about the operation `owner` (`Service.operation`), reported
     /// where it is declared.
     fn operation_error(&mut self, owner: &str, message: String) {
@@ -3426,7 +3870,8 @@ impl<'a> Analyzer<'a> {
     /// generator's own: the `Rt` alias, `Failure`, `FromRequestContext`,
     /// `ApiClient`, the `operations` and `wire` modules, a service's
     /// `<S>Service` trait and `<S>Operations` client group, an operation's
-    /// `<S><Op>Codes` set. A type of one of those names is a duplicate item in
+    /// `<S><Op>Codes` set, an error group's `<Area>Failure`. A type of one of
+    /// those names is a duplicate item in
     /// the module declaring both, and in a module glob-importing the types it
     /// is silently the generator's item instead of the SDL's. The prelude
     /// names are the same hazard the other way round: an SDL `Result` would
@@ -3474,6 +3919,14 @@ impl<'a> Analyzer<'a> {
                 reserved.insert(
                     codes_type_name(&s.name, &op.name),
                     format!("the codes type of `{}.{}`", s.name, op.name),
+                );
+            }
+        }
+        for group in api.error_groups() {
+            if let Some(failure) = group.failure_name() {
+                reserved.insert(
+                    failure,
+                    format!("the failure type of error group `{}`", group.name),
                 );
             }
         }
@@ -4080,6 +4533,54 @@ fn describe_args(args: &[InputValue<'static, String>]) -> String {
 }
 
 /// Names of the scalars the compiler maps without an `@scalar` directive.
+/// Every group `start` includes, directly or through another, in the order a
+/// depth-first walk of `includes:` meets them; never `start` itself, even
+/// when the includes close into a cycle back to it. A name that is not a group
+/// is skipped: it is reported where it is named.
+fn included_groups(direct: &BTreeMap<&str, &[String]>, start: &str) -> Vec<String> {
+    fn walk(direct: &BTreeMap<&str, &[String]>, start: &str, name: &str, found: &mut Vec<String>) {
+        let includes = direct.get(name).copied().unwrap_or_default();
+        for included in includes {
+            let known = direct.contains_key(included.as_str());
+            let seen = included == start || found.contains(included);
+            if known && !seen {
+                found.push(included.clone());
+                walk(direct, start, included, found);
+            }
+        }
+    }
+    let mut found: Vec<String> = Vec::new();
+    walk(direct, start, start, &mut found);
+    found
+}
+
+/// The way round from `start` back to itself through `includes:`, as the
+/// groups it passes — `A`, `B`, `A` — when there is one.
+fn include_cycle(direct: &BTreeMap<&str, &[String]>, start: &str) -> Option<Vec<String>> {
+    // Depth-first, one path at a time: each entry is a group and how many of
+    // its includes have been walked.
+    let mut path: Vec<(&str, usize)> = vec![(start, 0)];
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    while let Some((name, next)) = path.last_mut() {
+        let includes = direct.get(*name).copied().unwrap_or_default();
+        let Some(included) = includes.get(*next) else {
+            path.pop();
+            continue;
+        };
+        *next = next.saturating_add(1);
+        if included == start {
+            let mut cycle: Vec<String> = path.iter().map(|(n, _)| (*n).to_string()).collect();
+            cycle.push(start.to_string());
+            return Some(cycle);
+        }
+        let first = visited.insert(included.as_str());
+        if first {
+            path.push((included, 0));
+        }
+    }
+    None
+}
+
 fn builtin_names() -> Vec<String> {
     builtin_scalars()
         .iter()
