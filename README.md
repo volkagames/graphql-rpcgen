@@ -1869,11 +1869,11 @@ just test-one registry     # by test name
 just lint                  # cargo deny, fmt-check, clippy, cargo sort, machete
 ```
 
-340 tests. None needs a network; `ts_check`, the two `#[ignore]`d, needs the
+343 tests. None needs a network; `ts_check`, the two `#[ignore]`d, needs the
 TypeScript compiler `just check-ts` installs from npm (and `node`) and runs
 only with `-- --ignored`:
 
-- **semantic** (140) — every validation rule, the error-code registry (and that
+- **semantic** (143) — every validation rule, the error-code registry (and that
   an API with operations declares one), error groups (their codes flattened
   into the group, the registry and each operation, and every rejection),
   path versioning, union tags, which

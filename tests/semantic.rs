@@ -2167,7 +2167,8 @@ type Users @service {
     for expected in [
         "<memory>:19:3: `Users.second`: duplicate RPC path `/same`",
         "<memory>:20:3: `Users.guarded`: @auth(role:) is checked before the handler, so \
-         @throws(codes:) must list `role_required`",
+         @throws must list `role_required` in `codes:` or name a group holding it in \
+         `groups:`",
         "<memory>:21:3: `Users.bound`: @http(path:) names `{nope}`, which is not a field of the input",
     ] {
         assert!(e.contains(expected), "`{expected}` in {e}");
@@ -2252,7 +2253,6 @@ type Folders @service {{
         .error_group
         .as_ref()
         .ok_or("`FolderCode` is a group")?;
-    assert_eq!(group.own, ["kind_conflict", "name_refused"]);
     assert_eq!(group.includes, ["AccessCode"]);
     assert_eq!(folder.failure_name().as_deref(), Some("FolderFailure"));
     let message = folder.values.first().and_then(|v| v.message.as_deref());
@@ -2588,12 +2588,87 @@ fn a_message_on_a_registry_code_is_read() -> TestResult {
     Ok(())
 }
 
-/// A group's tagged code cannot be spelt on the wire like another code.
+/// A group's tagged code cannot be spelt on the wire like another code, and
+/// is reported where the group's code is declared.
 #[test]
 fn a_group_code_tagged_like_another_code_is_rejected() -> TestResult {
     let e = expect_error(r#"enum LockCode @errorGroup { locked @variant(tag: "same") }"#)?;
     assert!(
-        e.contains("`ErrorCode`: codes `same` and `locked` both serialise to `same`"),
+        e.contains(
+            "<memory>:13:29: enum `LockCode`: code `locked` serialises to `same`, as `same` of \
+             `ErrorCode` does"
+        ),
+        "{e}"
+    );
+    Ok(())
+}
+
+/// Two groups' codes clash the same way, reported at the later group's code.
+#[test]
+fn group_codes_tagged_alike_in_two_groups_are_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum LeaseCode @errorGroup { leased @variant(tag: "held") }
+enum LockCode @errorGroup {
+  locked @variant(tag: "held")
+}
+"#,
+    )?;
+    assert!(
+        e.contains(
+            "<memory>:16:3: enum `LockCode`: code `locked` serialises to `held`, as `leased` of \
+             `LeaseCode` does"
+        ),
+        "{e}"
+    );
+    Ok(())
+}
+
+#[test]
+fn including_a_group_twice_is_rejected() -> TestResult {
+    let e = expect_error(
+        r#"
+enum LockCode @errorGroup { locked }
+enum FolderCode @errorGroup(includes: [LockCode, LockCode]) { kind_conflict }
+"#,
+    )?;
+    assert!(
+        e.contains(
+            "<memory>:15:1: enum `FolderCode`: @errorGroup(includes:) names `LockCode` twice"
+        ),
+        "{e}"
+    );
+    Ok(())
+}
+
+/// The code a role check answers with may come from a group `@throws`
+/// names, as from `codes:`; without either, the message says both ways.
+#[test]
+fn a_group_holding_the_role_code_answers_for_the_role_check() -> TestResult {
+    let sdl = |throws: &str| {
+        format!(
+            "scalar UUID
+enum ErrorCode {{ invalid_body internal_error }}
+enum Role @roles {{ reader }}
+enum AuthCode @errorGroup {{ role_required }}
+input I {{ id: UUID! }}
+type O {{ id: UUID! }}
+type Users @service {{
+  get(input: I!): O! @query @auth(require: session, role: reader) {throws}
+}}
+"
+        )
+    };
+    graphql_rpcgen::compile_str(&sdl("@throws(groups: [AuthCode])"))?;
+    let e = match graphql_rpcgen::compile_str(&sdl("")) {
+        Ok(_) => return Err("a role check nothing answers for must be refused".into()),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains(
+            "`Users.get`: @auth(role:) is checked before the handler, so @throws must list \
+             `role_required` in `codes:` or name a group holding it in `groups:`"
+        ),
         "{e}"
     );
     Ok(())

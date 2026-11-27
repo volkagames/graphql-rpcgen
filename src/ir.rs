@@ -109,9 +109,6 @@ impl EnumType {
 /// What `@errorGroup(includes:)` declares beside the enum's values.
 #[derive(Debug, Clone, Default)]
 pub struct ErrorGroup {
-    /// The codes the group declares itself, in SDL order. Each is also a value
-    /// of the `ErrorCode` registry, and of no other group.
-    pub own: Vec<String>,
     /// Every group it includes, directly or through another, in the order a
     /// depth-first walk of `includes:` meets them.
     pub includes: Vec<String>,

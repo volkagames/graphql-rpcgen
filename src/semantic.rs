@@ -157,6 +157,30 @@ struct GroupEnum {
     includes: Vec<String>,
 }
 
+/// The sets an enum's directives mark it as.
+#[derive(Clone, Copy)]
+struct EnumMarks {
+    roles: bool,
+    permissions: bool,
+    scopes: bool,
+    error_group: bool,
+}
+
+impl EnumMarks {
+    /// The access sets marked — who acts, what is done, what a credential may
+    /// do — by their directives' names.
+    fn access(self) -> Vec<&'static str> {
+        [
+            (self.roles, "roles"),
+            (self.permissions, "permissions"),
+            (self.scopes, "scopes"),
+        ]
+        .into_iter()
+        .filter_map(|(marked, directive)| marked.then_some(directive))
+        .collect()
+    }
+}
+
 /// One error code as declared: by which enum, and where.
 struct CodeSite {
     code: String,
@@ -633,12 +657,12 @@ impl<'a> Analyzer<'a> {
         self.check_enum_sets(
             file,
             t,
-            [
-                (is_roles, "roles"),
-                (permissions.is_some(), "permissions"),
-                (scopes.is_some(), "scopes"),
-                (group.is_some(), "errorGroup"),
-            ],
+            EnumMarks {
+                roles: is_roles,
+                permissions: permissions.is_some(),
+                scopes: scopes.is_some(),
+                error_group: group.is_some(),
+            },
         );
         let error_group = group.map(|d| self.error_group(file, t, d));
         // The values of the registry and of a group are error codes: each is
@@ -825,7 +849,6 @@ impl<'a> Analyzer<'a> {
             includes: includes.clone(),
         });
         ErrorGroup {
-            own: t.values.iter().map(|v| v.name.clone()).collect(),
             // The direct includes until the groups are resolved, which closes
             // over them.
             includes,
@@ -872,20 +895,15 @@ impl<'a> Analyzer<'a> {
     /// The sets an enum is marked as, each a question of its own: who acts
     /// (`@roles`), what is done (`@permissions`), what a credential may do
     /// (`@scopes`), what can go wrong in one area (`@errorGroup`). One enum
-    /// answers one of them, and the error code registry none of the first
-    /// three. Each mark comes with its directive's name.
-    fn check_enum_sets(
-        &mut self,
-        file: &Path,
-        t: &EnumTypeDef<'static, String>,
-        marks: [(bool, &str); 4],
-    ) {
-        let [(is_roles, _), (is_permissions, _), (is_scopes, _), (is_group, _)] = marks;
+    /// answers one of them, and the error code registry none of the access
+    /// sets.
+    fn check_enum_sets(&mut self, file: &Path, t: &EnumTypeDef<'static, String>, marks: EnumMarks) {
+        let access = marks.access();
         // The registry names what can go wrong, not who may act, and
         // its Rust form is not the one an access enum gets. Whether it may
         // be a group is the group's check to say.
-        for (marked, directive) in marks.into_iter().take(3) {
-            if marked && t.name == ERROR_CODE_ENUM {
+        for directive in &access {
+            if t.name == ERROR_CODE_ENUM {
                 self.errors.push(CompileError::at(
                     format!(
                         "`{ERROR_CODE_ENUM}` is the error code registry; it cannot be \
@@ -898,7 +916,7 @@ impl<'a> Analyzer<'a> {
         }
         // A role is who acts and a permission is what is done: one value
         // cannot be both, and `@auth` names either by its set.
-        if is_roles && is_permissions {
+        if marks.roles && marks.permissions {
             self.errors.push(CompileError::at(
                 format!(
                     "enum `{}`: @roles and @permissions are two sets; mark one",
@@ -911,7 +929,7 @@ impl<'a> Analyzer<'a> {
         // A scope is what a credential may do for whoever holds it,
         // not who acts or what a user may be granted: one value cannot
         // answer two of those questions.
-        if is_scopes && (is_roles || is_permissions) {
+        if marks.scopes && (marks.roles || marks.permissions) {
             self.errors.push(CompileError::at(
                 format!(
                     "enum `{}`: @scopes is the set a credential carries, apart from the \
@@ -924,13 +942,8 @@ impl<'a> Analyzer<'a> {
         }
         // What can go wrong is not who acts, what is done or what a
         // credential may do.
-        let access = marks
-            .iter()
-            .take(3)
-            .filter(|(marked, _)| *marked)
-            .map(|(_, directive)| format!("@{directive}"))
-            .collect::<Vec<_>>();
-        if is_group && !access.is_empty() {
+        if marks.error_group && !access.is_empty() {
+            let access: Vec<String> = access.iter().map(|d| format!("@{d}")).collect();
             self.errors.push(CompileError::at(
                 format!(
                     "enum `{}`: an @errorGroup is a set of error codes, apart from {}; mark one",
@@ -2943,7 +2956,8 @@ impl<'a> Analyzer<'a> {
     /// hold — and the registry extended with every group's own codes, so it
     /// stays the one list of everything the API can answer.
     fn resolve_error_groups(&mut self, types: &mut [ApiType]) {
-        self.check_codes_declared_once();
+        let sites = std::mem::take(&mut self.code_sites);
+        self.check_codes_declared_once(&sites);
         let groups = std::mem::take(&mut self.group_enums);
         let Some(first) = groups.first() else { return };
         let registry = types.iter().find_map(|t| match t {
@@ -3020,7 +3034,9 @@ impl<'a> Analyzer<'a> {
             })
             .collect();
         let internal_error = registry.iter().find(|v| v.name == CODE_INTERNAL_ERROR);
-        let mut joined: Vec<EnumValue> = Vec::new();
+        // Each group's own codes the registry does not hold yet, with the
+        // group declaring it.
+        let mut joined: Vec<(&str, EnumValue)> = Vec::new();
         for ty in types.iter_mut() {
             let ApiType::Enum(e) = ty else { continue };
             let Some(group) = &mut e.error_group else {
@@ -3038,32 +3054,44 @@ impl<'a> Analyzer<'a> {
             values.extend(internal_error.cloned());
             e.values = values;
         }
-        for value in own.values().flatten() {
-            let present = registry.iter().chain(&joined).any(|v| v.name == value.name);
-            if !present {
-                joined.push(value.clone());
+        for (group, values) in &own {
+            for value in values {
+                let present = registry
+                    .iter()
+                    .chain(joined.iter().map(|(_, v)| v))
+                    .any(|v| v.name == value.name);
+                if !present {
+                    joined.push((group, value.clone()));
+                }
             }
         }
 
         // A group's code may carry a `@variant(tag:)` another enum's code is
-        // spelt like, which no single enum's check sees.
-        let mut wire: BTreeMap<&str, &str> = registry
+        // spelt like, which no single enum's check sees. Reported where the
+        // group's code is declared.
+        let mut wire: BTreeMap<&str, (&str, &str)> = registry
             .iter()
-            .map(|v| (v.wire_name(), v.name.as_str()))
+            .map(|v| (v.wire_name(), (v.name.as_str(), ERROR_CODE_ENUM)))
             .collect();
-        let mut clashes: Vec<String> = Vec::new();
-        for value in &joined {
-            if let Some(other) = wire.insert(value.wire_name(), &value.name) {
-                clashes.push(format!(
-                    "codes `{other}` and `{}` both serialise to `{}`",
-                    value.name,
-                    value.wire_name()
-                ));
-            }
+        for (group, value) in &joined {
+            let Some((other, owner)) = wire.insert(value.wire_name(), (&value.name, group)) else {
+                continue;
+            };
+            let message = format!(
+                "enum `{group}`: code `{}` serialises to `{}`, as `{other}` of `{owner}` does",
+                value.name,
+                value.wire_name()
+            );
+            let site = sites
+                .iter()
+                .find(|s| s.code == value.name && s.owner == *group);
+            let error = match site {
+                Some(site) => CompileError::at(message, &site.file, site.pos),
+                None => CompileError::new(message),
+            };
+            self.errors.push(error);
         }
-        for clash in clashes {
-            self.type_error(ERROR_CODE_ENUM, format!("`{ERROR_CODE_ENUM}`: {clash}"));
-        }
+        let joined: Vec<EnumValue> = joined.into_iter().map(|(_, v)| v).collect();
         for ty in types.iter_mut() {
             if let ApiType::Enum(e) = ty {
                 if e.name == ERROR_CODE_ENUM {
@@ -3076,10 +3104,9 @@ impl<'a> Analyzer<'a> {
     /// A code declared by two enums — the registry and a group, or two groups —
     /// reported at the second declaration, naming the first. One enum listing
     /// a value twice is its own wire-name check's to report.
-    fn check_codes_declared_once(&mut self) {
-        let sites = std::mem::take(&mut self.code_sites);
+    fn check_codes_declared_once(&mut self, sites: &[CodeSite]) {
         let mut first: BTreeMap<&str, &CodeSite> = BTreeMap::new();
-        for site in &sites {
+        for site in sites {
             let earlier = match first.entry(site.code.as_str()) {
                 Entry::Vacant(slot) => {
                     slot.insert(site);
@@ -3871,9 +3898,9 @@ impl<'a> Analyzer<'a> {
     /// `ApiClient`, the `operations` and `wire` modules, a service's
     /// `<S>Service` trait and `<S>Operations` client group, an operation's
     /// `<S><Op>Codes` set, an error group's `<Area>Failure`. A type of one of
-    /// those names is a duplicate item in
-    /// the module declaring both, and in a module glob-importing the types it
-    /// is silently the generator's item instead of the SDL's. The prelude
+    /// those names is a duplicate item in the module declaring both, and in a
+    /// module glob-importing the types it is silently the generator's item
+    /// instead of the SDL's. The prelude
     /// names are the same hazard the other way round: an SDL `Result` would
     /// take the prelude's place in every signature of the file. `From` is among
     /// them because the derives the generated code applies write it unqualified
@@ -4180,6 +4207,8 @@ impl<'a> Analyzer<'a> {
                             .collect(),
                     ),
                 };
+                // `op.errors` holds the codes of the groups `@throws(groups:)`
+                // names too, so a group holding the code answers for it.
                 for code in required {
                     let listed = op.errors.iter().any(|c| c == code);
                     if !listed {
@@ -4187,7 +4216,8 @@ impl<'a> Analyzer<'a> {
                             &owner,
                             format!(
                                 "@auth({argument}:) is checked before the handler, so \
-                                 @throws(codes:) must list `{code}`"
+                                 @throws must list `{code}` in `codes:` or name a group \
+                                 holding it in `groups:`"
                             ),
                         );
                     }
@@ -4532,7 +4562,6 @@ fn describe_args(args: &[InputValue<'static, String>]) -> String {
     format!("`{}`", names.join("`, `"))
 }
 
-/// Names of the scalars the compiler maps without an `@scalar` directive.
 /// Every group `start` includes, directly or through another, in the order a
 /// depth-first walk of `includes:` meets them; never `start` itself, even
 /// when the includes close into a cycle back to it. A name that is not a group
@@ -4581,6 +4610,7 @@ fn include_cycle(direct: &BTreeMap<&str, &[String]>, start: &str) -> Option<Vec<
     None
 }
 
+/// Names of the scalars the compiler maps without an `@scalar` directive.
 fn builtin_names() -> Vec<String> {
     builtin_scalars()
         .iter()

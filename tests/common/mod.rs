@@ -330,9 +330,9 @@ impl ScratchProject {
 
     /// Write the project and build it, which must fail: rustc refusing code
     /// that misuses the generated items is what the case pins. `Ok` only when
-    /// `cargo check --lib` fails and its output carries every one of
-    /// `expected`; otherwise an error with what it printed, so a build that
-    /// fails for another reason does not pass for this one.
+    /// `cargo check --lib` fails with exactly one error and its output carries
+    /// every one of `expected`; otherwise an error with what it printed, so a
+    /// build that fails for another reason does not pass for this one.
     pub fn refuses(
         &self,
         sources: &[(&str, &str)],
@@ -356,6 +356,11 @@ impl ScratchProject {
         let missing: Vec<&&str> = expected.iter().filter(|e| !printed.contains(**e)).collect();
         if !missing.is_empty() {
             return Err(format!("cargo check failed without {missing:?}:\n{printed}").into());
+        }
+        // One error, the expected one: a second, unrelated one would otherwise
+        // pass hidden behind it.
+        if !printed.contains("due to 1 previous error") {
+            return Err(format!("cargo check failed with more than one error:\n{printed}").into());
         }
         Ok(())
     }

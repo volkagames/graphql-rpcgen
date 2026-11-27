@@ -427,7 +427,10 @@ type S @service {{
 "#
     ))?;
     assert!(
-        e.contains("`S.g`: @auth(permission:) is checked before the handler, so @throws(codes:) must list `scope_required`"),
+        e.contains(
+            "`S.g`: @auth(permission:) is checked before the handler, so @throws must list \
+             `scope_required` in `codes:` or name a group holding it in `groups:`"
+        ),
         "{e}"
     );
     assert!(!e.contains("must list `role_forbidden`"), "{e}");
